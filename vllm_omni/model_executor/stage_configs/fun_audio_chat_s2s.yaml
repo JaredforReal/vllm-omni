@@ -36,6 +36,9 @@ stage_args:
       max_num_batched_tokens: 16384
       max_model_len: 8192 # Limit to avoid OOM
       distributed_executor_backend: "mp"
+      # Pass stage_configs_path to prevent OmniLLM from calling resolve_model_config_path
+      # which fails for custom model types like funaudiochat
+      stage_configs_path: vllm_omni/model_executor/stage_configs/fun_audio_chat_s2s.yaml
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -71,6 +74,8 @@ stage_args:
       max_num_batched_tokens: 65536
       max_model_len: 32768
       distributed_executor_backend: "mp"
+      # Pass stage_configs_path to prevent OmniLLM from calling resolve_model_config_path
+      stage_configs_path: vllm_omni/model_executor/stage_configs/fun_audio_chat_s2s.yaml
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.fun_audio_chat.main2crq
     final_output: false
@@ -106,6 +111,8 @@ stage_args:
       max_num_batched_tokens: 1000000
       max_model_len: 65536
       distributed_executor_backend: "mp"
+      # Pass stage_configs_path to prevent OmniLLM from calling resolve_model_config_path
+      stage_configs_path: vllm_omni/model_executor/stage_configs/fun_audio_chat_s2s.yaml
       # CosyVoice model path (optional, defaults to auto-download)
       # cosyvoice_model_path: path/to/Fun-CosyVoice3-0.5B-2512
     engine_input_source: [1]

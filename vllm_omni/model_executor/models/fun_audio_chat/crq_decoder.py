@@ -144,10 +144,15 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         device = self.lm_head.weight.device
         dtype = self.lm_head.weight.dtype
 
+        # Determine number of tokens from positions tensor for dummy run
+        # vLLM expects hidden_states shape [num_tokens, hidden_size]
+        num_tokens = positions.numel() if positions is not None else 1
+
         if additional_information is None:
             logger.warning("CRQ Decoder: No additional_information provided")
+            # Return dummy tensors with correct shape for vLLM's _dummy_run
             return OmniOutput(
-                text_hidden_states=torch.zeros(1, self.hidden_size, device=device, dtype=dtype),
+                text_hidden_states=torch.zeros(num_tokens, self.hidden_size, device=device, dtype=dtype),
                 multimodal_outputs={"speech_tokens": None},
             )
 
@@ -159,7 +164,7 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         if thinker_hidden_states is None:
             logger.warning("CRQ Decoder: No thinker_hidden_states provided")
             return OmniOutput(
-                text_hidden_states=torch.zeros(1, self.hidden_size, device=device, dtype=dtype),
+                text_hidden_states=torch.zeros(num_tokens, self.hidden_size, device=device, dtype=dtype),
                 multimodal_outputs={"speech_tokens": None},
             )
 

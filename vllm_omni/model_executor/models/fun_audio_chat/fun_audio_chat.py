@@ -1178,7 +1178,8 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
                 if combined_weights:
                     logger.info(f"Loading {len(combined_weights)} weights for CRQ decoder")
-                    crq_loaded = self.crq_decoder.load_weights(combined_weights)
+                    # Pass prefix="crq_decoder." so returned weight names match model's state_dict
+                    crq_loaded = self.crq_decoder.load_weights(combined_weights, prefix="crq_decoder.")
                     loaded_weights.update(crq_loaded)
             return loaded_weights
 

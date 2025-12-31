@@ -339,7 +339,11 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         logger.info(f"CRQ Decoder: Generated {speech_tokens.shape[1]} speech tokens from {seq_len} input steps")
         return speech_tokens
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        prefix: str = "",
+    ) -> set[str]:
         """Load CRQ decoder weights from audio_invert_tower prefix.
 
         Weight mapping from official model:
@@ -351,6 +355,11 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
 
         Note: In official impl, lm_head.weight is tied to audio_tower.embed_tokens.weight
         We handle this by also accepting audio_tower.embed_tokens weights.
+
+        Args:
+            weights: Iterable of (name, tensor) tuples from checkpoint
+            prefix: The prefix used in parent model's state_dict (e.g., "crq_decoder.")
+                   This is used to return correct weight names for vLLM's loader.
         """
         loaded_weights: set[str] = set()
 
@@ -374,7 +383,8 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
             if name in state_dict:
                 if state_dict[name].shape == weight.shape:
                     state_dict[name].copy_(weight)
-                    loaded_weights.add(f"audio_invert_tower.{name}")
+                    # Return the weight name as it appears in the parent model's state_dict
+                    loaded_weights.add(f"{prefix}{name}")
                 else:
                     logger.warning(f"Shape mismatch for {name}: expected {state_dict[name].shape}, got {weight.shape}")
             else:
@@ -385,7 +395,7 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         if "lm_head.weight" not in weights_dict and embed_tokens_weight is not None:
             if state_dict["lm_head.weight"].shape == embed_tokens_weight.shape:
                 state_dict["lm_head.weight"].copy_(embed_tokens_weight)
-                loaded_weights.add("audio_tower.embed_tokens.weight (tied to lm_head)")
+                loaded_weights.add(f"{prefix}lm_head.weight")
                 logger.info("Tied lm_head.weight to audio_tower.embed_tokens.weight")
 
         logger.info(f"Loaded {len(loaded_weights)} CRQ decoder weights")

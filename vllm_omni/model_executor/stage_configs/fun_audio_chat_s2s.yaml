@@ -8,12 +8,6 @@
 # Models:
 # - Fun-Audio-Chat-8B: https://huggingface.co/FunAudioLLM/Fun-Audio-Chat-8B
 # - CosyVoice3: https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
-#
-# GPU Requirements:
-# - Minimum: 1x 24GB GPU (all stages share GPU 0)
-# - Recommended: 2x 24GB GPUs (Stage 0 on GPU 0, Stages 1-2 on GPU 1)
-#
-# Tested on: 2x H100-80G GPU
 
 stage_args:
   # ============================================================================
@@ -58,7 +52,7 @@ stage_args:
   - stage_id: 1
     runtime:
       process: true
-      devices: "1" # Use GPU 1 for parallel processing
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: crq_decoder
@@ -92,7 +86,7 @@ stage_args:
   - stage_id: 2
     runtime:
       process: true
-      devices: "1" # Share GPU with Stage 1 (sequential execution)
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: cosyvoice

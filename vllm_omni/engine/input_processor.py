@@ -240,6 +240,10 @@ class OmniInputProcessor(InputProcessor):
             pe_cpu = pe.detach().to("cpu").contiguous()
             seq_len, hidden_size = pe_cpu.shape
             dtype_str = self._dtype_to_name(pe_cpu.dtype)
+            # numpy doesn't support bfloat16, convert to float32 for serialization
+            if pe_cpu.dtype == torch.bfloat16:
+                pe_cpu = pe_cpu.to(torch.float32)
+                dtype_str = "float32"
             data_bytes = pe_cpu.numpy().tobytes()
             prompt_embeds_payload = PromptEmbedsPayload(
                 data=data_bytes,
@@ -253,6 +257,10 @@ class OmniInputProcessor(InputProcessor):
                 if isinstance(value, torch.Tensor):
                     v_cpu = value.detach().to("cpu").contiguous()
                     dtype_str = self._dtype_to_name(v_cpu.dtype)
+                    # numpy doesn't support bfloat16, convert to float32 for serialization
+                    if v_cpu.dtype == torch.bfloat16:
+                        v_cpu = v_cpu.to(torch.float32)
+                        dtype_str = "float32"
                     data_bytes = v_cpu.numpy().tobytes()
                     entry = AdditionalInformationEntry(
                         tensor_data=data_bytes,

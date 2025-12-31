@@ -140,10 +140,14 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         Returns:
             OmniOutput with speech_tokens in multimodal_outputs
         """
+        # Get device from model weights for dummy tensors
+        device = self.lm_head.weight.device
+        dtype = self.lm_head.weight.dtype
+
         if additional_information is None:
             logger.warning("CRQ Decoder: No additional_information provided")
             return OmniOutput(
-                text_hidden_states=torch.zeros(1, self.hidden_size),
+                text_hidden_states=torch.zeros(1, self.hidden_size, device=device, dtype=dtype),
                 multimodal_outputs={"speech_tokens": None},
             )
 
@@ -155,7 +159,7 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         if thinker_hidden_states is None:
             logger.warning("CRQ Decoder: No thinker_hidden_states provided")
             return OmniOutput(
-                text_hidden_states=torch.zeros(1, self.hidden_size),
+                text_hidden_states=torch.zeros(1, self.hidden_size, device=device, dtype=dtype),
                 multimodal_outputs={"speech_tokens": None},
             )
 

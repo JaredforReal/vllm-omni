@@ -8,6 +8,9 @@
 # Models:
 # - Fun-Audio-Chat-8B: https://huggingface.co/FunAudioLLM/Fun-Audio-Chat-8B
 # - CosyVoice3: https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+#
+# All stages use the same model architecture (FunAudioChatForConditionalGeneration)
+# with different model_stage to control behavior, similar to Qwen2.5-Omni.
 
 stage_args:
   # ============================================================================
@@ -31,6 +34,7 @@ stage_args:
       engine_output_type: latent # Output hidden states for CRQ decoder
       enable_prefix_caching: false
       max_num_batched_tokens: 16384
+      max_model_len: 8192 # Limit to avoid OOM
       distributed_executor_backend: "mp"
     is_comprehension: true
     final_output: true
@@ -56,7 +60,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: crq_decoder
-      model_arch: FunAudioChatCRQDecoder
+      model_arch: FunAudioChatForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.15 # CRQ decoder is ~1.5B params
@@ -65,6 +69,7 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: latent
       max_num_batched_tokens: 65536
+      max_model_len: 32768
       distributed_executor_backend: "mp"
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.fun_audio_chat.main2crq
@@ -90,7 +95,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: cosyvoice
-      model_arch: FunAudioChatCosyVoice
+      model_arch: FunAudioChatForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.1 # CosyVoice is ~0.5B params
@@ -99,6 +104,7 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: audio
       max_num_batched_tokens: 1000000
+      max_model_len: 65536
       distributed_executor_backend: "mp"
       # CosyVoice model path (optional, defaults to auto-download)
       # cosyvoice_model_path: path/to/Fun-CosyVoice3-0.5B-2512

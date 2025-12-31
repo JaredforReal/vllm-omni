@@ -10,6 +10,15 @@ Pipeline:
 Transitions:
 - main2crq: Stage 0 → Stage 1
 - crq2cosyvoice: Stage 1 → Stage 2
+
+Note on hidden states:
+In the official implementation (modeling_funaudiochat.py), CRQ decoder receives
+`last_hidden_state + text_embeds.detach()` for each generated token during
+autoregressive generation.
+
+In vLLM-omni's batch mode, we pass the complete response hidden states
+(excluding prompt) to the CRQ decoder, which generates speech tokens for
+the entire response at once.
 """
 
 from typing import Any
@@ -33,7 +42,18 @@ def main2crq(
     Process main stage outputs for CRQ decoder input.
 
     Extracts hidden states and text embeddings from the main stage
-    for speech token generation.
+    for speech token generation. Only the response portion (excluding prompt)
+    is passed to CRQ decoder, as we only want to synthesize the model's response.
+
+    Official implementation reference (modeling_funaudiochat.py L1088-1097):
+    ```
+    if not self.sp_gen_kwargs['disable_speech']:
+        speech_inputs_embeds = last_hidden_state
+        if text_embeds is None:
+            text_embeds = self.get_input_embeddings()(input_ids)
+        speech_inputs_embeds = speech_inputs_embeds + text_embeds.detach()
+        speech_output = self.audio_invert_tower(...)
+    ```
 
     Args:
         stage_list: List of stage objects
@@ -81,31 +101,61 @@ def main2crq(
         # Clone and move to correct device/dtype
         thinker_hidden_states = latent.clone().detach().cuda().to(torch.float32)
 
-        # Get prompt token IDs for position info
+        # Get prompt and generated token IDs
         prompt_token_ids = main_output.prompt_token_ids
         generated_token_ids = output.token_ids
         prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
+        gen_len = len(generated_token_ids) if generated_token_ids else 0
+
+        logger.info(
+            f"main2crq: prompt_len={prompt_len}, gen_len={gen_len}, hidden_states.shape={thinker_hidden_states.shape}"
+        )
 
         # Extract only the generated portion hidden states (response part)
-        # The CRQ decoder needs hidden states corresponding to the response
+        # CRQ decoder should only synthesize speech for the model's response,
+        # not for the user's input/prompt
         if thinker_hidden_states.dim() == 2:
             # [seq_len, hidden_size] -> split by prompt length
-            response_hidden = thinker_hidden_states[prompt_len:]
-            prompt_hidden = thinker_hidden_states[:prompt_len]
+            # Take the last gen_len positions as the response
+            total_len = thinker_hidden_states.shape[0]
+            if gen_len > 0 and gen_len <= total_len:
+                response_hidden = thinker_hidden_states[-gen_len:]
+            else:
+                response_hidden = thinker_hidden_states[prompt_len:]
         else:
             # Assume [batch, seq_len, hidden_size]
-            response_hidden = thinker_hidden_states[:, prompt_len:]
-            prompt_hidden = thinker_hidden_states[:, :prompt_len]
+            total_len = thinker_hidden_states.shape[1]
+            if gen_len > 0 and gen_len <= total_len:
+                response_hidden = thinker_hidden_states[:, -gen_len:]
+            else:
+                response_hidden = thinker_hidden_states[:, prompt_len:]
 
-        # Get text embeddings if available
+        # Get text embeddings if available - also extract only response portion
         text_embeds = output.multimodal_output.get("text_embeds")
+        if text_embeds is not None:
+            if text_embeds.dim() == 2:
+                total_len = text_embeds.shape[0]
+                if gen_len > 0 and gen_len <= total_len:
+                    text_embeds = text_embeds[-gen_len:]
+                else:
+                    text_embeds = text_embeds[prompt_len:]
+            else:
+                total_len = text_embeds.shape[1]
+                if gen_len > 0 and gen_len <= total_len:
+                    text_embeds = text_embeds[:, -gen_len:]
+                else:
+                    text_embeds = text_embeds[:, prompt_len:]
+
+        logger.info(
+            f"main2crq: response_hidden.shape={response_hidden.shape}, "
+            f"text_embeds.shape={text_embeds.shape if text_embeds is not None else None}"
+        )
 
         crq_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=generated_token_ids,  # Use generated tokens as reference
                 additional_information={
                     "thinker_hidden_states": response_hidden,
-                    "prompt_embeds": prompt_hidden,
                     "text_embeds": text_embeds,
                     "prompt_token_ids": prompt_token_ids,
                     "generated_token_ids": generated_token_ids,

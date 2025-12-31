@@ -380,7 +380,8 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
     Architecture:
     - Main Stage: Audio understanding + Text generation
-    - CosyVoice Stage (future): Speech tokens → Audio waveform
+    - CRQ Decoder Stage: Hidden states → Speech tokens
+    - CosyVoice Stage: Speech tokens → Audio waveform
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -393,10 +394,14 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         if self.model_stage == "main":
             self._init_main_stage(vllm_config, prefix)
+        elif self.model_stage == "crq_decoder":
+            self._init_crq_decoder_stage(vllm_config, prefix)
         elif self.model_stage == "cosyvoice":
             self._init_cosyvoice_stage(vllm_config, prefix)
         else:
-            raise ValueError(f"Invalid model_stage: {self.model_stage}. Must be one of: 'main', 'cosyvoice'")
+            raise ValueError(
+                f"Invalid model_stage: {self.model_stage}. Must be one of: 'main', 'crq_decoder', 'cosyvoice'"
+            )
 
         # Initialize sampler
         self._sampler = None
@@ -459,13 +464,57 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else lambda: None
         )
 
-    def _init_cosyvoice_stage(self, vllm_config: VllmConfig, prefix: str):
-        """Initialize CosyVoice3 for speech synthesis."""
-        logger.warning("CosyVoice stage not yet implemented. For S2S, please use the separate CosyVoice3 model.")
-        self.cosyvoice = None
+    def _init_crq_decoder_stage(self, vllm_config: VllmConfig, prefix: str):
+        """Initialize the CRQ decoder stage for speech token generation.
+
+        The CRQ (Codec Residual Quantization) Decoder converts LLM hidden states
+        into discrete speech tokens at 25Hz.
+        """
+        from .crq_decoder import FunAudioChatCRQDecoder
+
+        logger.info("Initializing CRQ decoder stage")
+
+        # Get audio config for CRQ parameters
+        audio_config = self.config.audio_config
+        self.audio_config = audio_config
+        self.hidden_size = getattr(audio_config, "output_dim", 4096)
+
+        # Initialize CRQ decoder
+        self.crq_decoder = FunAudioChatCRQDecoder(vllm_config=vllm_config, prefix=prefix)
+
+        # No language model or audio encoders needed
+        self.language_model = None
+        self.audio_tower = None
+        self.continuous_audio_tower = None
+
         self.have_multimodal_outputs = True
         self.make_empty_intermediate_tensors = lambda: None
-        self.hidden_size = 3584  # Default hidden size
+
+    def _init_cosyvoice_stage(self, vllm_config: VllmConfig, prefix: str):
+        """Initialize CosyVoice3 for speech synthesis.
+
+        The CosyVoice stage converts discrete speech tokens into audio waveforms.
+        """
+        from .cosyvoice import FunAudioChatCosyVoice
+
+        logger.info("Initializing CosyVoice stage")
+
+        # Get audio config
+        audio_config = self.config.audio_config
+        self.audio_config = audio_config
+        self.hidden_size = 1024  # CosyVoice hidden size
+
+        # Initialize CosyVoice
+        self.cosyvoice = FunAudioChatCosyVoice(vllm_config=vllm_config, prefix=prefix)
+
+        # No language model or audio encoders needed
+        self.language_model = None
+        self.audio_tower = None
+        self.continuous_audio_tower = None
+        self.crq_decoder = None
+
+        self.have_multimodal_outputs = True
+        self.make_empty_intermediate_tensors = lambda: None
 
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
@@ -483,6 +532,8 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if hasattr(self, "language_model") and self.language_model is not None:
             if hasattr(self.language_model, "sampler"):
                 return self.language_model.sampler
+        if hasattr(self, "crq_decoder") and self.crq_decoder is not None:
+            return Sampler()
         return Sampler()
 
     # ==================== Text Generation Interface ====================
@@ -510,6 +561,10 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if hasattr(self, "language_model") and self.language_model is not None:
             return self.language_model.compute_logits(hidden_states)
 
+        # CRQ decoder stage: compute logits from CRQ decoder's lm_head
+        if hasattr(self, "crq_decoder") and self.crq_decoder is not None:
+            return self.crq_decoder.lm_head(hidden_states)
+
         # Fallback for cosyvoice stage or uninitialized language model
         return None
 
@@ -535,9 +590,11 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
     def get_input_embeddings(self):
         """Get input embeddings from language model."""
-        if hasattr(self.language_model, "get_input_embeddings"):
-            return self.language_model.get_input_embeddings()
-        return self.language_model.model.embed_tokens
+        if hasattr(self, "language_model") and self.language_model is not None:
+            if hasattr(self.language_model, "get_input_embeddings"):
+                return self.language_model.get_input_embeddings()
+            return self.language_model.model.embed_tokens
+        return None
 
     def embed_input_ids(
         self,
@@ -555,7 +612,8 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # logger.info(f"embed_input_ids: input_ids.shape={input_ids.shape}, "
         #            f"audio_token_index={self.audio_token_index}, count={audio_token_count}")
 
-        if self.model_stage == "cosyvoice":
+        if self.model_stage in ("cosyvoice", "crq_decoder"):
+            # These stages don't use text embeddings
             return torch.zeros(
                 input_ids.shape[0],
                 self.hidden_size,
@@ -922,6 +980,13 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 sampling_metadata=sampling_metadata,
                 **kwargs,
             )
+        elif self.model_stage == "crq_decoder":
+            return self._forward_crq_decoder(
+                input_ids=input_ids,
+                positions=positions,
+                additional_information=additional_information,
+                **kwargs,
+            )
         elif self.model_stage == "cosyvoice":
             return self._forward_cosyvoice(
                 input_ids=input_ids,
@@ -941,7 +1006,22 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         sampling_metadata=None,
         **kwargs,
     ) -> OmniOutput:
-        """Forward pass for the main audio-language stage (S2T)."""
+        """Forward pass for the main audio-language stage (S2T/S2S).
+
+        For S2S mode (engine_output_type == "latent"), outputs:
+        - hidden_states: LLM output hidden states for CRQ decoder
+        - text_embeds: Original text embeddings (without audio merge) for combining
+                      with hidden_states in CRQ decoder
+
+        Official implementation reference (modeling_funaudiochat.py L1095-1097):
+        ```
+        if text_embeds is None:
+            text_embeds = self.get_input_embeddings()(input_ids)
+            if text_features is not None:
+                text_embeds = text_embeds.masked_scatter(...)
+        speech_inputs_embeds = speech_inputs_embeds + text_embeds.detach()
+        ```
+        """
         # Normalize dimensions
         _added_batch_dim = False
         if input_ids is not None and input_ids.ndim == 1:
@@ -964,6 +1044,17 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds.to(device)
 
+        # Check if we're in S2S mode (engine_output_type == "latent")
+        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
+
+        # For S2S mode, we need original text embeddings (before audio merge)
+        # Official: text_embeds = self.get_input_embeddings()(input_ids)
+        # This is used in CRQ decoder: speech_inputs_embeds = hidden_states + text_embeds.detach()
+        text_embeds = None
+        if engine_output_type == "latent" and input_ids is not None:
+            # Get pure text embeddings from language model (before any audio merge)
+            text_embeds = self.get_input_embeddings()(input_ids)
+
         # Note: In vLLM v1, multimodal embeddings are computed by embed_multimodal()
         # and merged by embed_input_ids() before forward() is called.
         # The inputs_embeds parameter already contains the merged embeddings.
@@ -971,9 +1062,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # Get embeddings if not already provided
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids=input_ids)
-
-        # Store text embeddings for CRQ decoder (S2S mode)
-        text_embeds = inputs_embeds.clone()
 
         # Prepare positions for language model
         pos_to_use = positions[0] if positions.ndim > 1 else positions
@@ -986,9 +1074,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             intermediate_tensors=intermediate_tensors,
         )
 
-        # Check if we're in S2S mode (engine_output_type == "latent")
-        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
-
         # Build multimodal outputs
         multimodal_outputs: dict[str, Any] = {}
 
@@ -996,11 +1081,36 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # S2S mode: output hidden states for CRQ decoder
             multimodal_outputs["latent"] = hidden_states.reshape(-1, hidden_states.shape[-1])
             multimodal_outputs["hidden_states"] = hidden_states.reshape(-1, hidden_states.shape[-1])
-            multimodal_outputs["text_embeds"] = text_embeds.reshape(-1, text_embeds.shape[-1])
+            # Use original text embeddings (not merged with audio)
+            if text_embeds is not None:
+                multimodal_outputs["text_embeds"] = text_embeds.reshape(-1, text_embeds.shape[-1])
 
         return OmniOutput(
             text_hidden_states=hidden_states.reshape(-1, hidden_states.shape[-1]),
             multimodal_outputs=multimodal_outputs,
+        )
+
+    def _forward_crq_decoder(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        additional_information: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> OmniOutput:
+        """Forward pass for CRQ decoder stage (hidden states → speech tokens)."""
+        if not hasattr(self, "crq_decoder") or self.crq_decoder is None:
+            logger.error("CRQ decoder not initialized")
+            return OmniOutput(
+                text_hidden_states=torch.zeros(1, self.hidden_size),
+                multimodal_outputs={"speech_tokens": None},
+            )
+
+        # Delegate to CRQ decoder
+        return self.crq_decoder(
+            input_ids=input_ids,
+            positions=positions,
+            additional_information=additional_information,
+            **kwargs,
         )
 
     def _forward_cosyvoice(
@@ -1010,11 +1120,20 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         additional_information: dict[str, Any] | None = None,
         **kwargs,
     ) -> OmniOutput:
-        """Forward pass for CosyVoice speech synthesis stage."""
-        logger.warning("CosyVoice forward not yet implemented")
-        return OmniOutput(
-            text_hidden_states=torch.zeros(1, self.hidden_size),
-            multimodal_outputs={"audio": None},
+        """Forward pass for CosyVoice speech synthesis stage (speech tokens → audio)."""
+        if not hasattr(self, "cosyvoice") or self.cosyvoice is None:
+            logger.error("CosyVoice not initialized")
+            return OmniOutput(
+                text_hidden_states=torch.zeros(1, self.hidden_size),
+                multimodal_outputs={"audio": None},
+            )
+
+        # Delegate to CosyVoice
+        return self.cosyvoice(
+            input_ids=input_ids,
+            positions=positions,
+            additional_information=additional_information,
+            **kwargs,
         )
 
     # ==================== Weight Loading ====================
@@ -1041,6 +1160,38 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 audio_invert_tower_weights.append((name, weight))
             else:
                 other_weights.append((name, weight))
+
+        # Handle different stages
+        if self.model_stage == "crq_decoder":
+            # CRQ decoder stage: load audio_invert_tower weights
+            # Also need audio_tower.embed_tokens.weight for lm_head weight tying
+            if hasattr(self, "crq_decoder") and self.crq_decoder is not None:
+                # Combine audio_invert_tower weights with audio_tower.embed_tokens for weight tying
+                combined_weights = list(audio_invert_tower_weights)
+
+                # Find and add audio_tower.embed_tokens.weight for lm_head tying
+                for name, weight in audio_tower_weights:
+                    if name == "audio_tower.embed_tokens.weight":
+                        combined_weights.append((name, weight))
+                        logger.info("Found audio_tower.embed_tokens.weight for lm_head tying")
+                        break
+
+                if combined_weights:
+                    logger.info(f"Loading {len(combined_weights)} weights for CRQ decoder")
+                    crq_loaded = self.crq_decoder.load_weights(combined_weights)
+                    loaded_weights.update(crq_loaded)
+            return loaded_weights
+
+        elif self.model_stage == "cosyvoice":
+            # CosyVoice stage: no weights to load from the main model
+            # CosyVoice loads its own weights separately
+            logger.info("CosyVoice stage: no weights to load from main model checkpoint")
+            if hasattr(self, "cosyvoice") and self.cosyvoice is not None:
+                cosyvoice_loaded = self.cosyvoice.load_weights([])
+                loaded_weights.update(cosyvoice_loaded)
+            return loaded_weights
+
+        # Main stage: load all relevant weights
 
         # Load language model weights
         if hasattr(self, "language_model") and self.language_model is not None and language_model_weights:
@@ -1090,10 +1241,10 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
             loaded_weights.update(name for name, _ in audio_tower_weights)
 
-        # Log skipped audio_invert_tower weights (S2T mode doesn't use them)
+        # Log skipped audio_invert_tower weights (main stage doesn't use them for S2T)
         if audio_invert_tower_weights:
             logger.info(
-                f"Skipping {len(audio_invert_tower_weights)} audio_invert_tower weights (not needed for S2T mode)"
+                f"Skipping {len(audio_invert_tower_weights)} audio_invert_tower weights (not needed for main stage)"
             )
 
         return loaded_weights

@@ -151,9 +151,15 @@ def main2crq(
             f"text_embeds.shape={text_embeds.shape if text_embeds is not None else None}"
         )
 
+        # CRQ decoder uses speech codebook tokens (vocab ~6565), not text tokens (vocab ~150k)
+        # We only need a single BOS token to start generation - the actual input
+        # comes from thinker_hidden_states via additional_information
+        # BOS token ID from audio_config: 6561
+        crq_bos_token_id = 6561
+
         crq_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=generated_token_ids,  # Use generated tokens as reference
+                prompt_token_ids=[crq_bos_token_id],  # Single BOS token for CRQ decoder
                 additional_information={
                     "thinker_hidden_states": response_hidden,
                     "text_embeds": text_embeds,

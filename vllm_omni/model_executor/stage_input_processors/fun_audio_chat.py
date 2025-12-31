@@ -159,7 +159,6 @@ def main2crq(
                     "text_embeds": text_embeds,
                     "prompt_token_ids": prompt_token_ids,
                     "generated_token_ids": generated_token_ids,
-                    "text_response": output.text if hasattr(output, "text") else None,
                 },
                 multi_modal_data=None,
                 mm_processor_kwargs=None,

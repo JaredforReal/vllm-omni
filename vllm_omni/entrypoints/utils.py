@@ -100,6 +100,12 @@ def resolve_model_config_path(model: str) -> str:
         ValueError: If model_type cannot be determined
         FileNotFoundError: If no stage config file exists for the model type
     """
+    # Ensure omni models are registered to transformers before trying to load config
+    # This allows custom model types like 'funaudiochat' to be recognized
+    from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
+
+    register_omni_models_to_vllm()
+
     # Try to get config from standard transformers format first
     try:
         hf_config = get_config(model, trust_remote_code=True)

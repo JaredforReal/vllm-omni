@@ -400,7 +400,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 mm_payload: dict[str, object] = {}
                 for k, v in multimodal_outputs.items():
                     try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                        # Special handling for speech_tokens: don't slice, pass entire tensor
+                        if k == "speech_tokens" and isinstance(v, torch.Tensor):
+                            mm_payload[k] = v.detach().to("cpu").contiguous()
+                        elif isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
                             mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}

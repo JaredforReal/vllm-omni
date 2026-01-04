@@ -214,6 +214,20 @@ def crq2cosyvoice(
         # Extract speech tokens from CRQ output
         speech_tokens = output.multimodal_output.get("speech_tokens")
 
+        # Get shape info for logging
+        if hasattr(speech_tokens, "shape"):
+            shape_info = speech_tokens.shape
+        elif speech_tokens:
+            shape_info = len(speech_tokens)
+        else:
+            shape_info = 0
+
+        logger.info(
+            f"crq2cosyvoice: output {i}, "
+            f"multimodal_output keys = {list(output.multimodal_output.keys()) if output.multimodal_output else None}, "
+            f"speech_tokens type = {type(speech_tokens)}, speech_tokens shape = {shape_info}"
+        )
+
         if speech_tokens is None:
             logger.warning(f"No speech tokens found in CRQ output {i}")
             cosyvoice_inputs.append(

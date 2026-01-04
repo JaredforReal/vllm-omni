@@ -148,8 +148,21 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         # vLLM expects hidden_states shape [num_tokens, hidden_size]
         num_tokens = positions.numel() if positions is not None else 1
 
+        # vLLM-omni passes runtime_additional_information as a list of dicts (one per request)
+        # We need to extract the first request's info
         if additional_information is None:
-            logger.warning("CRQ Decoder: No additional_information provided")
+            runtime_info = kwargs.get("runtime_additional_information", [])
+            logger.debug(
+                f"CRQ Decoder: kwargs keys = {list(kwargs.keys())}, "
+                f"runtime_info type = {type(runtime_info)}, len = {len(runtime_info) if runtime_info else 0}"
+            )
+            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
+                additional_information = runtime_info[0]  # Single request batch for stage pipeline
+                info_keys = list(additional_information.keys()) if additional_information else None
+                logger.debug(f"CRQ Decoder: extracted additional_information keys = {info_keys}")
+
+        if additional_information is None or not additional_information:
+            logger.warning(f"CRQ Decoder: No additional_information provided, kwargs keys = {list(kwargs.keys())}")
             # Return dummy tensors with correct shape for vLLM's _dummy_run
             return OmniOutput(
                 text_hidden_states=torch.zeros(num_tokens, self.hidden_size, device=device, dtype=dtype),

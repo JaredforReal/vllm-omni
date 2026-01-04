@@ -181,8 +181,16 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
                 multimodal_outputs={"speech_tokens": None},
             )
 
-        device = thinker_hidden_states.device
-        dtype = thinker_hidden_states.dtype
+        # Move tensors from CPU to GPU (they come from additional_information_cpu)
+        # and ensure correct dtype
+        model_device = self.lm_head.weight.device
+        model_dtype = self.lm_head.weight.dtype
+        thinker_hidden_states = thinker_hidden_states.to(device=model_device, dtype=model_dtype)
+        if text_embeds is not None:
+            text_embeds = text_embeds.to(device=model_device, dtype=model_dtype)
+
+        device = model_device
+        dtype = model_dtype
 
         # Ensure 3D shape [batch, seq_len, hidden_size]
         if thinker_hidden_states.dim() == 2:
@@ -198,7 +206,7 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
                 min_len = min(text_embeds.shape[1], thinker_hidden_states.shape[1])
                 text_embeds = text_embeds[:, :min_len, :]
                 thinker_hidden_states = thinker_hidden_states[:, :min_len, :]
-            speech_inputs_embeds = thinker_hidden_states + text_embeds.detach().to(device, dtype)
+            speech_inputs_embeds = thinker_hidden_states + text_embeds.detach()
         else:
             speech_inputs_embeds = thinker_hidden_states
 

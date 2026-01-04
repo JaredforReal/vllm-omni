@@ -43,7 +43,7 @@ stage_args:
       temperature: 0.7
       top_p: 0.9
       top_k: 50
-      max_tokens: 2048
+      max_tokens: 256 # Reduced for faster CRQ generation (256 * 5 = 1280 speech tokens)
       seed: 42
       detokenize: true
       repetition_penalty: 1.05
@@ -78,7 +78,7 @@ stage_args:
       temperature: 0.9
       top_p: 0.8
       top_k: 40
-      max_tokens: 4096
+      max_tokens: 8  # CRQ generates all speech tokens in one forward, limit to avoid repeated calls
       seed: 42
       detokenize: false
       repetition_penalty: 1.0

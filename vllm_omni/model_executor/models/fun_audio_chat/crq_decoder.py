@@ -110,6 +110,18 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         # For empty intermediate tensors
         self.make_empty_intermediate_tensors = lambda: None
 
+        # Cache for generated speech tokens to avoid regenerating on subsequent vLLM forward calls
+        # vLLM calls forward repeatedly for token-by-token generation, but CRQ generates all at once
+        self._cached_speech_tokens: torch.Tensor | None = None
+        self._cached_hidden_states: torch.Tensor | None = None
+        self._generation_complete: bool = False
+
+    def reset_generation_cache(self):
+        """Reset generation cache for new request."""
+        self._cached_speech_tokens = None
+        self._cached_hidden_states = None
+        self._generation_complete = False
+
     def get_embeddings(self, audio_tokens: torch.Tensor) -> torch.Tensor:
         """Get embeddings for audio tokens from LM head weights.
 
@@ -163,6 +175,14 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
 
         if additional_information is None or not additional_information:
             logger.warning(f"CRQ Decoder: No additional_information provided, kwargs keys = {list(kwargs.keys())}")
+            # Check if we have cached results from a previous generation
+            # This happens when vLLM calls forward again after generation is complete
+            if self._generation_complete and self._cached_speech_tokens is not None:
+                logger.debug("CRQ Decoder: Returning cached result (no additional_information, generation complete)")
+                return OmniOutput(
+                    text_hidden_states=self._cached_hidden_states,
+                    multimodal_outputs={"speech_tokens": self._cached_speech_tokens},
+                )
             # Return dummy tensors with correct shape for vLLM's _dummy_run
             return OmniOutput(
                 text_hidden_states=torch.zeros(num_tokens, self.hidden_size, device=device, dtype=dtype),
@@ -175,11 +195,23 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         text_embeds = additional_information.get("text_embeds")
 
         if thinker_hidden_states is None:
-            logger.warning("CRQ Decoder: No thinker_hidden_states provided")
+            logger.warning("CRQ Decoder: No thinker_hidden_states in additional_information")
+            # Check if we have cached results from a previous generation
+            if self._generation_complete and self._cached_speech_tokens is not None:
+                logger.debug("CRQ Decoder: Returning cached result (no hidden_states, generation complete)")
+                return OmniOutput(
+                    text_hidden_states=self._cached_hidden_states,
+                    multimodal_outputs={"speech_tokens": self._cached_speech_tokens},
+                )
             return OmniOutput(
                 text_hidden_states=torch.zeros(num_tokens, self.hidden_size, device=device, dtype=dtype),
                 multimodal_outputs={"speech_tokens": None},
             )
+
+        # New generation request - clear any cached state from previous request
+        self._generation_complete = False
+        self._cached_speech_tokens = None
+        self._cached_hidden_states = None
 
         # Move tensors from CPU to GPU (they come from additional_information_cpu)
         # and ensure correct dtype
@@ -213,10 +245,35 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         # Generate speech tokens autoregressively using official crq_generate_forward logic
         speech_tokens = self._crq_generate_forward(speech_inputs_embeds)
 
+        # Cache results for subsequent forward calls
+        # vLLM may call forward multiple times, we return cached results after first generation
+        # We return EOS-biased hidden states so vLLM samples EOS and terminates
+        eos_hidden_states = self._get_eos_hidden_states(device, dtype)
+        self._cached_speech_tokens = speech_tokens
+        self._cached_hidden_states = eos_hidden_states
+        self._generation_complete = True
+
+        logger.info(f"CRQ Decoder: Generation complete, cached {speech_tokens.shape[1]} speech tokens")
+
         return OmniOutput(
-            text_hidden_states=thinker_hidden_states.reshape(-1, thinker_hidden_states.shape[-1]),
+            text_hidden_states=eos_hidden_states,
             multimodal_outputs={"speech_tokens": speech_tokens},
         )
+
+    def _get_eos_hidden_states(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Get hidden states that will produce EOS-biased logits when passed through lm_head.
+
+        This is used to signal to vLLM that generation is complete.
+        We use the EOS embedding from lm_head.weight as the hidden state.
+        When compute_logits calls lm_head(hidden_states), the dot product with EOS embedding
+        will be maximized, causing EOS to be sampled.
+        """
+        # Get EOS embedding from lm_head weight
+        eos_embedding = self.lm_head.weight.data[self.eos_token_id]  # [hidden_size]
+        # Normalize to unit vector for stable dot product
+        eos_embedding = eos_embedding / (eos_embedding.norm() + 1e-6)
+        # Return as [1, hidden_size] for single token
+        return eos_embedding.unsqueeze(0).to(device=device, dtype=dtype)
 
     def _crq_generate_forward(
         self,
@@ -365,6 +422,11 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
             speech_tokens = torch.cat(all_tokens, dim=1)  # [batch, num_steps * group_size]
         else:
             speech_tokens = torch.empty(batch_size, 0, dtype=torch.long, device=device)
+
+        # Clear past_key_values to free GPU memory
+        # This is important because HuggingFace transformer accumulates KV cache
+        del past_key_values
+        torch.cuda.empty_cache()
 
         logger.info(f"CRQ Decoder: Generated {speech_tokens.shape[1]} speech tokens from {seq_len} input steps")
         return speech_tokens

@@ -287,6 +287,10 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         This follows the official crq_generate_forward implementation in
         modeling_funaudiochat.py (FunAudioChatDecoder class).
 
+        Note: Unlike the official implementation which runs incrementally per text token,
+        this version generates all speech tokens at once from the complete hidden states.
+        This is necessary for vLLM's staged pipeline architecture.
+
         Args:
             inputs_embeds: Combined hidden states [batch, seq_len, hidden_size]
                           This is (last_hidden_state + text_embeds.detach())
@@ -301,134 +305,85 @@ class FunAudioChatCRQDecoder(nn.Module, SupportsPP):
         dtype = inputs_embeds.dtype
 
         # Step 1: Pre-matching - expand to group_size
-        # Official: inputs_embeds = self.pre_matching(inputs_embeds)
         # Shape: [bs, slen, hidden_size] -> [bs, slen, hidden_size * group_size]
         expanded = self.pre_matching(inputs_embeds)
 
-        # Official: hidden_states = inputs_embeds.reshape(bs, slen * self.group_size, -1)
-        # Shape: [bs, slen * group_size, hidden_size]
+        # Reshape to [bs, slen * group_size, hidden_size]
         hidden_states = expanded.reshape(batch_size, seq_len * self.group_size, -1)
+        total_positions = seq_len * self.group_size
 
         # Initialize audio embeddings with BOS token
-        # Official:
-        # self.crq_audio_embeds = (
-        #     self.get_embeddings(self.config.bos_token_id)[None, None, :]
-        #     .repeat(bs, 1, 1)
-        #     .to(dtype=hidden_states.dtype, device=hidden_states.device)
-        # )
-        audio_embeds = (
-            self.get_embeddings(torch.tensor([self.bos_token_id], device=device))
-            .unsqueeze(0)
-            .repeat(batch_size, 1, 1)
-            .to(dtype=dtype)
-        )
+        bos_embedding = self.get_embeddings(torch.tensor([self.bos_token_id], device=device))
+        audio_embeds = bos_embedding.unsqueeze(0).repeat(batch_size, 1, 1).to(dtype=dtype)
 
-        all_tokens = []
+        all_tokens: list[torch.Tensor] = []
         past_key_values = None
 
-        # Accumulated generated tokens for potential logits processing
-        generated_tokens: list[torch.Tensor] = []
+        # Generate tokens position by position
+        # Official implementation generates group_size tokens per "step" (per text token)
+        # Here we process all positions sequentially to match the expected behavior
+        for pos in range(total_positions):
+            # Determine input based on position within group
+            group_idx = pos % self.group_size
 
-        # Generate step by step
-        for step in range(seq_len):
-            step_tokens = []
+            if group_idx == 0:
+                # First position in group: use context from start to current
+                # This matches: hidden_states[:, : slen * group_size - (group_size - 0 - 1)]
+                # For pos=0: we use hidden_states[:, :1]
+                input_embeds = hidden_states[:, : pos + 1] + audio_embeds
+            else:
+                # Subsequent positions: only current position
+                input_embeds = hidden_states[:, pos : pos + 1] + audio_embeds.unsqueeze(1)
 
-            for i in range(self.group_size):
-                # Official logic from crq_generate_forward:
-                # if i == 0:
-                #     input_embeds = (
-                #         hidden_states[:, : slen * self.group_size - (self.group_size - i - 1)] + self.crq_audio_embeds
-                #     )
-                # else:
-                #     input_embeds = (
-                #         hidden_states[:, slen * self.group_size - (self.group_size - i)] + self.crq_audio_embeds
-                #     ).unsqueeze(1)
+            # Project to CRQ transformer dimension
+            input_embeds = self.input_matching(input_embeds)
 
-                if i == 0:
-                    # First position in group: use context from start to current position
-                    # end_idx = total_len - (group_size - i - 1) = total_len - group_size + 1
-                    # For step=0, i=0: end_idx = total_len - 4 (assuming group_size=5)
-                    # But we're generating step by step, so we use:
-                    # For step=s: end_idx = (s + 1) * group_size - (group_size - 1) = s * group_size + 1
-                    end_idx = step * self.group_size + 1
-                    input_embeds = hidden_states[:, :end_idx] + audio_embeds
-                else:
-                    # Subsequent positions: only current position
-                    # pos_idx = total_len - (group_size - i) for the original full-sequence logic
-                    # For step-by-step: pos_idx = step * group_size + i
-                    pos_idx = step * self.group_size + i
-                    input_embeds = hidden_states[:, pos_idx : pos_idx + 1] + audio_embeds.unsqueeze(1)
+            # Forward through CRQ transformer with KV cache
+            outputs = self.crq_transformer(
+                inputs_embeds=input_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
 
-                # Project to CRQ transformer dimension
-                # Official: input_embeds = self.input_matching(input_embeds)
-                input_embeds = self.input_matching(input_embeds)
+            # Get last hidden state and compute logits
+            last_hidden = self.output_matching(outputs.last_hidden_state[:, -1:, :])
+            logits = self.lm_head(last_hidden).squeeze(1)  # [batch, vocab]
 
-                # Forward through CRQ transformer with KV cache
-                # Official:
-                # outputs = self.crq_transformer(
-                #     inputs_embeds=input_embeds,
-                #     past_key_values=self.crq_past_key_values,
-                #     use_cache=True,
-                #     return_dict=True,
-                # )
-                # self.crq_past_key_values = outputs.past_key_values
-                outputs = self.crq_transformer(
-                    inputs_embeds=input_embeds,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                past_key_values = outputs.past_key_values
+            # Sample next token
+            if do_sample and temperature > 0:
+                logits = logits / temperature
+                probs = torch.nn.functional.softmax(logits.float(), dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_token = torch.argmax(logits, dim=-1)
 
-                # Project back and compute logits
-                # Official:
-                # lhidden_states = outputs.last_hidden_state
-                # lhidden_states = self.output_matching(lhidden_states)
-                # logits = self.lm_head(lhidden_states)
-                lhidden_states = self.output_matching(outputs.last_hidden_state)
-                logits = self.lm_head(lhidden_states)
+            all_tokens.append(next_token)
 
-                # Sampling step
-                # Official: crq_audio_tokens, logits = self.sampling_step(logits)
-                next_token_logits = logits[:, -1, :].clone().float()
-
-                # Apply temperature
-                if do_sample and temperature > 0:
-                    next_token_logits = next_token_logits / temperature
-                    probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                else:
-                    next_tokens = torch.argmax(next_token_logits, dim=-1)
-
-                step_tokens.append(next_tokens)
-                generated_tokens.append(next_tokens)
-
-                # Update audio embeddings for next position
-                # Official: self.crq_audio_embeds = self.get_embeddings(crq_audio_tokens)
-                audio_embeds = self.get_embeddings(next_tokens).to(dtype=dtype)
-
-            # Concatenate tokens for this step
-            # Official: self.crq_generate_tokens = torch.cat(self.crq_generate_tokens, dim=1)
-            step_tokens_tensor = torch.stack(step_tokens, dim=1)  # [batch, group_size]
-            all_tokens.append(step_tokens_tensor)
-
-            # Check for EOS in any position
-            if (step_tokens_tensor == self.eos_token_id).any():
-                logger.info(f"CRQ Decoder: EOS detected at step {step}")
+            # Check for EOS
+            if (next_token == self.eos_token_id).any():
+                logger.info(f"CRQ Decoder: EOS detected at position {pos}")
                 break
+
+            # Update audio embeddings for next position
+            audio_embeds = self.get_embeddings(next_token).to(dtype=dtype)
+
+        # Clean up KV cache to free memory
+        del past_key_values
+        del hidden_states
+        del expanded
 
         # Concatenate all tokens
         if all_tokens:
-            speech_tokens = torch.cat(all_tokens, dim=1)  # [batch, num_steps * group_size]
+            speech_tokens = torch.stack(all_tokens, dim=1)  # [batch, num_tokens]
         else:
             speech_tokens = torch.empty(batch_size, 0, dtype=torch.long, device=device)
 
-        # Clear past_key_values to free GPU memory
-        # This is important because HuggingFace transformer accumulates KV cache
-        del past_key_values
-        torch.cuda.empty_cache()
-
-        logger.info(f"CRQ Decoder: Generated {speech_tokens.shape[1]} speech tokens from {seq_len} input steps")
+        logger.info(
+            f"CRQ Decoder: Generated {speech_tokens.shape[1]} speech tokens "
+            f"from {seq_len} input steps (max {total_positions})"
+        )
         return speech_tokens
 
     def load_weights(

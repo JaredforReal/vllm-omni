@@ -789,3 +789,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
     def num_layers(self) -> int:
         """Return number of transformer layers."""
         return len(self.transformer_blocks)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return dtype of model parameters."""
+        return next(self.parameters()).dtype

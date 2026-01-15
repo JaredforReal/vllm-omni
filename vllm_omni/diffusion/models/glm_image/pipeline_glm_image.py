@@ -73,7 +73,7 @@ def get_glm_image_post_process_func(od_config: OmniDiffusionConfig):
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
     def post_process_func(images: PIL.Image.Image):
-        return images
+        return image_processor.postprocess(images, output_type="pil")
 
     return post_process_func
 
@@ -951,8 +951,7 @@ class GlmImagePipeline(nn.Module):
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
-        # 9. Post-process
-        image = self.image_processor.postprocess(image, output_type="pil")[0]
+        # 9. Leave post-process to vllm-omni pipeline
 
         return DiffusionOutput(output=image)
 

@@ -366,6 +366,7 @@ class GlmImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
         kv_cache: GlmImageLayerKVCache | None = None,
         kv_cache_mode: KVCacheMode | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:

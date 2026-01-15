@@ -17,7 +17,6 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from math import sqrt
 
 import numpy as np
 import PIL.Image
@@ -358,45 +357,41 @@ class GlmImagePipeline(nn.Module):
     # ==================== AR Stage Methods ====================
 
     @staticmethod
-    def _build_image_grid_thw(
-        token_h: int,
-        token_w: int,
-        prev_token_h: int,
-        prev_token_w: int,
-        existing_grid: torch.Tensor | None = None,
-        device: torch.device | None = None,
-    ) -> torch.Tensor:
-        """Build image grid tensor for AR model."""
-        if existing_grid is None or existing_grid.numel() == 0:
-            return torch.tensor(
-                [
-                    [1, token_h, token_w],
-                    [1, prev_token_h, prev_token_w],
-                ],
-                device=device,
-            )
-        else:
-            return torch.cat(
-                [existing_grid.to(device), torch.tensor([[1, token_h, token_w]], device=device)],
-                dim=0,
-            )
+    def _compute_generation_params(
+        image_grid_thw: torch.Tensor,
+        is_text_to_image: bool,
+    ) -> tuple[int, int, int, int]:
+        """
+        Compute AR generation parameters from image grid.
 
-    @staticmethod
-    def _calculate_ar_generation_params(
-        token_h: int, token_w: int, prev_token_h: int, prev_token_w: int, is_text_to_image: bool
-    ) -> tuple[int, int]:
-        """Calculate AR generation parameters."""
-        large_image_tokens = token_h * token_w
-        small_image_tokens = prev_token_h * prev_token_w
+        Args:
+            image_grid_thw: Image grid tensor of shape [N, 3] where each row is [t, h, w]
+            is_text_to_image: Whether this is text-to-image (vs image-to-image)
 
-        if is_text_to_image:
-            max_new_tokens = small_image_tokens + large_image_tokens + 1
-            large_image_start_offset = small_image_tokens
-        else:
-            max_new_tokens = large_image_tokens + 1
+        Returns:
+            Tuple of (max_new_tokens, large_image_start_offset, target_grid_h, target_grid_w)
+        """
+        grid_sizes = []
+        grid_hw = []
+
+        for i in range(image_grid_thw.shape[0]):
+            t, h, w = image_grid_thw[i].tolist()
+            grid_sizes.append(int(h * w))
+            grid_hw.append((int(h), int(w)))
+
+        if not is_text_to_image:
+            # Image-to-image: only generate target image tokens
+            max_new_tokens = grid_sizes[-1] + 1
             large_image_start_offset = 0
+            target_grid_h, target_grid_w = grid_hw[-1]
+        else:
+            # Text-to-image: generate both small preview and large target
+            total_tokens = sum(grid_sizes)
+            max_new_tokens = total_tokens + 1
+            large_image_start_offset = sum(grid_sizes[1:])
+            target_grid_h, target_grid_w = grid_hw[0]
 
-        return max_new_tokens, large_image_start_offset
+        return max_new_tokens, large_image_start_offset, target_grid_h, target_grid_w
 
     @staticmethod
     def _extract_large_image_tokens(
@@ -418,28 +413,6 @@ class GlmImagePipeline(nn.Module):
         token_ids = token_ids.view(1, -1)
         return token_ids
 
-    @staticmethod
-    def _build_prompt_with_shape(
-        prompt: str,
-        height: int,
-        width: int,
-        is_text_to_image: bool,
-        factor: int = 32,
-    ) -> tuple[str, int, int, int, int]:
-        """Build prompt with shape information for AR model."""
-        token_h = height // factor
-        token_w = width // factor
-        ratio = token_h / token_w
-        prev_token_h = int(sqrt(ratio) * (factor // 2))
-        prev_token_w = int(sqrt(1 / ratio) * (factor // 2))
-
-        if is_text_to_image:
-            expanded_prompt = f"{prompt}<sop>{token_h} {token_w}<eop><sop>{prev_token_h} {prev_token_w}<eop>"
-        else:
-            expanded_prompt = f"{prompt}<sop>{token_h} {token_w}<eop>"
-
-        return expanded_prompt, token_h, token_w, prev_token_h, prev_token_w
-
     @torch.inference_mode()
     def generate_prior_tokens(
         self,
@@ -448,7 +421,7 @@ class GlmImagePipeline(nn.Module):
         width: int,
         image: list[PIL.Image.Image] | None = None,
         factor: int = 32,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, int, int]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """
         Generate prior tokens using the AR model.
 
@@ -460,74 +433,59 @@ class GlmImagePipeline(nn.Module):
             factor: Token factor (default 32)
 
         Returns:
-            Tuple of (prior_token_ids, prior_token_image_ids, pixel_height, pixel_width)
+            Tuple of (prior_token_ids, prior_token_image_ids)
+            prior_token_image_ids is a list of tensors, one per condition image
         """
         device = self.vision_language_encoder.device
         height = (height // factor) * factor
         width = (width // factor) * factor
         is_text_to_image = image is None or len(image) == 0
 
-        expanded_prompt, token_h, token_w, prev_h, prev_w = self._build_prompt_with_shape(
-            prompt, height, width, is_text_to_image
-        )
-
         # Build message content
         content = []
         if image is not None:
             for img in image:
                 content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": expanded_prompt})
+        content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
 
-        # Apply chat template
+        # Apply chat template - processor will handle target dimensions and build grid
         inputs = self.processor.apply_chat_template(
             messages,
-            add_generation_prompt=True,
             tokenize=True,
+            target_h=height,
+            target_w=width,
             return_dict=True,
             return_tensors="pt",
-        )
+        ).to(device)
 
-        # Build image grid
-        existing_grid = inputs.get("image_grid_thw")
-        inputs["image_grid_thw"] = self._build_image_grid_thw(
-            token_h,
-            token_w,
-            prev_h,
-            prev_w,
-            existing_grid=existing_grid if not is_text_to_image else None,
-            device=device,
-        )
+        image_grid_thw = inputs.get("image_grid_thw")
 
-        max_new_tokens, large_image_offset = self._calculate_ar_generation_params(
-            token_h, token_w, prev_h, prev_w, is_text_to_image
+        # Compute generation parameters from the full grid
+        max_new_tokens, large_image_offset, token_h, token_w = self._compute_generation_params(
+            image_grid_thw=image_grid_thw, is_text_to_image=is_text_to_image
         )
-        large_image_tokens = token_h * token_w
-
-        inputs = inputs.to(device)
-        input_length = inputs["input_ids"].shape[-1]
 
         # Process condition images if provided
-        # prior_token_image_ids should be a LIST of tensors, one per condition image
+        # Use image_grid_thw[:-1] to exclude the target image grid (last entry)
         prior_token_image_ids = None
-        if image is not None and existing_grid is not None:
+        if image is not None and image_grid_thw is not None and len(image_grid_thw) > 1:
+            # Get features only for condition images (exclude target image grid)
+            condition_grid = image_grid_thw[:-1]
             prior_token_image_embed = self.vision_language_encoder.get_image_features(
-                inputs["pixel_values"], existing_grid
+                inputs["pixel_values"], condition_grid
             )
             prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
-            # get_image_tokens returns a flat tensor, we need to split it per image
             flat_prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
-                prior_token_image_embed, existing_grid
+                prior_token_image_embed, condition_grid
             )
             # Split by image grid sizes and convert to list
-            # Each image has t*h*w tokens, we need to split and reshape
-            split_sizes = (existing_grid.prod(dim=-1)).tolist()
+            split_sizes = (condition_grid.prod(dim=-1)).tolist()
             prior_token_image_ids_list = torch.split(flat_prior_token_image_ids, split_sizes, dim=0)
-            # Convert to list and add batch dimension for each, then upsample
+            # Convert to list with upsampling
             prior_token_image_ids = []
             for i, token_ids in enumerate(prior_token_image_ids_list):
-                grid_t, grid_h, grid_w = existing_grid[i].tolist()
-                # Reshape to [1, t*h*w] then upsample like the main prior_token_ids
+                grid_t, grid_h, grid_w = condition_grid[i].tolist()
                 token_ids = token_ids.view(1, -1)
                 # Upsample 2x (from d32 to d64)
                 token_ids_2d = token_ids.view(1, 1, grid_h, grid_w)
@@ -545,8 +503,9 @@ class GlmImagePipeline(nn.Module):
         )
 
         # Extract and upsample tokens
+        large_image_tokens = token_h * token_w
         prior_token_ids_d32 = self._extract_large_image_tokens(
-            outputs, input_length, large_image_offset, large_image_tokens
+            outputs, inputs["input_ids"].shape[-1], large_image_offset, large_image_tokens
         )
         prior_token_ids = self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
 
@@ -855,48 +814,6 @@ class GlmImagePipeline(nn.Module):
 
         return kv_caches
 
-    def _preprocess_condition_images(
-        self,
-        images: list[PIL.Image.Image] | PIL.Image.Image | None,
-    ) -> tuple[list[torch.Tensor] | None, int | None, int | None]:
-        """
-        Preprocess condition images for Image Edit mode.
-
-        Args:
-            images: Input images (PIL or list of PIL)
-
-        Returns:
-            Tuple of (preprocessed_images, height, width)
-        """
-        if images is None:
-            return None, None, None
-
-        if not isinstance(images, list):
-            images = [images]
-
-        preprocessed = []
-        height, width = None, None
-
-        for img in images:
-            if isinstance(img, PIL.Image.Image):
-                img_h, img_w = img.size[::-1]
-            else:
-                img_h, img_w = img.shape[:2]
-
-            # Align to multiple of vae_scale_factor * patch_size
-            multiple_of = self.vae_scale_factor * self._patch_size
-            img_h = (img_h // multiple_of) * multiple_of
-            img_w = (img_w // multiple_of) * multiple_of
-
-            processed = self.image_processor.preprocess(img, height=img_h, width=img_w)
-            preprocessed.append(processed)
-
-            # Use first image dimensions as default
-            if height is None:
-                height, width = img_h, img_w
-
-        return preprocessed, height, width
-
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
@@ -916,19 +833,11 @@ class GlmImagePipeline(nn.Module):
         prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
 
         # Get condition images for Image Edit mode
-        # Check if pre-processing was already done by DiffusionEngine
-        if hasattr(req, "preprocessed_image") and req.preprocessed_image is not None:
-            # Use pre-processed images from pre_process_func
-            preprocessed_images = req.preprocessed_image
-            condition_images = req.prompt_image if hasattr(req, "prompt_image") else req.pil_image
-            img_height = req.height
-            img_width = req.width
-        else:
-            # Fallback: preprocess in pipeline (for backward compatibility / debug)
-            condition_images = req.pil_image
-            if condition_images is not None and not isinstance(condition_images, list):
-                condition_images = [condition_images]
-            preprocessed_images, img_height, img_width = self._preprocess_condition_images(condition_images)
+        # Use pre-processed images from pre_process_func
+        preprocessed_images = req.preprocessed_image
+        condition_images = req.prompt_image if hasattr(req, "prompt_image") else req.pil_image
+        img_height = req.height
+        img_width = req.width
 
         is_image_edit = preprocessed_images is not None
 

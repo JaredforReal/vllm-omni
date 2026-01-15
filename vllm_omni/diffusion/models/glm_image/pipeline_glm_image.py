@@ -855,14 +855,32 @@ class GlmImagePipeline(nn.Module):
         if req.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
-        # 1. Generate prior tokens with AR model
-        logger.info("Generating prior tokens with AR model...")
-        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-            prompt=prompt,
-            image=condition_images,
-            height=height,
-            width=width,
-        )
+        # 1. Get prior tokens - either from external source (multistage) or generate internally
+        # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
+        external_prior_tokens = req.extra.get("prior_token_ids") if req.extra else None
+        external_prior_image_ids = req.extra.get("prior_token_image_ids") if req.extra else None
+
+        if external_prior_tokens is not None:
+            # Multistage mode: use externally provided prior tokens from vLLM AR stage
+            logger.info("Using externally provided prior tokens from AR stage...")
+            prior_token_id = external_prior_tokens
+            if isinstance(prior_token_id, list):
+                prior_token_id = torch.tensor(prior_token_id, dtype=torch.long, device=self.device)
+            elif isinstance(prior_token_id, torch.Tensor):
+                prior_token_id = prior_token_id.to(device=self.device, dtype=torch.long)
+            # Ensure shape is [1, num_tokens] for batch processing
+            if prior_token_id.dim() == 1:
+                prior_token_id = prior_token_id.unsqueeze(0)
+            prior_token_image_ids = external_prior_image_ids
+        else:
+            # Single-stage mode: generate prior tokens with internal AR model
+            logger.info("Generating prior tokens with AR model...")
+            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+                prompt=prompt,
+                image=condition_images,
+                height=height,
+                width=width,
+            )
 
         # 2. Encode prompt for glyph embeddings
         logger.info("Encoding prompt...")

@@ -24,7 +24,8 @@ stage_args:
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
-      hf_config_name: vision_language_encoder # Subfolder in model path
+      # Model path points to the main GLM-Image directory
+      # vLLM will load GlmImageForConditionalGeneration from it
     final_output: false # AR is not the final output
     is_comprehension: true
     default_sampling_params:
@@ -45,6 +46,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
+      model_arch: GlmImagePipeline # Required for diffusion model class resolution
       # Diffusion-specific parameters
       num_gpus: 1
       enforce_eager: true

@@ -599,7 +599,10 @@ def _stage_worker(
     )
     try:
         if stage_type == "diffusion":
-            engine_args.pop("model_stage")
+            engine_args.pop("model_stage", None)
+            # Pass model path to OmniDiffusion if not already in engine_args
+            if "model" not in engine_args:
+                engine_args["model"] = model
             stage_engine = OmniDiffusion(**engine_args)
         else:
             # Default to LLM engine

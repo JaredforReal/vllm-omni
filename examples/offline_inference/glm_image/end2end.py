@@ -225,9 +225,20 @@ def main(args: argparse.Namespace) -> None:
         detokenize=False,
     )
 
-    # For multistage, we may need multiple sampling_params (one per LLM stage)
-    # For GLM-Image: Stage 0 (AR) is LLM, Stage 1 (Diffusion) uses diffusion_kwargs
-    sampling_params_list = [ar_sampling_params]
+    # For diffusion stage, sampling_params contains diffusion-specific parameters
+    # These are passed as kwargs to the diffusion engine
+    diffusion_sampling_params = {
+        "num_inference_steps": args.num_inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "height": prompt_dict.get("height", 1024),
+        "width": prompt_dict.get("width", 1024),
+        "seed": args.seed,
+    }
+
+    # For multistage, we need sampling_params for each stage
+    # Stage 0 (AR): SamplingParams for vLLM
+    # Stage 1 (Diffusion): dict with diffusion kwargs
+    sampling_params_list = [ar_sampling_params, diffusion_sampling_params]
 
     # Run generation
     print(f"\nGenerating {args.num_prompts} image(s)...")

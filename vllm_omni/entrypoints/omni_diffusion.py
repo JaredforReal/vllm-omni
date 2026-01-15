@@ -51,34 +51,48 @@ class OmniDiffusion:
 
         self.od_config = od_config
 
-        # Diffusers-style models expose `model_index.json` with `_class_name`.
-        # Bagel models (and other non-diffusers) typically expose `config.json`.
-        try:
-            config_dict = get_hf_file_to_dict(
-                "model_index.json",
-                od_config.model,
-            )
-            od_config.model_class_name = config_dict.get("_class_name", None)
+        # Allow direct specification of model_class_name via model_arch parameter
+        # This is useful for multistage pipelines where we know the exact pipeline class
+        model_arch = kwargs.get("model_arch")
+        if model_arch and od_config.model_class_name is None:
+            od_config.model_class_name = model_arch
+            od_config.tf_model_config = TransformerConfig()
             od_config.update_multimodal_support()
-
-            tf_config_dict = get_hf_file_to_dict(
-                "transformer/config.json",
-                od_config.model,
-            )
-            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-        except (AttributeError, OSError, ValueError):
-            cfg = get_hf_file_to_dict("config.json", od_config.model)
-            if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
-
-            model_type = cfg.get("model_type")
-            architectures = cfg.get("architectures") or []
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
+            logger.info(f"Using model_arch '{model_arch}' as model_class_name")
+        elif od_config.model_class_name is None:
+            # Diffusers-style models expose `model_index.json` with `_class_name`.
+            # Bagel models (and other non-diffusers) typically expose `config.json`.
+            try:
+                config_dict = get_hf_file_to_dict(
+                    "model_index.json",
+                    od_config.model,
+                )
+                od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
-            else:
-                raise
+
+                tf_config_dict = get_hf_file_to_dict(
+                    "transformer/config.json",
+                    od_config.model,
+                )
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            except (AttributeError, OSError, ValueError):
+                cfg = get_hf_file_to_dict("config.json", od_config.model)
+                if cfg is None:
+                    raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+                model_type = cfg.get("model_type")
+                architectures = cfg.get("architectures") or []
+                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                    od_config.model_class_name = "BagelPipeline"
+                    od_config.tf_model_config = TransformerConfig()
+                    od_config.update_multimodal_support()
+                elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+                    # GLM-Image model detected
+                    od_config.model_class_name = "GlmImagePipeline"
+                    od_config.tf_model_config = TransformerConfig()
+                    od_config.update_multimodal_support()
+                else:
+                    raise
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 

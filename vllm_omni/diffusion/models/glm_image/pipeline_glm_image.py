@@ -56,6 +56,73 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 logger = logging.getLogger(__name__)
 
 
+def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
+    """Get pre-processing function for GLM-Image pipeline.
+
+    Pre-processes condition images before they are sent to the pipeline.
+    This is called by DiffusionEngine before batching requests.
+    """
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        block_out_channels = vae_config.get("block_out_channels", [128, 256, 512, 512])
+        vae_scale_factor = 2 ** (len(block_out_channels) - 1)
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+    # GLM-Image uses patch_size=2 for transformer
+    patch_size = 2
+
+    def pre_process_func(requests: list[OmniDiffusionRequest]):
+        """Pre-process condition images for Image Edit mode."""
+        for req in requests:
+            images = req.pil_image
+            if images is None:
+                # Text-to-image mode, no preprocessing needed
+                continue
+
+            if not isinstance(images, list):
+                images = [images]
+
+            preprocessed = []
+            height, width = None, None
+
+            for img in images:
+                if isinstance(img, PIL.Image.Image):
+                    img_h, img_w = img.size[::-1]  # PIL is (width, height)
+                else:
+                    img_h, img_w = img.shape[:2]
+
+                # Align to multiple of vae_scale_factor * patch_size
+                multiple_of = vae_scale_factor * patch_size
+                img_h = (img_h // multiple_of) * multiple_of
+                img_w = (img_w // multiple_of) * multiple_of
+
+                processed = image_processor.preprocess(img, height=img_h, width=img_w)
+                preprocessed.append(processed)
+
+                # Use first image dimensions as default
+                if height is None:
+                    height, width = img_h, img_w
+
+            # Store in request
+            req.preprocessed_image = preprocessed
+            req.prompt_image = images  # Keep original PIL images
+            if req.height is None:
+                req.height = height
+            if req.width is None:
+                req.width = width
+
+        return requests
+
+    return pre_process_func
+
+
 def get_glm_image_post_process_func(od_config: OmniDiffusionConfig):
     """Get post-processing function for GLM-Image pipeline."""
     model_name = od_config.model
@@ -849,12 +916,20 @@ class GlmImagePipeline(nn.Module):
         prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
 
         # Get condition images for Image Edit mode
-        condition_images = req.pil_image
-        if condition_images is not None and not isinstance(condition_images, list):
-            condition_images = [condition_images]
+        # Check if pre-processing was already done by DiffusionEngine
+        if hasattr(req, "preprocessed_image") and req.preprocessed_image is not None:
+            # Use pre-processed images from pre_process_func
+            preprocessed_images = req.preprocessed_image
+            condition_images = req.prompt_image if hasattr(req, "prompt_image") else req.pil_image
+            img_height = req.height
+            img_width = req.width
+        else:
+            # Fallback: preprocess in pipeline (for backward compatibility / debug)
+            condition_images = req.pil_image
+            if condition_images is not None and not isinstance(condition_images, list):
+                condition_images = [condition_images]
+            preprocessed_images, img_height, img_width = self._preprocess_condition_images(condition_images)
 
-        # Preprocess condition images and get dimensions
-        preprocessed_images, img_height, img_width = self._preprocess_condition_images(condition_images)
         is_image_edit = preprocessed_images is not None
 
         # Use image dimensions as default if available

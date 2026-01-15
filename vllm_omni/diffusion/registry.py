@@ -137,6 +137,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
+    "GlmImagePipeline": "get_glm_image_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
 }

@@ -441,15 +441,34 @@ class GlmImagePipeline(nn.Module):
         input_length = inputs["input_ids"].shape[-1]
 
         # Process condition images if provided
+        # prior_token_image_ids should be a LIST of tensors, one per condition image
         prior_token_image_ids = None
         if image is not None and existing_grid is not None:
             prior_token_image_embed = self.vision_language_encoder.get_image_features(
                 inputs["pixel_values"], existing_grid
             )
             prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
-            prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
+            # get_image_tokens returns a flat tensor, we need to split it per image
+            flat_prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
                 prior_token_image_embed, existing_grid
             )
+            # Split by image grid sizes and convert to list
+            # Each image has t*h*w tokens, we need to split and reshape
+            split_sizes = (existing_grid.prod(dim=-1)).tolist()
+            prior_token_image_ids_list = torch.split(flat_prior_token_image_ids, split_sizes, dim=0)
+            # Convert to list and add batch dimension for each, then upsample
+            prior_token_image_ids = []
+            for i, token_ids in enumerate(prior_token_image_ids_list):
+                grid_t, grid_h, grid_w = existing_grid[i].tolist()
+                # Reshape to [1, t*h*w] then upsample like the main prior_token_ids
+                token_ids = token_ids.view(1, -1)
+                # Upsample 2x (from d32 to d64)
+                token_ids_2d = token_ids.view(1, 1, grid_h, grid_w)
+                token_ids_upsampled = torch.nn.functional.interpolate(
+                    token_ids_2d.float(), scale_factor=2, mode="nearest"
+                ).to(dtype=torch.long)
+                token_ids_upsampled = token_ids_upsampled.view(1, -1)
+                prior_token_image_ids.append(token_ids_upsampled)
 
         # Generate with AR model
         outputs = self.vision_language_encoder.generate(
@@ -634,7 +653,7 @@ class GlmImagePipeline(nn.Module):
                         timestep=timestep,
                         target_size=target_size,
                         crop_coords=crop_coords,
-                        kv_caches=kv_caches,
+                        kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
                 else:
@@ -647,7 +666,7 @@ class GlmImagePipeline(nn.Module):
                         timestep=timestep,
                         target_size=target_size,
                         crop_coords=crop_coords,
-                        kv_caches=kv_caches,
+                        kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
 
@@ -690,7 +709,7 @@ class GlmImagePipeline(nn.Module):
                         timestep=timestep,
                         target_size=target_size,
                         crop_coords=crop_coords,
-                        kv_caches=kv_caches,
+                        kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
 
@@ -763,7 +782,7 @@ class GlmImagePipeline(nn.Module):
                 timestep=torch.zeros((1,), device=self.device),
                 target_size=torch.tensor([condition_image.shape[-2:]], device=self.device, dtype=prompt_embeds.dtype),
                 crop_coords=torch.zeros((1, 2), device=self.device, dtype=prompt_embeds.dtype),
-                kv_caches=kv_caches,
+                kv_cache=kv_caches,
                 return_dict=False,
             )
 

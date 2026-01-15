@@ -44,6 +44,9 @@ class OmniDiffusion:
     """
 
     def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
+        # Extract model_arch before passing to OmniDiffusionConfig (not a valid config field)
+        model_arch = kwargs.pop("model_arch", None)
+
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
         elif isinstance(od_config, dict):
@@ -53,7 +56,6 @@ class OmniDiffusion:
 
         # Allow direct specification of model_class_name via model_arch parameter
         # This is useful for multistage pipelines where we know the exact pipeline class
-        model_arch = kwargs.get("model_arch")
         if model_arch and od_config.model_class_name is None:
             od_config.model_class_name = model_arch
             od_config.tf_model_config = TransformerConfig()

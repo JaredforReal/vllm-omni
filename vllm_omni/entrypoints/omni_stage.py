@@ -443,6 +443,12 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
+    # Handle model_subdir for models with config in subdirectory (e.g., GLM-Image AR model)
+    model_subdir = engine_args.pop("model_subdir", None)
+    if model_subdir:
+        model = _os.path.join(model, model_subdir)
+        logger.info(f"Using model subdirectory: {model}")
+
     # Aggregates for running average
     _agg_total_tokens = 0
     _agg_total_gen_time_ms = 0.0

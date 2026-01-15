@@ -44,21 +44,16 @@ stage_args:
       devices: "1" # Can use different GPU, or same GPU if memory allows
       max_batch_size: 1
     engine_args:
-      model_arch: GlmImagePipeline
       model_stage: dit
       # Diffusion-specific parameters
       num_gpus: 1
-      cfg_parallel_size: 1 # Set to 2 for CFG parallelism on 2 GPUs
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image # Final output is image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
     engine_input_source: [0] # Input from AR stage
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.glm_image.ar2diffusion
     final_output: true
     final_output_type: image
-    is_comprehension: false
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

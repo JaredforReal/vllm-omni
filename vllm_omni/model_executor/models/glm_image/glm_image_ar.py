@@ -1785,24 +1785,27 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         for name, loaded_weight in weights:
             # Handle stacked parameters (QKV, gate_up)
+            is_stacked = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name not in params_dict:
                     break
-                param = params_dict[name]
+                param = params_dict[stacked_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(stacked_name)
+                is_stacked = True
                 break
-            else:
+
+            if not is_stacked:
                 # Regular weight loading
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
+                loaded_params.add(name)
 
         return loaded_params

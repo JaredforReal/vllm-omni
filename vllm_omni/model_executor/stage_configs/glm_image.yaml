@@ -16,6 +16,7 @@ stage_args:
       model_stage: ar
       model_arch: GlmImageForConditionalGeneration
       model_subdir: vision_language_encoder # AR model config.json is in this subdirectory
+      tokenizer_subdir: tokenizer # Tokenizer files are in tokenizer/ subdirectory
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6

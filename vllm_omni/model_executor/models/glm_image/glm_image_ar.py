@@ -1824,6 +1824,15 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Hidden states or intermediate tensors
         """
+        # Debug logging (first call only)
+        if not hasattr(self, "_logged_forward"):
+            self._logged_forward = True
+            logger.info(f"[GLM-Image Forward] input_ids shape: {input_ids.shape if input_ids is not None else None}")
+            logger.info(f"[GLM-Image Forward] positions shape: {positions.shape if positions is not None else None}")
+            logger.info(f"[GLM-Image Forward] pixel_values: {pixel_values is not None}")
+            logger.info(f"[GLM-Image Forward] image_grid_thw: {image_grid_thw}")
+            logger.info(f"[GLM-Image Forward] kwargs keys: {list(kwargs.keys())}")
+
         if intermediate_tensors is not None:
             inputs_embeds = None
 

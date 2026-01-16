@@ -29,8 +29,8 @@ stage_args:
     final_output: false # AR is not the final output
     is_comprehension: true
     default_sampling_params:
-      temperature: 1.0 # Must use sampling (not greedy) for image token generation
-      top_p: 1.0
+      temperature: 0.9 # From model's generation_config.json
+      top_p: 0.75 # From model's generation_config.json
       top_k: -1
       max_tokens: 16384 # Support up to 2048x2048 images (64x64 tokens * 4 = 16384)
       seed: 42

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Iterable
 
 import numpy as np
@@ -859,6 +860,7 @@ class GlmImagePipeline(nn.Module):
         external_prior_tokens = req.extra.get("prior_token_ids") if req.extra else None
         external_prior_image_ids = req.extra.get("prior_token_image_ids") if req.extra else None
 
+        ar_start_time = time.perf_counter()
         if external_prior_tokens is not None:
             # Multistage mode: use externally provided prior tokens from vLLM AR stage
             logger.info("Using externally provided prior tokens from AR stage...")
@@ -880,6 +882,8 @@ class GlmImagePipeline(nn.Module):
                 height=height,
                 width=width,
             )
+        ar_end_time = time.perf_counter()
+        logger.info(f"[Profile] AR stage took {ar_end_time - ar_start_time:.4f} seconds")
 
         # 2. Encode prompt for glyph embeddings
         logger.info("Encoding prompt...")
@@ -939,6 +943,7 @@ class GlmImagePipeline(nn.Module):
 
         # 7. Denoising loop with CFG-parallel support
         logger.info(f"Starting denoising loop with {num_inference_steps} steps...")
+        dit_start_time = time.perf_counter()
         latents = self.diffuse(
             latents=latents,
             prior_token_id=prior_token_id,
@@ -951,9 +956,12 @@ class GlmImagePipeline(nn.Module):
             do_classifier_free_guidance=do_classifier_free_guidance,
             kv_caches=kv_caches,
         )
+        dit_end_time = time.perf_counter()
+        logger.info(f"[Profile] DiT stage took {dit_end_time - dit_start_time:.4f}s ({num_inference_steps} steps)")
 
         # 8. VAE decode
         logger.info("Decoding latents with VAE...")
+        vae_start_time = time.perf_counter()
         latents = latents.to(self.vae.dtype)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -967,8 +975,15 @@ class GlmImagePipeline(nn.Module):
         )
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        vae_end_time = time.perf_counter()
+        logger.info(f"[Profile] VAE decode took {vae_end_time - vae_start_time:.4f} seconds")
 
         # 9. Leave post-process to vllm-omni pipeline
+        total_time = vae_end_time - ar_start_time
+        logger.info(
+            f"[Profile] Total generation time: {total_time:.4f}s (AR: {ar_end_time - ar_start_time:.4f}s,\
+                  DiT: {dit_end_time - dit_start_time:.4f}s, VAE: {vae_end_time - vae_start_time:.4f}s)"
+        )
 
         return DiffusionOutput(output=image)
 

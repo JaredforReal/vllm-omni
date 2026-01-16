@@ -68,6 +68,8 @@ def _parse_generated_tokens(
     small_token_w = token_w // 2
     small_image_tokens = small_token_h * small_token_w
 
+    token_tensor = torch.tensor(token_ids, dtype=torch.long)
+
     # Log actual values for debugging
     logger.info(
         f"_parse_generated_tokens: total_tokens={len(token_ids)}, "
@@ -75,11 +77,39 @@ def _parse_generated_tokens(
         f"small_image_tokens={small_image_tokens} ({small_token_h}x{small_token_w})"
     )
 
-    # Determine if this is text-to-image (has small + large) or image-to-image (large only)
+    # Analyze token distribution to find image tokens
+    # Image tokens should be in range [0, 16384) for VQ codebook
+    # Text tokens are typically higher values
+    logger.info(
+        f"Full sequence stats: min={token_tensor.min().item()}, "
+        f"max={token_tensor.max().item()}, "
+        f"unique={token_tensor.unique().numel()}"
+    )
+
+    # Look for the actual image tokens - they should be consecutive and in VQ range
+    # Print first 20 and last 20 tokens to understand the structure
+    logger.info(f"First 20 tokens: {token_tensor[:20].tolist()}")
+    logger.info(f"Last 20 tokens: {token_tensor[-20:].tolist()}")
+
+    # The actual structure for text-to-image from vLLM AR should be:
+    # [small_image_tokens (256)] + [large_image_tokens (1024)] + [EOS]
+    # Total expected: 256 + 1024 + 1 = 1281 tokens
+    # But we got 16384 tokens - this suggests the output includes prompt tokens
+
+    # For GLM-Image, the expected structure is that the model generates ALL new tokens
+    # including both small preview and large image tokens
+    # Since we got 16384 tokens, and 1024*16 = 16384, this might be at 2x downsampling
+    # Let's try different interpretations
+
+    # Possibility 1: tokens are at 2x scale (64x64 = 4096 for large, 32x32 = 1024 for small)
+    # Possibility 2: the output is padded or has a different format
+    # Possibility 3: tokens include repeated EOS or padding
+
     total_expected_t2i = small_image_tokens + large_image_tokens + 1  # +1 for EOS
     total_expected_i2i = large_image_tokens + 1
 
-    token_tensor = torch.tensor(token_ids, dtype=torch.long)
+    # Try to detect the end of meaningful tokens by looking for EOS patterns
+    # EOS token is typically a high value or repeated value at the end
 
     if len(token_ids) >= total_expected_t2i:
         # Text-to-image: extract large image tokens after small image tokens

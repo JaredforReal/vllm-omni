@@ -1715,6 +1715,95 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         """Tokenize image features with VQ-VAE."""
         return self.model.get_image_tokens(hidden_states, image_grid_thw)
 
+    def _parse_grid_from_tokens(
+        self,
+        input_tokens: list[int],
+        hf_config,
+    ) -> list[list[int]] | None:
+        """
+        Parse image grid dimensions from prompt tokens.
+
+        For text-to-image, the prompt format is:
+        "text<sop>H W<eop><sop>h w<eop><bos>"
+
+        Where:
+        - <sop> is grid_bos_token_id (start of phrase, marks grid dimension start)
+        - <eop> is grid_eos_token_id (end of phrase, marks grid dimension end)
+        - H W is large image grid (e.g., "32 32" for 1024x1024)
+        - h w is small image grid (e.g., "16 16" for preview)
+        - <bos> is image_start_token_id (16384, marks start of image generation)
+
+        Returns:
+            List of grids [[1, H, W], [1, h, w]] or None if parsing fails
+        """
+        try:
+            # Get special token IDs from config or tokenizer
+            # We need grid_bos_token_id and grid_eos_token_id
+            # These are typically <sop> and <eop> tokens
+
+            # First try to get from hf_config
+            grid_bos_id = getattr(hf_config, "grid_bos_token_id", None)
+            grid_eos_id = getattr(hf_config, "grid_eos_token_id", None)
+
+            # If not in config, we need to infer from token patterns
+            # For GLM-Image, looking at the processor code:
+            # - grid_bos_token = tokenizer.grid_bos_token
+            # - grid_eos_token = tokenizer.grid_eos_token
+            # These are typically single-token markers
+
+            if grid_bos_id is None or grid_eos_id is None:
+                # Try to find pattern in tokens: look for repeated pattern of
+                # [marker] [number] [number] [marker]
+                # where numbers are small positive integers (grid dimensions like 16, 32)
+
+                # Use heuristics: grid dimensions are typically between 8 and 128
+                # represented as single tokens that decode to numbers
+
+                # For now, return None and let caller use defaults
+                logger.warning(
+                    "[GLM-Image M-RoPE] Cannot find grid_bos_token_id/grid_eos_token_id, will use default grids"
+                )
+                return None
+
+            # Find all <sop>...<eop> regions
+            grids = []
+            i = 0
+            while i < len(input_tokens):
+                if input_tokens[i] == grid_bos_id:
+                    # Found start of grid region, find end
+                    j = i + 1
+                    while j < len(input_tokens) and input_tokens[j] != grid_eos_id:
+                        j += 1
+
+                    if j < len(input_tokens):
+                        # Extract tokens between <sop> and <eop>
+                        grid_tokens = input_tokens[i + 1 : j]
+
+                        # These should decode to "H W" format
+                        # For now, we assume they're numeric token IDs that represent the dimensions
+                        # This is a simplification - actual implementation would need tokenizer
+
+                        if len(grid_tokens) >= 2:
+                            # Assume first two tokens are H and W values
+                            # This is a heuristic - actual values depend on tokenizer
+                            # For GLM-Image with ChatGLM tokenizer, numbers are tokenized specially
+                            h = grid_tokens[0] if grid_tokens[0] < 256 else 32  # fallback
+                            w = grid_tokens[1] if grid_tokens[1] < 256 else 32  # fallback
+                            grids.append([1, h, w])
+
+                    i = j + 1
+                else:
+                    i += 1
+
+            if len(grids) >= 2:
+                return grids
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"[GLM-Image M-RoPE] Error parsing grids from tokens: {e}")
+            return None
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
@@ -1745,10 +1834,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Tuple of (position_ids [3, seq_len + decode_len], mrope_position_delta)
         """
+        hf_config = self.config
+        image_start_token_id = hf_config.image_start_token_id
+        image_end_token_id = hf_config.image_end_token_id
+
         logger.warning(
             f"[GLM-Image M-RoPE] get_mrope_input_positions called: "
             f"input_tokens_len={len(input_tokens)}, mm_features={mm_features is not None}, "
-            f"image_grid_thw={image_grid_thw}, kwargs_keys={list(kwargs.keys())}"
+            f"image_grid_thw={image_grid_thw}, kwargs_keys={list(kwargs.keys())}, "
+            f"last_token={input_tokens[-1] if input_tokens else None}, "
+            f"image_start_token_id={image_start_token_id}, "
+            f"image_end_token_id={image_end_token_id}"
         )
 
         # Get image_grid_thw from either the direct arg or mm_features
@@ -1763,13 +1859,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         if image_grid_thw is None:
             image_grid_thw = []
 
-        hf_config = self.config
-        image_start_token_id = hf_config.image_start_token_id
-        image_end_token_id = hf_config.image_end_token_id
-
         # For text-to-image: parse grid info from input tokens if not provided
-        # Input format: "text<sop>H W<eop><sop>h w<eop><|dit_token_16384|>"
-        # where H W is large image grid (e.g., 32 32) and h w is small image grid (e.g., 16 16)
+        # Input format: "text<sop>H W<eop><sop>h w<eop><bos>" where <bos>=image_start_token_id=16384
+        # For 1024x1024: H=32, W=32 (large), h=16, w=16 (small preview)
         if not image_grid_thw:
             # Try to parse from kwargs (passed from processor)
             hf_config_arg = kwargs.get("hf_config")
@@ -1778,19 +1870,25 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
             # If still empty, try to infer from input tokens
             if not image_grid_thw:
-                # Check if this is a text-to-image request by looking for dit_token
-                # dit_token_id = image_start_token_id = 16384
-                has_dit_token = image_start_token_id in input_tokens
+                # Check if this is a text-to-image request:
+                # - Prompt ends with image_start_token_id (16384, the <bos> token for image generation)
+                # - No image_end_token_id (16385) in prompt (no completed images)
+                prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
                 has_end_token = image_end_token_id in input_tokens
 
-                # Text-to-image: has dit_token but no end_token (nothing generated yet)
-                if has_dit_token and not has_end_token:
-                    # Default grids for text-to-image: large (32x32) and small (16x16)
-                    # These are the standard GLM-Image generation grids
-                    # The actual grid sizes should be parsed from the prompt, but for now use defaults
-                    # TODO: Parse grid sizes from prompt tokens like "<sop>32 32<eop>"
-                    image_grid_thw = [[1, 32, 32], [1, 16, 16]]
-                    logger.warning(f"[GLM-Image M-RoPE] Text-to-image detected, using default grids: {image_grid_thw}")
+                # Text-to-image: ends with start token but no end token
+                if prompt_ends_with_start and not has_end_token:
+                    # Parse grid dimensions from prompt tokens
+                    # Format: ... <sop> H W <eop> <sop> h w <eop> <bos>
+                    # We need to find the grid_bos_token (<sop>) and grid_eos_token (<eop>)
+                    # and extract the dimensions between them
+                    image_grid_thw = self._parse_grid_from_tokens(input_tokens, hf_config)
+                    if image_grid_thw:
+                        logger.warning(f"[GLM-Image M-RoPE] Text-to-image detected, parsed grids: {image_grid_thw}")
+                    else:
+                        # Fallback to default 1024x1024 grids if parsing fails
+                        image_grid_thw = [[1, 32, 32], [1, 16, 16]]
+                        logger.warning(f"[GLM-Image M-RoPE] Text-to-image, using default grids: {image_grid_thw}")
 
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []

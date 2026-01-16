@@ -216,8 +216,11 @@ def main(args: argparse.Namespace) -> None:
     # For multistage, the AR stage may need sampling params
     from vllm import SamplingParams
 
+    # IMPORTANT: GLM-Image AR model requires sampling (not greedy) for proper
+    # image token generation. Using temperature=0.0 causes degenerate repetitive
+    # tokens and black images. Must use temperature > 0 (default: 1.0).
     ar_sampling_params = SamplingParams(
-        temperature=0.0,
+        temperature=1.0,  # Must use sampling for image token diversity
         top_p=1.0,
         top_k=-1,
         max_tokens=args.max_tokens,

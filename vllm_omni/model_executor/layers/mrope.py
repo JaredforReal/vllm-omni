@@ -201,7 +201,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 context_len=context_len,
                 seq_len=seq_len,
             )
-        elif hf_config.model_type == "glm-image":
+        elif hf_config.model_type == "glm_image":
             # GLM-Image is an image generation model.
             # For text-to-image mode (no input images), use simple text-only positions.
             # For image-to-image mode, use GLM4V-style position encoding.

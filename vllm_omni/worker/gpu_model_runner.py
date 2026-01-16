@@ -106,6 +106,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
+            logger.info(
+                f"[M-RoPE Init] prompt_len={len(req_state.prompt_token_ids)}, "
+                f"mrope_positions_shape={req_state.mrope_positions.shape}, "
+                f"mrope_position_delta={req_state.mrope_position_delta}, "
+                f"image_grid_thw={image_grid_thw}"
+            )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
@@ -177,8 +183,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.mrope_positions.np[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
                         :, decode_start:decode_end
                     ]
+                    logger.debug(
+                        f"[M-RoPE] Using pre-computed decode positions: "
+                        f"decode_start={decode_start}, decode_end={decode_end}, "
+                        f"total_precomputed={total_precomputed}"
+                    )
                 else:
                     # Fallback to default linear positions for text-only generation
+                    logger.warning(
+                        f"[M-RoPE] Falling back to linear positions! "
+                        f"decode_end={decode_end} > total_precomputed={total_precomputed}, "
+                        f"num_prompt_tokens={num_prompt_tokens}, completion_part_len={completion_part_len}"
+                    )
                     assert req.mrope_position_delta is not None
                     MRotaryEmbedding.get_next_input_positions_tensor(
                         out=self.mrope_positions.np,

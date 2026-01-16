@@ -608,6 +608,7 @@ class Omni(OmniBase):
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
+        _req_start_perf_ts: dict[str, float] = {}  # perf_counter for profiling
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
             task = {
@@ -617,6 +618,7 @@ class Omni(OmniBase):
             }
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
+            _req_start_perf_ts[req_id] = time.perf_counter()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
         pbar = None
@@ -659,6 +661,11 @@ class Omni(OmniBase):
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+                t_stage_completed = time.perf_counter()
+                stage_elapsed = t_stage_completed - _req_start_perf_ts.get(req_id, t_stage_completed)
+                logger.info(
+                    f"[Profile] Stage {stage_id} completed: req_id={req_id}, elapsed_from_start={stage_elapsed:.3f}s"
+                )
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
@@ -723,6 +730,7 @@ class Omni(OmniBase):
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
+                    t_transition_start = time.perf_counter()
                     try:
                         next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
                     except Exception as e:
@@ -731,6 +739,11 @@ class Omni(OmniBase):
                             f" at stage {next_stage_id}: {e}",
                         )
                         continue
+                    t_transition_end = time.perf_counter()
+                    logger.info(
+                        f"[Profile] Stage {stage_id}→{next_stage_id} transition: "
+                        f"process_inputs={t_transition_end - t_transition_start:.4f}s, req_id={req_id}"
+                    )
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
 
                     # Check if we have a connector for this edge

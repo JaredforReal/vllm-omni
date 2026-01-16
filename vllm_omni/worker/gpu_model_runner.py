@@ -132,7 +132,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         - Default vLLM: decode positions use linear [N, N+1, N+2, ...] for all 3 dims
         - GLM-Image needs: temporal=constant, height/width=2D grid pattern
         """
-        from vllm.multimodal.utils import length_from_prompt_token_ids_or_embeds
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
 
         mrope_pos_ptr = 0
         for index, req_id in enumerate(self.input_batch.req_ids):

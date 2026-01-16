@@ -1715,7 +1715,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
-        mm_features: list[MultiModalFeatureSpec],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        image_grid_thw: list[list[int]] | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, int]:
         """
         Compute M-RoPE position IDs for GLM-Image generation.
@@ -1727,19 +1729,30 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
           - height: row position in image grid
           - width: column position in image grid
 
+        For text-to-image generation, we also pre-compute positions for the tokens
+        that will be generated (small image + large image + EOS), similar to how
+        transformers GLM-Image caches decode positions.
+
         Args:
             input_tokens: List of input token IDs
-            mm_features: Multimodal feature specifications
+            mm_features: Multimodal feature specifications (optional)
+            image_grid_thw: Pre-extracted image grid dimensions (optional)
+            **kwargs: Additional arguments (hf_config, video_grid_thw, etc.)
 
         Returns:
-            Tuple of (position_ids [3, seq_len], mrope_position_delta)
+            Tuple of (position_ids [3, seq_len + decode_len], mrope_position_delta)
         """
-        # Gather image grid info from multimodal features
-        kwargs = MultiModalFeatureSpec.gather_kwargs(
-            mm_features,
-            {"image_grid_thw"},
-        )
-        image_grid_thw = [item.tolist() for item in kwargs.get("image_grid_thw", [])]
+        # Get image_grid_thw from either the direct arg or mm_features
+        if image_grid_thw is None and mm_features is not None:
+            # Gather image grid info from multimodal features
+            feature_kwargs = MultiModalFeatureSpec.gather_kwargs(
+                mm_features,
+                {"image_grid_thw"},
+            )
+            image_grid_thw = [item.tolist() for item in feature_kwargs.get("image_grid_thw", [])]
+
+        if image_grid_thw is None:
+            image_grid_thw = []
 
         hf_config = self.config
         image_start_token_id = hf_config.image_start_token_id
@@ -1747,6 +1760,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []
+
+        # Count completed images (have end marker) vs images to generate
+        num_complete_images = sum(1 for t in input_tokens if t == image_end_token_id)
 
         if image_grid_thw:
             # Build position IDs considering image regions
@@ -1757,8 +1773,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             while i < seq_len:
                 token = input_tokens[i]
 
-                if token == image_start_token_id and image_idx < len(image_grid_thw):
-                    # Start of image region
+                if token == image_start_token_id and image_idx < num_complete_images:
+                    # This is a completed image (source image for i2i)
                     # Add position for the start marker
                     llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
                     current_pos += 1
@@ -1787,12 +1803,57 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     i += 1
 
                 else:
-                    # Regular text token
+                    # Regular text token (or trailing start marker for generation)
                     llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
                     current_pos += 1
                     i += 1
 
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1)
+            prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
+
+            # Pre-compute decode positions for images that will be generated
+            # This is critical for text-to-image where we need to generate image tokens
+            num_decode_grids = len(image_grid_thw) - num_complete_images
+
+            if num_decode_grids > 0:
+                decode_pos_lists: list[torch.Tensor] = []
+                decode_pos = current_pos
+
+                # Process grids in reverse order (last grid first for GLM-Image t2i)
+                # For t2i with grids [[1,32,32], [1,16,16]]:
+                # - First generate small image (16x16 = 256 tokens)
+                # - Then generate large image (32x32 = 1024 tokens)
+                # - Finally generate EOS
+                for i in range(1, num_decode_grids + 1):
+                    grid_idx = -i
+                    _, h, w = image_grid_thw[grid_idx]
+                    total_tokens = h * w
+
+                    # Build 2D positions for this generated image
+                    h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
+                    w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+
+                    decode_t = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                    decode_h = decode_pos + h_indices
+                    decode_w = decode_pos + w_indices
+
+                    decode_pos_lists.append(torch.stack([decode_t, decode_h, decode_w], dim=0))
+                    decode_pos = decode_pos + max(h, w)
+
+                # Add position for EOS token
+                decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+
+                decode_positions = torch.cat(decode_pos_lists, dim=1)
+
+                # Concatenate prefill and decode positions
+                llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
+
+                # Log for debugging
+                logger.info(
+                    f"[GLM-Image M-RoPE] prefill_len={prefill_positions.shape[1]}, "
+                    f"decode_len={decode_positions.shape[1]}, total_len={llm_positions.shape[1]}"
+                )
+            else:
+                llm_positions = prefill_positions
         else:
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)

@@ -444,10 +444,26 @@ def _stage_worker(
     stage_type = stage_payload.get("stage_type", "llm")
 
     # Handle model_subdir for models with config in subdirectory (e.g., GLM-Image AR model)
+    # Also handle tokenizer_subdir for when tokenizer is in a different location than model
     model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    base_model_path = model  # Keep original model path for tokenizer
+
     if model_subdir:
         model = _os.path.join(model, model_subdir)
         logger.info(f"Using model subdirectory: {model}")
+
+    # Set tokenizer path if different from model path
+    if tokenizer_subdir is not None:
+        # tokenizer_subdir can be empty string "" to use base_model_path directly
+        tokenizer_path = _os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info(f"Using tokenizer from: {tokenizer_path}")
+    elif model_subdir and "tokenizer" not in engine_args:
+        # If model is in subdirectory but tokenizer not specified, use base path
+        # This is common for models like GLM-Image where tokenizer is in root
+        engine_args["tokenizer"] = base_model_path
+        logger.info(f"Using tokenizer from base model path: {base_model_path}")
 
     # Aggregates for running average
     _agg_total_tokens = 0

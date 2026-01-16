@@ -229,15 +229,21 @@ class GlmImageDummyInputsBuilder(BaseDummyInputsBuilder[GlmImageProcessingInfo])
     ) -> MultiModalDataDict:
         """
         Generate dummy multimodal data for profiling.
+
+        Returns empty dict if no images (text-to-image mode).
         """
+        num_images = mm_counts.get("image", 0)
+
+        # Text-to-image mode: no multimodal data needed
+        if num_images == 0:
+            return {}
+
         hf_config = self.info.get_hf_config()
         vision_config = hf_config.vision_config
 
         # Default image size from config
         image_size = getattr(vision_config, "image_size", 2048)
         width = height = image_size
-
-        num_images = mm_counts.get("image", 0)
 
         image_overrides = mm_options.get("image") if mm_options else None
 
@@ -295,7 +301,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     ) -> Mapping[str, MultiModalFieldConfig]:
         """
         Get the multimodal field configuration.
+
+        Returns empty dict if no image data (text-to-image mode).
         """
+        # Check if we have image data
+        if "pixel_values" not in hf_inputs:
+            return {}
+
         return dict(
             pixel_values=MultiModalFieldConfig.batched("image"),
             image_grid_thw=MultiModalFieldConfig.batched("image"),
@@ -312,7 +324,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         GLM-Image replaces each image placeholder with:
         <|image_start|> + image_tokens + <|image_end|>
+
+        Returns empty list if no images (text-to-image mode).
         """
+        # Check if we have any images
+        if not mm_items.get_count("image", strict=False):
+            return []
+
         hf_config = self.info.get_hf_config()
 
         # Get special token IDs from config

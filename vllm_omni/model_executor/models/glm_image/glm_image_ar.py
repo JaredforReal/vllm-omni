@@ -138,10 +138,15 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
             return None
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # GLM-Image supports multiple source images for image-to-image generation
-        # or no image for text-to-image generation
-        # None means no limit on the number of images
-        return {"image": None}
+        # GLM-Image is an image GENERATION model, not an image understanding model.
+        # For text-to-image (t2i) mode: no multimodal input is needed
+        # For image-to-image (i2i) mode: source images are provided as input
+        #
+        # Return empty dict to indicate no multimodal inputs are required for
+        # profiling. Image-to-image mode will be handled dynamically at runtime.
+        # This prevents vLLM from trying to create dummy image inputs during
+        # model initialization.
+        return {}
 
     def get_num_image_tokens(
         self,
@@ -198,15 +203,23 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
 class GlmImageDummyInputsBuilder(BaseDummyInputsBuilder[GlmImageProcessingInfo]):
     """
     Builds dummy inputs for GLM-Image model profiling.
+
+    GLM-Image is an image GENERATION model. For text-to-image mode,
+    no multimodal inputs are needed - just a text prompt.
     """
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         """
-        Generate dummy text with image placeholders.
+        Generate dummy text for profiling.
 
-        GLM-Image uses <|image|> as the image placeholder token.
+        For text-to-image mode (no images), returns a simple text prompt.
+        For image-to-image mode, includes image placeholders.
         """
         num_images = mm_counts.get("image", 0)
+
+        # Text-to-image mode: return a simple text prompt for profiling
+        if num_images == 0:
+            return "A beautiful image."
 
         hf_config = self.info.get_hf_config()
         # Get image token from config or use default

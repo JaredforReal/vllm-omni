@@ -127,14 +127,48 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(GlmImageConfig)
 
     def get_hf_processor(self, **kwargs: object):
-        # GLM-Image uses a processor similar to Qwen2-VL
-        # Try to get GlmImageProcessor if available
+        """Get the GlmImageProcessor.
+
+        GLM-Image has a special directory structure where:
+        - Model (AR) is in: {base}/vision_language_encoder/
+        - Processor is in: {base}/processor/
+
+        Since model_subdir is used to load the AR model, the model_config.model
+        path points to vision_language_encoder/. We need to go up one level
+        and into processor/ to load the GlmImageProcessor.
+        """
+        import os
+
         try:
             from transformers import GlmImageProcessor
 
-            return self.ctx.get_hf_processor(GlmImageProcessor, **kwargs)
-        except ImportError:
+            # Get the model path from config
+            model_path = self.ctx.model_config.model
+
+            # Check if we're in a subdirectory (vision_language_encoder)
+            # and need to go to processor/ instead
+            if model_path.endswith("vision_language_encoder") or "/vision_language_encoder" in model_path:
+                # Go up one level and into processor/
+                base_path = os.path.dirname(model_path.rstrip("/"))
+                processor_path = os.path.join(base_path, "processor")
+            else:
+                # Try processor subdirectory of current path
+                processor_path = os.path.join(model_path, "processor")
+                if not os.path.exists(processor_path):
+                    processor_path = model_path
+
+            # Load processor directly from the correct path
+            return GlmImageProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=self.ctx.model_config.trust_remote_code,
+                **kwargs,
+            )
+        except (ImportError, OSError) as e:
             # Fallback: return None and handle in processor
+            from vllm.logger import init_logger
+
+            logger = init_logger(__name__)
+            logger.warning(f"Failed to load GlmImageProcessor: {e}")
             return None
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:

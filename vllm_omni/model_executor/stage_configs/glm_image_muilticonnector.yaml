@@ -31,10 +31,11 @@ stage_args:
     final_output: false # AR is not the final output
     is_comprehension: true
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 16384 # Support up to 2048x2048 images
+      temperature: 0.9 # From model's generation_config.json
+      top_p: 0.75 # From model's generation_config.json
+      top_k: 16512 # vision_vocab_size from generation_config.json
+      max_tokens: 1281 # For 1024x1024: small(16x16=256) + large(32x32=1024) + EOS(1)
+      stop_token_ids: [16385] # eos_token_id from generation_config.json
       seed: 42
       detokenize: false
 

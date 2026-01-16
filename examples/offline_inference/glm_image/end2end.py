@@ -51,6 +51,41 @@ DEFAULT_CONFIG_PATH = "vllm_omni/model_executor/stage_configs/glm_image.yaml"
 
 SEED = 42
 
+# GLM-Image special tokens
+GLM_IMAGE_EOS_TOKEN_ID = 16385  # eos_token_id from generation_config.json
+GLM_IMAGE_VISION_VOCAB_SIZE = 16512  # top_k should be vision_vocab_size
+
+
+def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
+    """
+    Compute max_new_tokens for GLM-Image AR generation.
+
+    GLM-Image generates tokens in this order for text-to-image:
+    1. Small preview image (half resolution in each dimension)
+    2. Large target image (full resolution)
+    3. EOS token
+
+    Args:
+        height: Target image height in pixels
+        width: Target image width in pixels
+        factor: Downsampling factor (32 for GLM-Image AR output)
+
+    Returns:
+        Total number of tokens to generate (small + large + EOS)
+    """
+    # Large image tokens (target resolution)
+    token_h = height // factor
+    token_w = width // factor
+    large_tokens = token_h * token_w
+
+    # Small preview tokens (half resolution in each dimension)
+    small_h = token_h // 2
+    small_w = token_w // 2
+    small_tokens = small_h * small_w
+
+    # Total: small + large + EOS
+    return small_tokens + large_tokens + 1
+
 
 def load_image(image_path: str) -> Image.Image:
     """Load an image from file path."""
@@ -226,14 +261,28 @@ def main(args: argparse.Namespace) -> None:
     # For multistage, the AR stage may need sampling params
     from vllm import SamplingParams
 
-    # IMPORTANT: GLM-Image AR model requires sampling (not greedy) for proper
-    # image token generation. Using temperature=0.0 causes degenerate repetitive
-    # tokens and black images. Must use temperature > 0 (default: 1.0).
+    # Compute max_tokens dynamically based on target image size
+    target_height = prompt_dict.get("height", 1024)
+    target_width = prompt_dict.get("width", 1024)
+    calculated_max_tokens = compute_max_tokens(target_height, target_width)
+
+    # Use calculated value unless user explicitly specified a different value
+    # Default args.max_tokens is 16384 (very large), so prefer calculated value
+    effective_max_tokens = calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
+
+    if args.verbose:
+        print(f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})")
+
+    # IMPORTANT: GLM-Image AR model requires these exact sampling parameters
+    # from generation_config.json for proper image token generation.
+    # - temperature=0.9, top_p=0.75, top_k=16512 (vision_vocab_size)
+    # - stop_token_ids=[16385] (eos_token_id) is CRITICAL to stop generation
     ar_sampling_params = SamplingParams(
-        temperature=1.0,  # Must use sampling for image token diversity
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=args.max_tokens,
+        temperature=0.9,  # From generation_config.json
+        top_p=0.75,  # From generation_config.json
+        top_k=GLM_IMAGE_VISION_VOCAB_SIZE,  # 16512, vision vocabulary size
+        max_tokens=effective_max_tokens,
+        stop_token_ids=[GLM_IMAGE_EOS_TOKEN_ID],  # 16385, CRITICAL for stopping
         seed=args.seed,
         detokenize=False,
     )

@@ -41,20 +41,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output: object | None = None
 
         # Override uses_mrope for models that use M-RoPE but vLLM's default
-        # detection fails (e.g., GLM-Image has mrope_section in text_config,
-        # but vLLM only checks top-level hf_config.rope_parameters)
+        # detection fails. GLM-Image uses M-RoPE (mrope_section in config.json)
+        # but transformers ignores it with warning:
+        # "Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section'}"
+        # So we hardcode the detection based on model_type.
         if not self.uses_mrope:
             hf_config = self.model_config.hf_config
-            # Check text_config for nested configs (like GLM-Image)
-            text_config = getattr(hf_config, "text_config", None)
-            if text_config is not None:
-                rope_params = getattr(text_config, "rope_parameters", None)
-                if rope_params is not None and rope_params.get("mrope_section") is not None:
-                    self.uses_mrope = True
-                    logger.info(
-                        f"[OmniGPUModelRunner] Enabling M-RoPE for model_type={hf_config.model_type} "
-                        f"(detected mrope_section in text_config)"
-                    )
+            model_type = getattr(hf_config, "model_type", None)
+            # GLM-Image uses M-RoPE with mrope_section: [8, 12, 12]
+            if model_type in ("glm_image",):
+                self.uses_mrope = True
+                logger.info(f"[OmniGPUModelRunner] Enabling M-RoPE for model_type={model_type}")
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)

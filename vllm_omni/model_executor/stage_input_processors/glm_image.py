@@ -144,8 +144,17 @@ def ar2diffusion(
 
         # Get original prompt info
         original_prompt = prompt[i] if i < len(prompt) else {}
-        if isinstance(original_prompt, (OmniTokensPrompt, TextPrompt)):
-            original_prompt = dict(original_prompt) if hasattr(original_prompt, "__iter__") else {}
+        # Handle various prompt types - convert to dict for uniform access
+        # Note: TypedDict (TextPrompt, OmniTokensPrompt) doesn't support isinstance
+        if isinstance(original_prompt, dict):
+            pass  # Already a dict
+        elif hasattr(original_prompt, "_asdict"):
+            # NamedTuple
+            original_prompt = original_prompt._asdict()
+        elif hasattr(original_prompt, "__dict__"):
+            original_prompt = vars(original_prompt)
+        else:
+            original_prompt = {}
 
         # Extract dimensions from original prompt or use defaults
         height = original_prompt.get("height", 1024)

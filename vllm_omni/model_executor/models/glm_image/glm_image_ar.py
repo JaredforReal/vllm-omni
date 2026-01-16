@@ -362,12 +362,16 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                     input_ids = hf_inputs["input_ids"]
                     if hasattr(input_ids, "shape"):
                         logger.info(f"[GLM-Image T2I] input_ids shape: {input_ids.shape}")
-                    tokenizer = self.info.get_tokenizer()
-                    if tokenizer is not None and hasattr(input_ids, "__len__"):
-                        # Decode to check the format
+                    # Use processor's tokenizer (not ByT5Tokenizer from tokenizer/ dir)
+                    # GlmImageProcessor has its own tokenizer with a different vocabulary
+                    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
                         ids_list = input_ids[0].tolist() if hasattr(input_ids[0], "tolist") else list(input_ids[0])
-                        decoded = tokenizer.decode(ids_list)
-                        logger.info(f"[GLM-Image T2I] decoded input: {decoded}")
+                        try:
+                            decoded = processor.tokenizer.decode(ids_list)
+                            logger.info(f"[GLM-Image T2I] decoded input: {decoded}")
+                        except Exception as e:
+                            logger.warning(f"[GLM-Image T2I] could not decode: {e}")
+                            logger.info(f"[GLM-Image T2I] first 50 token ids: {ids_list[:50]}")
 
                 if "image_grid_thw" in hf_inputs:
                     logger.info(f"[GLM-Image T2I] image_grid_thw: {hf_inputs['image_grid_thw']}")

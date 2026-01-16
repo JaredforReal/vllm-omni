@@ -1753,6 +1753,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        **kwargs: object,
     ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
         logits = self.logits_processor(

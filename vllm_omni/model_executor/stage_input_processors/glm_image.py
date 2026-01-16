@@ -78,65 +78,92 @@ def _parse_generated_tokens(
     )
 
     # Analyze token distribution to find image tokens
-    # Image tokens should be in range [0, 16384) for VQ codebook
-    # Text tokens are typically higher values
     logger.info(
         f"Full sequence stats: min={token_tensor.min().item()}, "
         f"max={token_tensor.max().item()}, "
         f"unique={token_tensor.unique().numel()}"
     )
 
-    # Look for the actual image tokens - they should be consecutive and in VQ range
     # Print first 20 and last 20 tokens to understand the structure
     logger.info(f"First 20 tokens: {token_tensor[:20].tolist()}")
     logger.info(f"Last 20 tokens: {token_tensor[-20:].tolist()}")
 
-    # The actual structure for text-to-image from vLLM AR should be:
-    # [small_image_tokens (256)] + [large_image_tokens (1024)] + [EOS]
-    # Total expected: 256 + 1024 + 1 = 1281 tokens
-    # But we got 16384 tokens - this suggests the output includes prompt tokens
+    # Remove EOS token (16385) from the end if present
+    eos_token_id = 16385
+    if len(token_ids) > 0 and token_ids[-1] == eos_token_id:
+        token_tensor = token_tensor[:-1]
+        logger.info(f"Removed EOS token, remaining: {len(token_tensor)} tokens")
 
-    # For GLM-Image, the expected structure is that the model generates ALL new tokens
-    # including both small preview and large image tokens
-    # Since we got 16384 tokens, and 1024*16 = 16384, this might be at 2x downsampling
-    # Let's try different interpretations
+    actual_tokens = len(token_tensor)
 
-    # Possibility 1: tokens are at 2x scale (64x64 = 4096 for large, 32x32 = 1024 for small)
-    # Possibility 2: the output is padded or has a different format
-    # Possibility 3: tokens include repeated EOS or padding
-
-    total_expected_t2i = small_image_tokens + large_image_tokens + 1  # +1 for EOS
-    total_expected_i2i = large_image_tokens + 1
-
-    # Try to detect the end of meaningful tokens by looking for EOS patterns
-    # EOS token is typically a high value or repeated value at the end
-
-    if len(token_ids) >= total_expected_t2i:
+    if actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens
         large_end = large_start + large_image_tokens
         prior_token_ids_d32 = token_tensor[large_start:large_end]
+        actual_h, actual_w = token_h, token_w
         logger.info(f"Text-to-image mode: extracting tokens [{large_start}:{large_end}]")
-    elif len(token_ids) >= total_expected_i2i:
+    elif actual_tokens >= large_image_tokens:
         # Image-to-image: large image tokens are at the beginning
         prior_token_ids_d32 = token_tensor[:large_image_tokens]
+        actual_h, actual_w = token_h, token_w
         logger.info(f"Image-to-image mode: extracting tokens [0:{large_image_tokens}]")
     else:
-        # Fallback: use whatever tokens we have
-        logger.warning(
-            f"Unexpected token count: {len(token_ids)}, expected at least {total_expected_i2i}. Using available tokens."
-        )
-        prior_token_ids_d32 = token_tensor[:large_image_tokens]
+        # Insufficient tokens - try to infer the actual grid size
+        # The model might have generated for a different resolution
+        import math
+
+        # Try to find a square grid that fits the available tokens
+        # First check if it matches any of the small+large patterns
+        for scale in [1, 2, 4]:
+            test_h = token_h // scale
+            test_w = token_w // scale
+            test_small_h = test_h // 2
+            test_small_w = test_w // 2
+            test_large = test_h * test_w
+            test_small = test_small_h * test_small_w
+
+            if actual_tokens >= test_small + test_large:
+                # Found matching grid for t2i
+                prior_token_ids_d32 = token_tensor[test_small : test_small + test_large]
+                actual_h, actual_w = test_h, test_w
+                # Adjust output dimensions
+                height = test_h * factor
+                width = test_w * factor
+                logger.warning(f"Adjusted grid to {test_h}x{test_w} (scale={scale}), output will be {height}x{width}")
+                break
+            elif actual_tokens >= test_large:
+                # Found matching grid for i2i
+                prior_token_ids_d32 = token_tensor[:test_large]
+                actual_h, actual_w = test_h, test_w
+                height = test_h * factor
+                width = test_w * factor
+                logger.warning(f"Adjusted grid to {test_h}x{test_w} (scale={scale}), output will be {height}x{width}")
+                break
+        else:
+            # Last resort: find closest square grid
+            sqrt_tokens = int(math.sqrt(actual_tokens))
+            actual_h = actual_w = sqrt_tokens
+            usable_tokens = sqrt_tokens * sqrt_tokens
+            prior_token_ids_d32 = token_tensor[:usable_tokens]
+            height = sqrt_tokens * factor
+            width = sqrt_tokens * factor
+            logger.error(
+                f"Could not match grid pattern. Using {sqrt_tokens}x{sqrt_tokens} grid "
+                f"({usable_tokens} tokens), output will be {height}x{width}. "
+                f"This likely indicates a prompt format issue."
+            )
 
     # Log token value statistics for debugging
     logger.info(
-        f"prior_token_ids_d32: min={prior_token_ids_d32.min().item()}, "
+        f"prior_token_ids_d32: shape={prior_token_ids_d32.shape}, "
+        f"min={prior_token_ids_d32.min().item()}, "
         f"max={prior_token_ids_d32.max().item()}, "
         f"unique_count={prior_token_ids_d32.unique().numel()}"
     )
 
     # Upsample from 32x to 16x
-    prior_token_ids = _upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+    prior_token_ids = _upsample_token_ids(prior_token_ids_d32, actual_h, actual_w)
 
     return prior_token_ids, height, width
 

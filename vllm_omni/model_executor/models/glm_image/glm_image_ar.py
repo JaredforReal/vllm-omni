@@ -343,6 +343,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 # Build messages format expected by processor
                 messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
+                logger.info("[GLM-Image T2I] Using GlmImageProcessor.apply_chat_template")
+                logger.info(f"[GLM-Image T2I] target_h={target_h}, target_w={target_w}")
+                logger.info(f"[GLM-Image T2I] prompt: {prompt[:200]}...")
+
                 # Use apply_chat_template which handles target dimensions
                 hf_inputs = processor.apply_chat_template(
                     messages,
@@ -352,6 +356,22 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                     return_dict=True,
                     return_tensors="pt",
                 )
+
+                # Debug: log the tokenized input
+                if "input_ids" in hf_inputs:
+                    input_ids = hf_inputs["input_ids"]
+                    if hasattr(input_ids, "shape"):
+                        logger.info(f"[GLM-Image T2I] input_ids shape: {input_ids.shape}")
+                    tokenizer = self.info.get_tokenizer()
+                    if tokenizer is not None and hasattr(input_ids, "__len__"):
+                        # Decode to check the format
+                        ids_list = input_ids[0].tolist() if hasattr(input_ids[0], "tolist") else list(input_ids[0])
+                        decoded = tokenizer.decode(ids_list)
+                        logger.info(f"[GLM-Image T2I] decoded input: {decoded}")
+
+                if "image_grid_thw" in hf_inputs:
+                    logger.info(f"[GLM-Image T2I] image_grid_thw: {hf_inputs['image_grid_thw']}")
+
                 return hf_inputs
             else:
                 # Fallback: just tokenize (this won't work properly for generation)

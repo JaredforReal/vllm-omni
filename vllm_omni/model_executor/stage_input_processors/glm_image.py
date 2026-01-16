@@ -191,7 +191,12 @@ def ar2diffusion(
                 diffusion_input[key] = original_prompt[key]
 
         diffusion_inputs.append(diffusion_input)
+        logger.info(
+            f"ar2diffusion: request {i}: prompt='{text_prompt[:50]}...', "
+            f"prior_token_ids shape={prior_token_ids.shape}, "
+            f"height={pixel_h}, width={pixel_w}"
+        )
 
-    logger.debug(f"ar2diffusion: processed {len(ar_outputs)} AR outputs → {len(diffusion_inputs)} diffusion inputs")
+    logger.info(f"ar2diffusion: processed {len(ar_outputs)} AR outputs → {len(diffusion_inputs)} diffusion inputs")
 
     return diffusion_inputs

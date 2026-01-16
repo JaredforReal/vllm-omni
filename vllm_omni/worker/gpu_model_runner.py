@@ -108,14 +108,17 @@ class OmniGPUModelRunner(GPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        if supports_mrope(self.model):
+        # Get unwrapped model - self.model may be wrapped in CUDAGraphWrapper
+        # after load_model(), which would break the isinstance check in supports_mrope()
+        model = self.get_model()
+        if supports_mrope(model):
             logger.warning(
                 f"[M-RoPE Init] Calling get_mrope_input_positions: "
                 f"prompt_len={len(req_state.prompt_token_ids)}, "
                 f"mm_features_count={len(req_state.mm_features) if req_state.mm_features else 0}, "
                 f"image_grid_thw={image_grid_thw}"
             )
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+            req_state.mrope_positions, req_state.mrope_position_delta = model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
                 hf_config=self.model_config.hf_config,

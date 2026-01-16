@@ -58,7 +58,15 @@ class OmniDiffusion:
         # This is useful for multistage pipelines where we know the exact pipeline class
         if model_arch and od_config.model_class_name is None:
             od_config.model_class_name = model_arch
-            od_config.tf_model_config = TransformerConfig()
+            # Try to load transformer config from transformer/config.json
+            try:
+                tf_config_dict = get_hf_file_to_dict(
+                    "transformer/config.json",
+                    od_config.model,
+                )
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            except (AttributeError, OSError, ValueError):
+                od_config.tf_model_config = TransformerConfig()
             od_config.update_multimodal_support()
             logger.info(f"Using model_arch '{model_arch}' as model_class_name")
         elif od_config.model_class_name is None:
@@ -89,9 +97,17 @@ class OmniDiffusion:
                     od_config.tf_model_config = TransformerConfig()
                     od_config.update_multimodal_support()
                 elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
-                    # GLM-Image model detected
+                    # GLM-Image model detected - load transformer config
                     od_config.model_class_name = "GlmImagePipeline"
-                    od_config.tf_model_config = TransformerConfig()
+                    # Try to load transformer config from transformer/config.json
+                    try:
+                        tf_config_dict = get_hf_file_to_dict(
+                            "transformer/config.json",
+                            od_config.model,
+                        )
+                        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                    except (AttributeError, OSError, ValueError):
+                        od_config.tf_model_config = TransformerConfig()
                     od_config.update_multimodal_support()
                 else:
                     raise

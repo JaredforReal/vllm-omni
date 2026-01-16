@@ -88,6 +88,11 @@ def build_prompt_for_t2i(
         "prompt": prompt,
         "height": height,
         "width": width,
+        # Pass target dimensions to AR processor for proper grid token generation
+        "mm_processor_kwargs": {
+            "target_h": height,
+            "target_w": width,
+        },
     }
 
 
@@ -122,6 +127,11 @@ def build_prompt_for_i2i(
         },
         "height": height,
         "width": width,
+        # Pass target dimensions to AR processor for proper grid token generation
+        "mm_processor_kwargs": {
+            "target_h": height,
+            "target_w": width,
+        },
     }
 
 

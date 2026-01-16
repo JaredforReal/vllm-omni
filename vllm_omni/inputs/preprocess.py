@@ -20,6 +20,55 @@ class OmniInputPreprocessor(InputPreprocessor):
     Supports processing tokens, embeddings, text, and multimodal inputs.
     """
 
+    def _process_text(
+        self,
+        parsed_content: TextPrompt,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        mm_uuids: MultiModalUUIDDict | None = None,
+    ) -> OmniTokenInputs | MultiModalInputs:
+        """Process text prompts with support for mm_processor_kwargs.
+
+        Override the base class to support passing mm_processor_kwargs even when
+        there's no multi_modal_data. This is needed for models like GLM-Image
+        where text-to-image generation requires processor kwargs (target_h, target_w)
+        to properly format the prompt with grid tokens.
+        """
+        prompt_text = parsed_content["prompt"]
+        mm_processor_kwargs = parsed_content.get("mm_processor_kwargs") or {}
+
+        inputs: OmniTokenInputs | MultiModalInputs
+        if multi_modal_data := parsed_content.get("multi_modal_data"):
+            inputs = self._process_multimodal(
+                prompt_text,
+                multi_modal_data,
+                mm_processor_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
+        elif mm_processor_kwargs:
+            # Handle case where mm_processor_kwargs is provided without multi_modal_data
+            # This is needed for GLM-Image text-to-image mode where the processor
+            # needs target_h/target_w to build the prompt with grid tokens
+            inputs = self._process_multimodal(
+                prompt_text,
+                {},  # Empty multi_modal_data
+                mm_processor_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
+        else:
+            prompt_token_ids = self._tokenize_prompt(
+                prompt_text,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+            inputs = token_inputs_omni(prompt_token_ids=prompt_token_ids)
+
+        if cache_salt := parsed_content.get("cache_salt"):
+            inputs["cache_salt"] = cache_salt
+
+        return inputs
+
     def _process_tokens(
         self,
         parsed_content: TokensPrompt,

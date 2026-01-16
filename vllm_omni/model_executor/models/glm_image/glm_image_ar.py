@@ -290,14 +290,40 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         Call the HuggingFace processor.
 
-        If no multimodal data is provided (text-to-image mode),
-        we only tokenize the text.
+        For text-to-image mode (no images), we need to:
+        1. Build the prompt with target grid dimensions
+        2. Build the image_grid_thw tensor for M-RoPE position encoding
+
+        For image-to-image mode, we use the full processor.
         """
         if not mm_data or not mm_data.get("image"):
-            # Text-to-image mode: just tokenize the prompt
-            tokenizer = self.info.get_tokenizer()
-            prompt_ids = tokenizer.encode(prompt)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+            # Text-to-image mode: use GlmImageProcessor with target dimensions
+            # This is critical - the processor adds grid tokens that tell the model
+            # what resolution to generate
+            processor = self.info.get_hf_processor()
+            if processor is not None:
+                # Get target dimensions from mm_kwargs or use defaults
+                target_h = mm_kwargs.get("target_h", 1024) if mm_kwargs else 1024
+                target_w = mm_kwargs.get("target_w", 1024) if mm_kwargs else 1024
+
+                # Build messages format expected by processor
+                messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+                # Use apply_chat_template which handles target dimensions
+                hf_inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    target_h=target_h,
+                    target_w=target_w,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                return hf_inputs
+            else:
+                # Fallback: just tokenize (this won't work properly for generation)
+                tokenizer = self.info.get_tokenizer()
+                prompt_ids = tokenizer.encode(prompt)
+                return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
         # Image-to-image mode: use full processor
         return super()._call_hf_processor(
@@ -315,16 +341,20 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         Get the multimodal field configuration.
 
-        Returns empty dict if no image data (text-to-image mode).
+        For text-to-image: only image_grid_thw is needed (no pixel_values)
+        For image-to-image: both pixel_values and image_grid_thw are needed
         """
-        # Check if we have image data
-        if "pixel_values" not in hf_inputs:
-            return {}
+        result = {}
 
-        return dict(
-            pixel_values=MultiModalFieldConfig.batched("image"),
-            image_grid_thw=MultiModalFieldConfig.batched("image"),
-        )
+        # image_grid_thw is needed for both t2i and i2i (for M-RoPE position encoding)
+        if "image_grid_thw" in hf_inputs:
+            result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+
+        # pixel_values only present in image-to-image mode
+        if "pixel_values" in hf_inputs:
+            result["pixel_values"] = MultiModalFieldConfig.batched("image")
+
+        return result
 
     def _get_prompt_updates(
         self,

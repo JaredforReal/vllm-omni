@@ -96,6 +96,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
         if supports_mrope(self.model):
+            logger.warning(
+                f"[M-RoPE Init] Calling get_mrope_input_positions: "
+                f"prompt_len={len(req_state.prompt_token_ids)}, "
+                f"mm_features_count={len(req_state.mm_features) if req_state.mm_features else 0}, "
+                f"image_grid_thw={image_grid_thw}"
+            )
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
@@ -106,13 +112,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
-            logger.info(
-                f"[M-RoPE Init] prompt_len={len(req_state.prompt_token_ids)}, "
+            logger.warning(
+                f"[M-RoPE Init] Result: "
                 f"mrope_positions_shape={req_state.mrope_positions.shape}, "
-                f"mrope_position_delta={req_state.mrope_position_delta}, "
-                f"image_grid_thw={image_grid_thw}"
+                f"mrope_position_delta={req_state.mrope_position_delta}"
             )
         else:
+            logger.warning("[M-RoPE Init] Model does not support M-RoPE, using default")
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
                 hf_config=self.model_config.hf_config,

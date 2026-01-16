@@ -1745,7 +1745,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Tuple of (position_ids [3, seq_len + decode_len], mrope_position_delta)
         """
-        logger.info(
+        logger.warning(
             f"[GLM-Image M-RoPE] get_mrope_input_positions called: "
             f"input_tokens_len={len(input_tokens)}, mm_features={mm_features is not None}, "
             f"image_grid_thw={image_grid_thw}, kwargs_keys={list(kwargs.keys())}"
@@ -1790,7 +1790,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     # The actual grid sizes should be parsed from the prompt, but for now use defaults
                     # TODO: Parse grid sizes from prompt tokens like "<sop>32 32<eop>"
                     image_grid_thw = [[1, 32, 32], [1, 16, 16]]
-                    logger.info(f"[GLM-Image M-RoPE] Text-to-image detected, using default grids: {image_grid_thw}")
+                    logger.warning(f"[GLM-Image M-RoPE] Text-to-image detected, using default grids: {image_grid_thw}")
 
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []
@@ -1882,15 +1882,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
 
                 # Log for debugging
-                logger.info(
+                logger.warning(
                     f"[GLM-Image M-RoPE] prefill_len={prefill_positions.shape[1]}, "
                     f"decode_len={decode_positions.shape[1]}, total_len={llm_positions.shape[1]}"
                 )
             else:
                 llm_positions = prefill_positions
+                logger.warning(f"[GLM-Image M-RoPE] No decode grids, prefill_len={prefill_positions.shape[1]}")
         else:
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
+            logger.warning(f"[GLM-Image M-RoPE] Pure text mode, positions_len={seq_len}")
 
         mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
         return llm_positions, mrope_position_delta

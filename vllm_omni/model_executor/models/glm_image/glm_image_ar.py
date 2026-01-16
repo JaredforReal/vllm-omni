@@ -406,16 +406,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # image_grid_thw is needed for both t2i and i2i (for M-RoPE position encoding)
         # For text-to-image, we don't have pixel_values but still need image_grid_thw
-        # Use "image" modality so it gets processed, or use flat for metadata-only fields
+        # Always use batched("image") - the fallback in get_mrope_input_positions will handle
+        # the case where image_grid_thw is not passed through mm_features
         if "image_grid_thw" in hf_inputs:
-            # Check if we have pixel_values (image-to-image) or not (text-to-image)
-            if "pixel_values" in hf_inputs:
-                # Image-to-image: batch with image modality
-                result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
-            else:
-                # Text-to-image: use flat config to ensure it's passed through
-                # This is metadata that doesn't depend on actual image data
-                result["image_grid_thw"] = MultiModalFieldConfig.flat("image", allow_missing=True)
+            result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
 
         # pixel_values only present in image-to-image mode
         if "pixel_values" in hf_inputs:

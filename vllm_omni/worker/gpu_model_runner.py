@@ -112,12 +112,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         # after load_model(), which would break the isinstance check in supports_mrope()
         model = self.get_model()
         if supports_mrope(model):
-            logger.warning(
-                f"[M-RoPE Init] Calling get_mrope_input_positions: "
-                f"prompt_len={len(req_state.prompt_token_ids)}, "
-                f"mm_features_count={len(req_state.mm_features) if req_state.mm_features else 0}, "
-                f"image_grid_thw={image_grid_thw}"
-            )
             req_state.mrope_positions, req_state.mrope_position_delta = model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
@@ -128,13 +122,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
-            logger.warning(
-                f"[M-RoPE Init] Result: "
-                f"mrope_positions_shape={req_state.mrope_positions.shape}, "
-                f"mrope_position_delta={req_state.mrope_position_delta}"
-            )
         else:
-            logger.warning("[M-RoPE Init] Model does not support M-RoPE, using default")
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
                 hf_config=self.model_config.hf_config,
@@ -148,17 +136,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         """Calculate M-RoPE positions for scheduled tokens.
 
-        This method overrides the base vLLM implementation to support models
-        like GLM-Image that pre-compute decode positions with 2D spatial encoding.
-
-        For GLM-Image text-to-image generation:
-        - Prefill positions: Use pre-computed positions from get_mrope_input_positions
-        - Decode positions: Also use pre-computed 2D spatial positions instead of
-          the default linear positions from get_next_input_positions_tensor
-
-        The key difference from vLLM's default behavior:
-        - Default vLLM: decode positions use linear [N, N+1, N+2, ...] for all 3 dims
-        - GLM-Image needs: temporal=constant, height/width=2D grid pattern
+        Overrides base vLLM to use pre-computed 2D spatial positions for decode
+        phase (for models like GLM-Image) instead of linear positions.
         """
         from vllm.utils import length_from_prompt_token_ids_or_embeds
 
@@ -205,18 +184,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.mrope_positions.np[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
                         :, decode_start:decode_end
                     ]
-                    logger.debug(
-                        f"[M-RoPE] Using pre-computed decode positions: "
-                        f"decode_start={decode_start}, decode_end={decode_end}, "
-                        f"total_precomputed={total_precomputed}"
-                    )
                 else:
                     # Fallback to default linear positions for text-only generation
-                    logger.warning(
-                        f"[M-RoPE] Falling back to linear positions! "
-                        f"decode_end={decode_end} > total_precomputed={total_precomputed}, "
-                        f"num_prompt_tokens={num_prompt_tokens}, completion_part_len={completion_part_len}"
-                    )
                     assert req.mrope_position_delta is not None
                     MRotaryEmbedding.get_next_input_positions_tensor(
                         out=self.mrope_positions.np,

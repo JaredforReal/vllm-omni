@@ -343,10 +343,6 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 # Build messages format expected by processor
                 messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
-                logger.info("[GLM-Image T2I] Using GlmImageProcessor.apply_chat_template")
-                logger.info(f"[GLM-Image T2I] target_h={target_h}, target_w={target_w}")
-                logger.info(f"[GLM-Image T2I] prompt: {prompt[:200]}...")
-
                 # Use apply_chat_template which handles target dimensions
                 hf_inputs = processor.apply_chat_template(
                     messages,
@@ -356,25 +352,6 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                     return_dict=True,
                     return_tensors="pt",
                 )
-
-                # Debug: log the tokenized input
-                if "input_ids" in hf_inputs:
-                    input_ids = hf_inputs["input_ids"]
-                    if hasattr(input_ids, "shape"):
-                        logger.info(f"[GLM-Image T2I] input_ids shape: {input_ids.shape}")
-                    # Use processor's tokenizer (not ByT5Tokenizer from tokenizer/ dir)
-                    # GlmImageProcessor has its own tokenizer with a different vocabulary
-                    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
-                        ids_list = input_ids[0].tolist() if hasattr(input_ids[0], "tolist") else list(input_ids[0])
-                        try:
-                            decoded = processor.tokenizer.decode(ids_list)
-                            logger.info(f"[GLM-Image T2I] decoded input: {decoded}")
-                        except Exception as e:
-                            logger.warning(f"[GLM-Image T2I] could not decode: {e}")
-                            logger.info(f"[GLM-Image T2I] first 50 token ids: {ids_list[:50]}")
-
-                if "image_grid_thw" in hf_inputs:
-                    logger.info(f"[GLM-Image T2I] image_grid_thw: {hf_inputs['image_grid_thw']}")
 
                 return hf_inputs
             else:
@@ -1759,10 +1736,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # Use heuristics: grid dimensions are typically between 8 and 128
                 # represented as single tokens that decode to numbers
 
-                # For now, return None and let caller use defaults
-                logger.warning(
-                    "[GLM-Image M-RoPE] Cannot find grid_bos_token_id/grid_eos_token_id, will use default grids"
-                )
+                # Cannot find grid tokens, let caller use defaults
                 return None
 
             # Find all <sop>...<eop> regions
@@ -1800,8 +1774,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
             return None
 
-        except Exception as e:
-            logger.warning(f"[GLM-Image M-RoPE] Error parsing grids from tokens: {e}")
+        except Exception:
             return None
 
     def get_mrope_input_positions(
@@ -1811,41 +1784,19 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         image_grid_thw: list[list[int]] | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, int]:
-        """
-        Compute M-RoPE position IDs for GLM-Image generation.
+        """Compute M-RoPE position IDs for GLM-Image.
 
-        GLM-Image uses 3D position encoding:
-        - For text tokens: all 3 dimensions (temporal, height, width) are the same
-        - For image tokens:
-          - temporal: constant (marks image region)
-          - height: row position in image grid
-          - width: column position in image grid
+        GLM-Image uses 3D positional encoding where text tokens have identical
+        values across all dimensions, while image tokens use 2D grid positions.
 
-        For text-to-image generation, we also pre-compute positions for the tokens
-        that will be generated (small image + large image + EOS), similar to how
-        transformers GLM-Image caches decode positions.
-
-        Args:
-            input_tokens: List of input token IDs
-            mm_features: Multimodal feature specifications (optional)
-            image_grid_thw: Pre-extracted image grid dimensions (optional)
-            **kwargs: Additional arguments (hf_config, video_grid_thw, etc.)
+        For text-to-image, also pre-computes decode positions for generated tokens.
 
         Returns:
-            Tuple of (position_ids [3, seq_len + decode_len], mrope_position_delta)
+            Tuple of (position_ids [3, total_len], mrope_position_delta)
         """
         hf_config = self.config
         image_start_token_id = hf_config.image_start_token_id
         image_end_token_id = hf_config.image_end_token_id
-
-        logger.warning(
-            f"[GLM-Image M-RoPE] get_mrope_input_positions called: "
-            f"input_tokens_len={len(input_tokens)}, mm_features={mm_features is not None}, "
-            f"image_grid_thw={image_grid_thw}, kwargs_keys={list(kwargs.keys())}, "
-            f"last_token={input_tokens[-1] if input_tokens else None}, "
-            f"image_start_token_id={image_start_token_id}, "
-            f"image_end_token_id={image_end_token_id}"
-        )
 
         # Get image_grid_thw from either the direct arg or mm_features
         if image_grid_thw is None and mm_features is not None:
@@ -1879,16 +1830,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # Text-to-image: ends with start token but no end token
                 if prompt_ends_with_start and not has_end_token:
                     # Parse grid dimensions from prompt tokens
-                    # Format: ... <sop> H W <eop> <sop> h w <eop> <bos>
-                    # We need to find the grid_bos_token (<sop>) and grid_eos_token (<eop>)
-                    # and extract the dimensions between them
                     image_grid_thw = self._parse_grid_from_tokens(input_tokens, hf_config)
-                    if image_grid_thw:
-                        logger.warning(f"[GLM-Image M-RoPE] Text-to-image detected, parsed grids: {image_grid_thw}")
-                    else:
+                    if not image_grid_thw:
                         # Fallback to default 1024x1024 grids if parsing fails
                         image_grid_thw = [[1, 32, 32], [1, 16, 16]]
-                        logger.warning(f"[GLM-Image M-RoPE] Text-to-image, using default grids: {image_grid_thw}")
 
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []
@@ -1978,19 +1923,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
                 # Concatenate prefill and decode positions
                 llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
-
-                # Log for debugging
-                logger.warning(
-                    f"[GLM-Image M-RoPE] prefill_len={prefill_positions.shape[1]}, "
-                    f"decode_len={decode_positions.shape[1]}, total_len={llm_positions.shape[1]}"
-                )
             else:
                 llm_positions = prefill_positions
-                logger.warning(f"[GLM-Image M-RoPE] No decode grids, prefill_len={prefill_positions.shape[1]}")
         else:
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
-            logger.warning(f"[GLM-Image M-RoPE] Pure text mode, positions_len={seq_len}")
 
         mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
         return llm_positions, mrope_position_delta
@@ -2019,15 +1956,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Hidden states or intermediate tensors
         """
-        # Debug logging (first call only)
-        if not hasattr(self, "_logged_forward"):
-            self._logged_forward = True
-            logger.info(f"[GLM-Image Forward] input_ids shape: {input_ids.shape if input_ids is not None else None}")
-            logger.info(f"[GLM-Image Forward] positions shape: {positions.shape if positions is not None else None}")
-            logger.info(f"[GLM-Image Forward] pixel_values: {pixel_values is not None}")
-            logger.info(f"[GLM-Image Forward] image_grid_thw: {image_grid_thw}")
-            logger.info(f"[GLM-Image Forward] kwargs keys: {list(kwargs.keys())}")
-
         if intermediate_tensors is not None:
             inputs_embeds = None
 

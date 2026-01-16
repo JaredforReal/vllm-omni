@@ -405,8 +405,17 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         result = {}
 
         # image_grid_thw is needed for both t2i and i2i (for M-RoPE position encoding)
+        # For text-to-image, we don't have pixel_values but still need image_grid_thw
+        # Use "image" modality so it gets processed, or use flat for metadata-only fields
         if "image_grid_thw" in hf_inputs:
-            result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+            # Check if we have pixel_values (image-to-image) or not (text-to-image)
+            if "pixel_values" in hf_inputs:
+                # Image-to-image: batch with image modality
+                result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+            else:
+                # Text-to-image: use flat config to ensure it's passed through
+                # This is metadata that doesn't depend on actual image data
+                result["image_grid_thw"] = MultiModalFieldConfig.flat("image", allow_missing=True)
 
         # pixel_values only present in image-to-image mode
         if "pixel_values" in hf_inputs:
@@ -1742,6 +1751,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Tuple of (position_ids [3, seq_len + decode_len], mrope_position_delta)
         """
+        logger.info(
+            f"[GLM-Image M-RoPE] get_mrope_input_positions called: "
+            f"input_tokens_len={len(input_tokens)}, mm_features={mm_features is not None}, "
+            f"image_grid_thw={image_grid_thw}, kwargs_keys={list(kwargs.keys())}"
+        )
+
         # Get image_grid_thw from either the direct arg or mm_features
         if image_grid_thw is None and mm_features is not None:
             # Gather image grid info from multimodal features
@@ -1757,6 +1772,31 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         hf_config = self.config
         image_start_token_id = hf_config.image_start_token_id
         image_end_token_id = hf_config.image_end_token_id
+
+        # For text-to-image: parse grid info from input tokens if not provided
+        # Input format: "text<sop>H W<eop><sop>h w<eop><|dit_token_16384|>"
+        # where H W is large image grid (e.g., 32 32) and h w is small image grid (e.g., 16 16)
+        if not image_grid_thw:
+            # Try to parse from kwargs (passed from processor)
+            hf_config_arg = kwargs.get("hf_config")
+            if hf_config_arg is not None and hasattr(hf_config_arg, "image_grid_thw"):
+                image_grid_thw = hf_config_arg.image_grid_thw
+
+            # If still empty, try to infer from input tokens
+            if not image_grid_thw:
+                # Check if this is a text-to-image request by looking for dit_token
+                # dit_token_id = image_start_token_id = 16384
+                has_dit_token = image_start_token_id in input_tokens
+                has_end_token = image_end_token_id in input_tokens
+
+                # Text-to-image: has dit_token but no end_token (nothing generated yet)
+                if has_dit_token and not has_end_token:
+                    # Default grids for text-to-image: large (32x32) and small (16x16)
+                    # These are the standard GLM-Image generation grids
+                    # The actual grid sizes should be parsed from the prompt, but for now use defaults
+                    # TODO: Parse grid sizes from prompt tokens like "<sop>32 32<eop>"
+                    image_grid_thw = [[1, 32, 32], [1, 16, 16]]
+                    logger.info(f"[GLM-Image M-RoPE] Text-to-image detected, using default grids: {image_grid_thw}")
 
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []

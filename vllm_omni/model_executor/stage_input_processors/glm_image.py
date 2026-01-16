@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
-from math import sqrt
 from typing import Any
 
 import torch
@@ -57,16 +56,24 @@ def _parse_generated_tokens(
     Returns:
         Tuple of (upsampled_prior_token_ids, pixel_height, pixel_width)
     """
-    # Calculate token dimensions
+    # Calculate token dimensions for target image
     token_h = height // factor
     token_w = width // factor
     large_image_tokens = token_h * token_w
 
-    # Calculate small image dimensions (used in text-to-image)
-    ratio = token_h / token_w
-    prev_token_h = int(sqrt(ratio) * (factor // 2))
-    prev_token_w = int(sqrt(1 / ratio) * (factor // 2))
-    small_image_tokens = prev_token_h * prev_token_w
+    # Calculate small preview image dimensions (used in text-to-image)
+    # GLM-Image generates a small preview at 1/4 resolution before the full image
+    # The preview grid is computed as target_grid / 2 in each dimension
+    small_token_h = token_h // 2
+    small_token_w = token_w // 2
+    small_image_tokens = small_token_h * small_token_w
+
+    # Log actual values for debugging
+    logger.info(
+        f"_parse_generated_tokens: total_tokens={len(token_ids)}, "
+        f"large_image_tokens={large_image_tokens} ({token_h}x{token_w}), "
+        f"small_image_tokens={small_image_tokens} ({small_token_h}x{small_token_w})"
+    )
 
     # Determine if this is text-to-image (has small + large) or image-to-image (large only)
     total_expected_t2i = small_image_tokens + large_image_tokens + 1  # +1 for EOS
@@ -79,15 +86,24 @@ def _parse_generated_tokens(
         large_start = small_image_tokens
         large_end = large_start + large_image_tokens
         prior_token_ids_d32 = token_tensor[large_start:large_end]
+        logger.info(f"Text-to-image mode: extracting tokens [{large_start}:{large_end}]")
     elif len(token_ids) >= total_expected_i2i:
         # Image-to-image: large image tokens are at the beginning
         prior_token_ids_d32 = token_tensor[:large_image_tokens]
+        logger.info(f"Image-to-image mode: extracting tokens [0:{large_image_tokens}]")
     else:
         # Fallback: use whatever tokens we have
         logger.warning(
             f"Unexpected token count: {len(token_ids)}, expected at least {total_expected_i2i}. Using available tokens."
         )
         prior_token_ids_d32 = token_tensor[:large_image_tokens]
+
+    # Log token value statistics for debugging
+    logger.info(
+        f"prior_token_ids_d32: min={prior_token_ids_d32.min().item()}, "
+        f"max={prior_token_ids_d32.max().item()}, "
+        f"unique_count={prior_token_ids_d32.unique().numel()}"
+    )
 
     # Upsample from 32x to 16x
     prior_token_ids = _upsample_token_ids(prior_token_ids_d32, token_h, token_w)

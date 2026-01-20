@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only GLM-Image model compatible with HuggingFace weights."""
 
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal
 
@@ -1082,8 +1083,13 @@ class GlmImageVisionModel(nn.Module):
         Returns:
             Hidden states [total_patches, hidden_size]
         """
+        t_start = time.perf_counter()
+
         # Patch embedding
+        t_patch_start = time.perf_counter()
         hidden_states = self.patch_embed(pixel_values.to(self.device, self.dtype))
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_patch_end = time.perf_counter()
 
         # Compute position IDs
         position_ids = self.compute_position_ids(grid_thw)
@@ -1099,6 +1105,7 @@ class GlmImageVisionModel(nn.Module):
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
 
         # Add position embeddings
+        t_embed_start = time.perf_counter()
         hidden_states = self.embeddings(
             hidden_states,
             seqlens,
@@ -1106,17 +1113,30 @@ class GlmImageVisionModel(nn.Module):
             position_ids[:, 0].to(hidden_states.device),
             position_ids[:, 1].to(hidden_states.device),
         )
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_embed_end = time.perf_counter()
 
         # Compute max seqlen for flash attention
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
         # Transformer blocks
+        t_blocks_start = time.perf_counter()
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_blocks_end = time.perf_counter()
+
+        t_end = time.perf_counter()
+        logger.info(
+            f"[Profile][AR-VisionEncoder] total={t_end - t_start:.4f}s | "
+            f"patch_embed={t_patch_end - t_patch_start:.4f}s, "
+            f"pos_embed={t_embed_end - t_embed_start:.4f}s, "
+            f"transformer_blocks({len(self.blocks)})={t_blocks_end - t_blocks_start:.4f}s"
+        )
 
         return hidden_states
 
@@ -1560,6 +1580,10 @@ class GlmImageModel(nn.Module):
         Returns:
             Hidden states or intermediate tensors for PP
         """
+        t_forward_start = time.perf_counter()
+        t_vision = 0.0
+        t_vqvae = 0.0
+
         # Handle intermediate tensors for pipeline parallelism
         if intermediate_tensors is not None:
             return self.language_model(
@@ -1572,10 +1596,17 @@ class GlmImageModel(nn.Module):
         # Process source images if provided (image-to-image generation)
         if pixel_values is not None and image_grid_thw is not None:
             # Encode images
+            t_vision_start = time.perf_counter()
             image_features = self.get_image_features(pixel_values, image_grid_thw)
+            torch.cuda.synchronize() if image_features.is_cuda else None
+            t_vision = time.perf_counter() - t_vision_start
+
             # Tokenize with VQ-VAE
+            t_vqvae_start = time.perf_counter()
             image_tokens = self.get_image_tokens(image_features, image_grid_thw)
             image_tokens = image_tokens.to(input_ids.device)
+            torch.cuda.synchronize() if image_tokens.is_cuda else None
+            t_vqvae = time.perf_counter() - t_vqvae_start
 
             # Replace placeholder tokens with actual image tokens
             special_image_mask = input_ids == self.image_token_id
@@ -1584,16 +1615,29 @@ class GlmImageModel(nn.Module):
                 input_ids[special_image_mask] = image_tokens
 
         # Get embeddings
+        t_embed_start = time.perf_counter()
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
             input_ids = None
+        torch.cuda.synchronize() if inputs_embeds.is_cuda else None
+        t_embed = time.perf_counter() - t_embed_start
 
         # Forward through language model
+        t_lm_start = time.perf_counter()
         hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+        )
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_lm = time.perf_counter() - t_lm_start
+
+        t_forward_end = time.perf_counter()
+        logger.info(
+            f"[Profile][AR-GlmImageModel] total={t_forward_end - t_forward_start:.4f}s | "
+            f"vision_encoder={t_vision:.4f}s, vqvae={t_vqvae:.4f}s, "
+            f"embedding={t_embed:.4f}s, language_model={t_lm:.4f}s"
         )
 
         return hidden_states
@@ -1956,6 +2000,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Hidden states or intermediate tensors
         """
+        t_start = time.perf_counter()
+
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -1968,6 +2014,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             image_grid_thw=image_grid_thw,
         )
 
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_end = time.perf_counter()
+        logger.info(f"[Profile][AR-Forward] GlmImageForConditionalGeneration.forward took {t_end - t_start:.4f}s")
+
         return hidden_states
 
     def compute_logits(
@@ -1976,10 +2026,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         **kwargs: object,
     ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
+        t_start = time.perf_counter()
         logits = self.logits_processor(
             self.lm_head,
             hidden_states,
         )
+        torch.cuda.synchronize() if logits is not None and logits.is_cuda else None
+        t_end = time.perf_counter()
+        logger.info(f"[Profile][AR-Logits] compute_logits took {t_end - t_start:.4f}s")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

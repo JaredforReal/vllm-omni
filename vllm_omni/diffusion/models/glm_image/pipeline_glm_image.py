@@ -658,6 +658,12 @@ class GlmImagePipeline(nn.Module):
         # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
         cfg_parallel_ready = do_classifier_free_guidance and get_classifier_free_guidance_world_size() > 1
 
+        # Profiling accumulators
+        total_transformer_time = 0.0
+        total_cfg_combine_time = 0.0
+        total_scheduler_time = 0.0
+        num_steps = len(timesteps)
+
         for i, t in enumerate(timesteps):
             latent_model_input = latents.to(transformer_dtype)
             timestep = t.expand(latents.shape[0]) - 1
@@ -666,6 +672,7 @@ class GlmImagePipeline(nn.Module):
                 cfg_group = get_cfg_group()
                 cfg_rank = get_classifier_free_guidance_rank()
 
+                t_tf_start = time.perf_counter()
                 if cfg_rank == 0:
                     # Rank 0: Compute positive (conditional) prediction
                     local_pred = self.transformer(
@@ -692,8 +699,11 @@ class GlmImagePipeline(nn.Module):
                         kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
+                torch.cuda.synchronize() if local_pred.is_cuda else None
+                total_transformer_time += time.perf_counter() - t_tf_start
 
                 # All-gather predictions from all ranks
+                t_cfg_start = time.perf_counter()
                 gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
 
                 if cfg_rank == 0:
@@ -701,8 +711,12 @@ class GlmImagePipeline(nn.Module):
                     noise_pred_cond = gathered[0]
                     noise_pred_uncond = gathered[1]
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    total_cfg_combine_time += time.perf_counter() - t_cfg_start
+
                     # Scheduler step
+                    t_sched_start = time.perf_counter()
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    total_scheduler_time += time.perf_counter() - t_sched_start
 
                 # Broadcast updated latents to all ranks
                 cfg_group.broadcast(latents, src=0)
@@ -710,6 +724,7 @@ class GlmImagePipeline(nn.Module):
             else:
                 # Sequential CFG (single GPU or no CFG)
                 # Conditional forward pass
+                t_tf_start = time.perf_counter()
                 noise_pred_cond = self.transformer(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -735,13 +750,28 @@ class GlmImagePipeline(nn.Module):
                         kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
+                torch.cuda.synchronize() if noise_pred_cond.is_cuda else None
+                total_transformer_time += time.perf_counter() - t_tf_start
 
+                t_cfg_start = time.perf_counter()
+                if do_classifier_free_guidance:
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
                     noise_pred = noise_pred_cond
+                total_cfg_combine_time += time.perf_counter() - t_cfg_start
 
                 # Scheduler step
+                t_sched_start = time.perf_counter()
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                total_scheduler_time += time.perf_counter() - t_sched_start
+
+        # Log diffuse loop profiling summary
+        avg_transformer = total_transformer_time / num_steps if num_steps > 0 else 0
+        logger.info(
+            f"[Profile][DiT-Diffuse] {num_steps} steps | "
+            f"total_transformer={total_transformer_time:.4f}s (avg={avg_transformer:.4f}s/step), "
+            f"cfg_combine={total_cfg_combine_time:.4f}s, scheduler={total_scheduler_time:.4f}s"
+        )
 
         return latents
 
@@ -935,10 +965,14 @@ class GlmImagePipeline(nn.Module):
             do_classifier_free_guidance=do_classifier_free_guidance,
             kv_caches=kv_caches,
         )
+        torch.cuda.synchronize() if latents.is_cuda else None
         t_denoise_end = time.perf_counter()
 
-        # 8. VAE decode
+        # 8. VAE decode with detailed profiling
         t_vae_start = time.perf_counter()
+
+        # 8.1 Prepare latents for VAE
+        t_vae_prep_start = time.perf_counter()
         latents = latents.to(self.vae.dtype)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -951,18 +985,32 @@ class GlmImagePipeline(nn.Module):
             .to(latents.device, latents.dtype)
         )
         latents = latents * latents_std + latents_mean
+        t_vae_prep_end = time.perf_counter()
+
+        # 8.2 VAE decode
+        t_vae_decode_start = time.perf_counter()
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        torch.cuda.synchronize() if image.is_cuda else None
+        t_vae_decode_end = time.perf_counter()
+
         t_vae_end = time.perf_counter()
+
+        # Log VAE profiling details
+        logger.info(
+            f"[Profile][VAE] total={t_vae_end - t_vae_start:.4f}s | "
+            f"prepare={t_vae_prep_end - t_vae_prep_start:.4f}s, "
+            f"decode={t_vae_decode_end - t_vae_decode_start:.4f}s"
+        )
 
         t_forward_end = time.perf_counter()
 
-        # Profile logging
+        # Profile logging - summary
         logger.info(
-            f"[Profile] Diffusion forward: total={t_forward_end - t_forward_start:.3f}s | "
-            f"prior_tokens={t_prior_end - t_prior_start:.3f}s, "
-            f"prompt_encode={t_encode_end - t_encode_start:.3f}s, "
-            f"kv_cache={t_kvcache_end - t_kvcache_start:.3f}s, "
-            f"denoise({num_inference_steps} steps)={t_denoise_end - t_denoise_start:.3f}s, "
+            f"[Profile][Summary] GlmImagePipeline.forward total={t_forward_end - t_forward_start:.3f}s | "
+            f"prior_tokens(AR)={t_prior_end - t_prior_start:.3f}s, "
+            f"prompt_encode(T5)={t_encode_end - t_encode_start:.3f}s, "
+            f"kv_cache_prep={t_kvcache_end - t_kvcache_start:.3f}s, "
+            f"denoise(DiT,{num_inference_steps}steps)={t_denoise_end - t_denoise_start:.3f}s, "
             f"vae_decode={t_vae_end - t_vae_start:.3f}s"
         )
 

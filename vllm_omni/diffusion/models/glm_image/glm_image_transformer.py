@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Iterable
 from enum import Enum
 from typing import Any
@@ -643,10 +644,14 @@ class GlmImageTransformer2DModel(CachedTransformer):
         """
         batch_size, num_channels, height, width = hidden_states.shape
 
+        # Profiling variables
+        t_start = time.perf_counter()
+
         # Get KV cache mode
         kv_cache_mode = kv_cache.mode if kv_cache is not None else None
 
         # 1. RoPE
+        t_rope_start = time.perf_counter()
         if image_rotary_emb is None:
             image_rotary_emb = self.rope(hidden_states)
             # Move to correct device
@@ -654,8 +659,10 @@ class GlmImageTransformer2DModel(CachedTransformer):
                 image_rotary_emb[0].to(hidden_states.device),
                 image_rotary_emb[1].to(hidden_states.device),
             )
+        t_rope_end = time.perf_counter()
 
         # 2. Patch & Timestep embeddings
+        t_embed_start = time.perf_counter()
         p = self.patch_size
         post_patch_height = height // p
         post_patch_width = width // p
@@ -671,8 +678,10 @@ class GlmImageTransformer2DModel(CachedTransformer):
 
         # Timestep conditioning
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
+        t_embed_end = time.perf_counter()
 
         # 3. Transformer blocks
+        t_blocks_start = time.perf_counter()
         for layer_idx, block in enumerate(self.transformer_blocks):
             # Get layer-specific KV cache if available
             layer_kv_cache = kv_cache[layer_idx] if kv_cache is not None else None
@@ -687,14 +696,29 @@ class GlmImageTransformer2DModel(CachedTransformer):
                 kv_cache=layer_kv_cache,
                 kv_cache_mode=kv_cache_mode,
             )
+        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        t_blocks_end = time.perf_counter()
 
         # 4. Output norm & projection
+        t_output_start = time.perf_counter()
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 
         # 5. Unpatchify: [B, H'*W', C*p*p] -> [B, C, H, W]
         hidden_states = hidden_states.reshape(batch_size, post_patch_height, post_patch_width, -1, p, p)
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
+        t_output_end = time.perf_counter()
+
+        t_end = time.perf_counter()
+        # Log detailed timing for each step (useful for debugging single steps)
+        # Only log summary occasionally to avoid log spam during inference loop
+        if timestep is not None and timestep[0].item() % 100 < 10:  # Log ~10% of steps
+            logger.info(
+                f"[Profile][DiT-Step] t={timestep[0].item():.0f} total={t_end - t_start:.4f}s | "
+                f"rope={t_rope_end - t_rope_start:.4f}s, embed={t_embed_end - t_embed_start:.4f}s, "
+                f"blocks({len(self.transformer_blocks)})={t_blocks_end - t_blocks_start:.4f}s, "
+                f"output={t_output_end - t_output_start:.4f}s"
+            )
 
         if not return_dict:
             return (output,)

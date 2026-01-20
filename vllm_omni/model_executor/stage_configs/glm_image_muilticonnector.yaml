@@ -21,7 +21,7 @@ stage_args:
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6
-      enforce_eager: false
+      enforce_eager: true
       trust_remote_code: true
       engine_output_type: token_ids # Output prior_token_ids for diffusion stage
       distributed_executor_backend: "mp"
@@ -51,7 +51,7 @@ stage_args:
       model_stage: dit
       # Diffusion-specific parameters
       num_gpus: 1
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       distributed_executor_backend: "mp"
     engine_input_source: [0] # Input from AR stage

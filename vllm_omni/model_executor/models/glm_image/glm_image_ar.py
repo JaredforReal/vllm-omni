@@ -2072,7 +2072,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             inputs_embeds = None
 
         hidden_states = self.model(
-            input_id=input_ids,
+            input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,

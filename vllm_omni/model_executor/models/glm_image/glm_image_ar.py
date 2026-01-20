@@ -1598,14 +1598,12 @@ class GlmImageModel(nn.Module):
             # Encode images
             t_vision_start = time.perf_counter()
             image_features = self.get_image_features(pixel_values, image_grid_thw)
-            torch.cuda.synchronize() if image_features.is_cuda else None
             t_vision = time.perf_counter() - t_vision_start
 
             # Tokenize with VQ-VAE
             t_vqvae_start = time.perf_counter()
             image_tokens = self.get_image_tokens(image_features, image_grid_thw)
             image_tokens = image_tokens.to(input_ids.device)
-            torch.cuda.synchronize() if image_tokens.is_cuda else None
             t_vqvae = time.perf_counter() - t_vqvae_start
 
             # Replace placeholder tokens with actual image tokens
@@ -1619,7 +1617,6 @@ class GlmImageModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
             input_ids = None
-        torch.cuda.synchronize() if inputs_embeds.is_cuda else None
         t_embed = time.perf_counter() - t_embed_start
 
         # Forward through language model
@@ -1630,7 +1627,6 @@ class GlmImageModel(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
-        torch.cuda.synchronize() if hidden_states.is_cuda else None
         t_lm = time.perf_counter() - t_lm_start
 
         t_forward_end = time.perf_counter()
@@ -2014,7 +2010,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             image_grid_thw=image_grid_thw,
         )
 
-        torch.cuda.synchronize() if hidden_states.is_cuda else None
         t_end = time.perf_counter()
         logger.info(f"[Profile][AR-Forward] GlmImageForConditionalGeneration.forward took {t_end - t_start:.4f}s")
 
@@ -2031,7 +2026,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             self.lm_head,
             hidden_states,
         )
-        torch.cuda.synchronize() if logits is not None and logits.is_cuda else None
         t_end = time.perf_counter()
         logger.info(f"[Profile][AR-Logits] compute_logits took {t_end - t_start:.4f}s")
         return logits

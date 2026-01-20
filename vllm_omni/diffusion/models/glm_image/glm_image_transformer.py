@@ -696,7 +696,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
                 kv_cache=layer_kv_cache,
                 kv_cache_mode=kv_cache_mode,
             )
-        torch.cuda.synchronize() if hidden_states.is_cuda else None
+        # NOTE: Removed torch.cuda.synchronize() - was causing performance bubbles
         t_blocks_end = time.perf_counter()
 
         # 4. Output norm & projection

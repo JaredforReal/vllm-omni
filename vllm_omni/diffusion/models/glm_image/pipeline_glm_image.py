@@ -699,7 +699,7 @@ class GlmImagePipeline(nn.Module):
                         kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
-                torch.cuda.synchronize() if local_pred.is_cuda else None
+                # NOTE: Removed torch.cuda.synchronize() - was causing performance bubbles
                 total_transformer_time += time.perf_counter() - t_tf_start
 
                 # All-gather predictions from all ranks
@@ -750,7 +750,7 @@ class GlmImagePipeline(nn.Module):
                         kv_cache=kv_caches,
                         return_dict=False,
                     )[0].float()
-                torch.cuda.synchronize() if noise_pred_cond.is_cuda else None
+                # NOTE: Removed torch.cuda.synchronize() - was causing performance bubbles
                 total_transformer_time += time.perf_counter() - t_tf_start
 
                 t_cfg_start = time.perf_counter()

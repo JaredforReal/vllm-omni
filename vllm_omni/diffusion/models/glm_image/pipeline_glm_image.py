@@ -852,7 +852,7 @@ class GlmImagePipeline(nn.Module):
 
         prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
         preprocessed_images = req.preprocessed_image
-        condition_images = getattr(req, "prompt_image", None)
+        # condition_images = getattr(req, "prompt_image", None)
         img_height = req.height
         img_width = req.width
         is_image_edit = preprocessed_images is not None
@@ -877,6 +877,14 @@ class GlmImagePipeline(nn.Module):
         external_prior_image_ids = req.extra.get("prior_token_image_ids") if req.extra else None
 
         if external_prior_tokens is not None:
+            logger.info(
+                f"[Profile][AR-Source] Using vLLM AR prior tokens (external), shape=\
+                    {
+                    external_prior_tokens.shape
+                    if hasattr(external_prior_tokens, 'shape')
+                    else len(external_prior_tokens)
+                }"
+            )
             prior_token_id = external_prior_tokens
             if isinstance(prior_token_id, list):
                 prior_token_id = torch.tensor(prior_token_id, dtype=torch.long, device=self.device)
@@ -886,12 +894,19 @@ class GlmImagePipeline(nn.Module):
                 prior_token_id = prior_token_id.unsqueeze(0)
             prior_token_image_ids = external_prior_image_ids
         else:
-            prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
-                prompt=prompt,
-                image=condition_images,
-                height=height,
-                width=width,
+            # NOTE: Transformers path disabled for profiling - vLLM AR should always provide prior tokens
+            raise RuntimeError(
+                "[Profile] ERROR: No external prior tokens from vLLM AR! "
+                "Transformers fallback is disabled. Check AR stage output."
             )
+            # Original transformers path (commented out for profiling):
+            # logger.info("[Profile][AR-Source] Using transformers AR (generate_prior_tokens)")
+            # prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+            #     prompt=prompt,
+            #     image=condition_images,
+            #     height=height,
+            #     width=width,
+            # )
         t_prior_end = time.perf_counter()
 
         # 2. Encode prompt for glyph embeddings

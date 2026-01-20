@@ -23,6 +23,7 @@
 
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Annotated, Literal
 
 import torch
@@ -93,6 +94,56 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
+
+@dataclass
+class ARProfiler:
+    """Accumulator for AR profiling statistics."""
+
+    # Prefill stage (only once per request)
+    vision_encoder_time: float = 0.0
+    vqvae_time: float = 0.0
+    prefill_embed_time: float = 0.0
+    prefill_lm_time: float = 0.0
+
+    # Decode stage (accumulated over all tokens)
+    decode_embed_time: float = 0.0
+    decode_lm_time: float = 0.0
+    compute_logits_time: float = 0.0
+    decode_count: int = 0
+
+    # Logger reference (set after logger is initialized)
+    _logger: object = None
+
+    def reset(self, print_summary: bool = True):
+        """Reset all counters. Optionally print summary of previous request."""
+        if print_summary and self.decode_count > 0 and self._logger:
+            self._logger.info(self.summary())
+        self.vision_encoder_time = 0.0
+        self.vqvae_time = 0.0
+        self.prefill_embed_time = 0.0
+        self.prefill_lm_time = 0.0
+        self.decode_embed_time = 0.0
+        self.decode_lm_time = 0.0
+        self.compute_logits_time = 0.0
+        self.decode_count = 0
+
+    def summary(self) -> str:
+        """Generate summary string."""
+        total_decode = self.decode_embed_time + self.decode_lm_time + self.compute_logits_time
+        total_prefill = self.vision_encoder_time + self.vqvae_time + self.prefill_embed_time + self.prefill_lm_time
+        avg_decode_per_token = total_decode / max(self.decode_count, 1)
+        return (
+            f"[Profile][AR-Summary] "
+            f"prefill: vision={self.vision_encoder_time:.4f}s, vqvae={self.vqvae_time:.4f}s, "
+            f"embed={self.prefill_embed_time:.4f}s, lm={self.prefill_lm_time:.4f}s, total={total_prefill:.4f}s | "
+            f"decode({self.decode_count} tokens): embed={self.decode_embed_time:.4f}s, "
+            f"lm={self.decode_lm_time:.4f}s, logits={self.compute_logits_time:.4f}s, "
+            f"total={total_decode:.4f}s, avg={avg_decode_per_token * 1000:.2f}ms/tok"
+        )
+
+
+# Global profiler instance
+_ar_profiler = ARProfiler()
 
 # === Multimodal Processing ===
 
@@ -1593,8 +1644,13 @@ class GlmImageModel(nn.Module):
                 inputs_embeds=None,
             )
 
+        # Detect prefill vs decode: prefill has multiple input tokens, decode has 1
+        # (or check if this is the first forward with images)
+        has_image_input = pixel_values is not None and image_grid_thw is not None
+        is_prefill = input_ids is not None and input_ids.numel() > 1
+
         # Process source images if provided (image-to-image generation)
-        if pixel_values is not None and image_grid_thw is not None:
+        if has_image_input:
             # Encode images
             t_vision_start = time.perf_counter()
             image_features = self.get_image_features(pixel_values, image_grid_thw)
@@ -1630,11 +1686,23 @@ class GlmImageModel(nn.Module):
         t_lm = time.perf_counter() - t_lm_start
 
         t_forward_end = time.perf_counter()
-        logger.info(
-            f"[Profile][AR-GlmImageModel] total={t_forward_end - t_forward_start:.4f}s | "
-            f"vision_encoder={t_vision:.4f}s, vqvae={t_vqvae:.4f}s, "
-            f"embedding={t_embed:.4f}s, language_model={t_lm:.4f}s"
-        )
+
+        # Accumulate profiling stats
+        if is_prefill:
+            _ar_profiler.reset()  # Reset for new request
+            _ar_profiler.vision_encoder_time = t_vision
+            _ar_profiler.vqvae_time = t_vqvae
+            _ar_profiler.prefill_embed_time = t_embed
+            _ar_profiler.prefill_lm_time = t_lm
+            logger.info(
+                f"[Profile][AR-Prefill] total={t_forward_end - t_forward_start:.4f}s | "
+                f"vision_encoder={t_vision:.4f}s, vqvae={t_vqvae:.4f}s, "
+                f"embedding={t_embed:.4f}s, language_model={t_lm:.4f}s"
+            )
+        else:
+            _ar_profiler.decode_embed_time += t_embed
+            _ar_profiler.decode_lm_time += t_lm
+            _ar_profiler.decode_count += 1
 
         return hidden_states
 
@@ -1688,6 +1756,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         self.config = config
         self.vllm_config = vllm_config
+
+        # Initialize profiler logger
+        _ar_profiler._logger = logger
 
         # Main model (Vision + VQ-VAE + Text)
         self.model = GlmImageModel(
@@ -1996,22 +2067,18 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         Returns:
             Hidden states or intermediate tensors
         """
-        t_start = time.perf_counter()
 
         if intermediate_tensors is not None:
             inputs_embeds = None
 
         hidden_states = self.model(
-            input_ids=input_ids,
+            input_id=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
-
-        t_end = time.perf_counter()
-        logger.info(f"[Profile][AR-Forward] GlmImageForConditionalGeneration.forward took {t_end - t_start:.4f}s")
 
         return hidden_states
 
@@ -2026,9 +2093,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             self.lm_head,
             hidden_states,
         )
-        t_end = time.perf_counter()
-        logger.info(f"[Profile][AR-Logits] compute_logits took {t_end - t_start:.4f}s")
+        t_logits = time.perf_counter() - t_start
+        _ar_profiler.compute_logits_time += t_logits
+        # Summary will be printed automatically at next prefill (reset)
         return logits
+
+    def get_ar_profile_summary(self) -> str:
+        """Get AR profiling summary. Call this at end of generation."""
+        return _ar_profiler.summary()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """

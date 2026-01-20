@@ -45,6 +45,7 @@ stage_args:
       process: true
       devices: "1" # Can use different GPU, or same GPU if memory allows
       max_batch_size: 1
+      requires_multimodal_data: true # Required for i2i mode to pass condition images
     engine_args:
       model_stage: dit
       model_arch: GlmImagePipeline # Required for diffusion model class resolution

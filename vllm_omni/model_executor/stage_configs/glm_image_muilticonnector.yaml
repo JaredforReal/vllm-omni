@@ -47,6 +47,7 @@ stage_args:
       process: true
       devices: "1" # Use separate GPU for diffusion
       max_batch_size: 1
+      requires_multimodal_data: true # Required for i2i mode to pass condition images
     engine_args:
       model_stage: dit
       # Diffusion-specific parameters

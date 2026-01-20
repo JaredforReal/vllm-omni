@@ -161,15 +161,25 @@ def ar2diffusion(
         prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width)
         t_parse_end = time.perf_counter()
 
+        # Get prior_token_image_ids from AR model output (for i2i mode)
+        # This contains VQ-VAE tokens from input image, used for KV cache conditioning
+        prior_token_image_ids = None
+        if hasattr(output, "multimodal_output") and output.multimodal_output:
+            raw_prior_image_ids = output.multimodal_output.get("prior_token_image_ids")
+            if raw_prior_image_ids is not None:
+                # Wrap in list if it's a single tensor (expected by diffusion pipeline)
+                if isinstance(raw_prior_image_ids, torch.Tensor):
+                    prior_token_image_ids = [raw_prior_image_ids]
+                elif isinstance(raw_prior_image_ids, list):
+                    prior_token_image_ids = raw_prior_image_ids
+
         diffusion_input = {
             "prompt": text_prompt,
             "height": pixel_h,
             "width": pixel_w,
             "extra": {
                 "prior_token_ids": prior_token_ids,
-                "prior_token_image_ids": output.multimodal_output.get("prior_token_image_ids")
-                if hasattr(output, "multimodal_output") and output.multimodal_output
-                else None,
+                "prior_token_image_ids": prior_token_image_ids,
             },
         }
 

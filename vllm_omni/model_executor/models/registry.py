@@ -53,6 +53,11 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "Qwen3TTSModelForGeneration",
     ),
+    "GlmImageForConditionalGeneration": (
+        "glm_image",
+        "glm_image_ar",
+        "GlmImageForConditionalGeneration",
+    ),
 }
 
 

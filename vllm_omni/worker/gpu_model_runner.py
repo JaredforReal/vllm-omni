@@ -41,7 +41,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output: object | None = None
 
     def load_model(self, *args, **kwargs) -> None:
+        logger.info("[OmniGPUModelRunner] load_model called with args=%s, kwargs=%s", args, kwargs)
         super().load_model(*args, **kwargs)
+        # Verify model was loaded successfully
+        if not hasattr(self, "model") or self.model is None:
+            logger.error(
+                "[OmniGPUModelRunner] CRITICAL: Model was not loaded after super().load_model(). "
+                "self.model=%s, hasattr='model'=%s. This will cause execute_model to fail.",
+                self.model if hasattr(self, "model") else "NO_ATTR",
+                hasattr(self, "model"),
+            )
+        else:
+            logger.info(
+                "[OmniGPUModelRunner] Model loaded successfully: self.model type=%s, get_model()=%s",
+                type(self.model).__name__,
+                type(self.get_model()).__name__ if self.get_model() is not None else None,
+            )
         # TODO move this model specific logic to a separate class
         if hasattr(self.model, "talker_mtp") and self.model.talker is not None:
             self.talker_mtp = self.model.talker_mtp
@@ -886,7 +901,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.get_model().embed_input_ids(
+            model = self.get_model()
+            if model is None:
+                raise RuntimeError(
+                    "Model not loaded. Ensure load_model() is called before execute_model(). "
+                    f"self.model={self.model}, get_model()={model}"
+                )
+            inputs_embeds_scheduled = model.embed_input_ids(
                 self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
@@ -917,7 +938,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Some tokens ids may need to become embeds
             if token_ids_idx.numel() > 0:
                 token_ids = self.input_ids.gpu[token_ids_idx]
-                tokens_to_embeds = self.get_model().embed_input_ids(input_ids=token_ids)
+                model = self.get_model()
+                if model is None:
+                    raise RuntimeError(
+                        "Model not loaded. Ensure load_model() is called before execute_model(). "
+                        f"self.model={self.model}, get_model()={model}"
+                    )
+                tokens_to_embeds = model.embed_input_ids(input_ids=token_ids)
                 self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]

@@ -384,10 +384,15 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             # Build messages with image objects directly in content
             # This is how GlmImageProcessor expects images - embedded in the content dict
             # NOT as a separate images= parameter
+            #
+            # IMPORTANT: Remove <|image|> placeholders from prompt since apply_chat_template
+            # will automatically insert them for each image in content. Having both leads to
+            # index out of bounds when processing image_grid_thw.
+            clean_prompt = prompt.replace("<|image|>", "")
             content = []
             for img in images:
                 content.append({"type": "image", "image": img})
-            content.append({"type": "text", "text": prompt})
+            content.append({"type": "text", "text": clean_prompt})
             messages = [{"role": "user", "content": content}]
 
             logger.debug(f"_call_hf_processor: calling apply_chat_template with {len(images)} images in content")

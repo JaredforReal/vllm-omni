@@ -2325,6 +2325,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         if image_grid_thw:
             # Build position IDs considering image regions
+            # For M-RoPE, we use 3D positional encoding (T, H, W)
+            # - T (temporal): constant for static images, increments across sequence
+            # - H (height): row position within image grid
+            # - W (width): column position within image grid
+            #
+            # Key insight: All three dimensions share the same base offset (st_idx),
+            # and within an image, T is constant while H and W encode 2D grid positions.
+            # This matches GLM4V's approach.
             current_pos = 0
             image_idx = 0
             i = 0
@@ -2340,17 +2348,21 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     i += 1
 
                     # Get grid dimensions for this image
-                    _, h, w = image_grid_thw[image_idx]
+                    t, h, w = image_grid_thw[image_idx]
                     total_image_tokens = h * w
 
-                    # Build 2D position IDs for image tokens
-                    t_indices = torch.full((total_image_tokens,), current_pos)
-                    h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten() + current_pos
-                    w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten() + current_pos
+                    # Build 2D position IDs for image tokens following GLM4V pattern:
+                    # - t_index: temporal index (constant 0 for single images)
+                    # - h_index: height index [0, 1, ..., h-1] repeated w times
+                    # - w_index: width index [0, 1, ..., w-1] for each row
+                    # All shifted by current_pos uniformly
+                    t_index = torch.zeros(total_image_tokens, dtype=torch.long)
+                    h_index = torch.arange(h).view(-1, 1).expand(h, w).flatten()
+                    w_index = torch.arange(w).view(1, -1).expand(h, w).flatten()
 
-                    llm_pos_ids_list.append(torch.stack([t_indices, h_indices, w_indices], dim=0))
+                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index], dim=0) + current_pos)
 
-                    # Skip image tokens
+                    # Skip image tokens, advance position by max(h, w) to maintain spatial coherence
                     i += total_image_tokens
                     current_pos += max(h, w)
                     image_idx += 1
@@ -2382,20 +2394,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # - First generate small image (16x16 = 256 tokens)
                 # - Then generate large image (32x32 = 1024 tokens)
                 # - Finally generate EOS
-                for i in range(1, num_decode_grids + 1):
-                    grid_idx = -i
+                for grid_i in range(1, num_decode_grids + 1):
+                    grid_idx = -grid_i
                     _, h, w = image_grid_thw[grid_idx]
                     total_tokens = h * w
 
-                    # Build 2D positions for this generated image
-                    h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
-                    w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+                    # Build 2D positions for generated image following same pattern
+                    t_index = torch.zeros(total_tokens, dtype=torch.long)
+                    h_index = torch.arange(h).view(-1, 1).expand(h, w).flatten()
+                    w_index = torch.arange(w).view(1, -1).expand(h, w).flatten()
 
-                    decode_t = torch.full((total_tokens,), decode_pos, dtype=torch.long)
-                    decode_h = decode_pos + h_indices
-                    decode_w = decode_pos + w_indices
-
-                    decode_pos_lists.append(torch.stack([decode_t, decode_h, decode_w], dim=0))
+                    decode_pos_lists.append(torch.stack([t_index, h_index, w_index], dim=0) + decode_pos)
                     decode_pos = decode_pos + max(h, w)
 
                 # Add position for EOS token

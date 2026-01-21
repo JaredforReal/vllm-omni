@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -30,7 +30,6 @@ from vllm.v1.worker.gpu_model_runner import (
     IntermediateTensors,
     get_pp_group,
     get_tp_group,
-    has_kv_transfer_group,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -279,9 +278,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            # Extract multimodal outputs if model supports it
+            # This handles both OmniOutput objects and plain tensors
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
-            if multimodal_outputs is not None:
+            if multimodal_outputs is not None and multimodal_outputs:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
                     if isinstance(multimodal_outputs, dict)

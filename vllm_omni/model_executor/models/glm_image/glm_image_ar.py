@@ -1063,7 +1063,7 @@ class GlmImageVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen: int | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # hidden_states: [seq_len, hidden_size] (no batch dim)
         seq_len = hidden_states.shape[0]
@@ -1280,7 +1280,7 @@ class GlmImageVisionBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen: int | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention
         residual = hidden_states
@@ -1408,13 +1408,14 @@ class GlmImageVisionModel(nn.Module):
     def compute_attn_mask_seqlen(
         self,
         cu_seqlens: torch.Tensor,
-    ) -> int | None:
+    ) -> torch.Tensor | None:
         """Compute max sequence length for flash attention."""
         if (
             self.attn_backend == AttentionBackendEnum.FLASH_ATTN
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
         ):
-            return (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+            # Return as 1D tensor for vLLM 0.14.0+ API compatibility
+            return (cu_seqlens[1:] - cu_seqlens[:-1]).max().unsqueeze(0)
         return None
 
     def forward(

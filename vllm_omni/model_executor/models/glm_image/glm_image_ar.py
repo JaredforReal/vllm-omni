@@ -2405,6 +2405,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
         return llm_positions, mrope_position_delta
 
+    def get_language_model(self) -> torch.nn.Module:
+        return self.language_model
+
     # Flag to indicate this model can output multimodal data (prior_token_image_ids for i2i)
     have_multimodal_outputs = True
 

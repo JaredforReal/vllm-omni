@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Iterable
 
 import numpy as np
@@ -812,77 +813,59 @@ class GlmImagePipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """
-        Main generation forward pass.
+        """Main generation forward pass."""
+        t_forward_start = time.perf_counter()
 
-        Args:
-            req: OmniDiffusionRequest with generation parameters
-
-        Returns:
-            DiffusionOutput containing generated image
-        """
         prompt = req.prompt or ""
         if isinstance(prompt, list):
             prompt = prompt[0] if prompt else ""
 
-        # Get pre-computed prompt embeddings if provided
         prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
-
-        # Get condition images for Image Edit mode
-        # Use pre-processed images from pre_process_func
         preprocessed_images = req.preprocessed_image
         condition_images = getattr(req, "prompt_image", None)
         img_height = req.height
         img_width = req.width
-
         is_image_edit = preprocessed_images is not None
 
-        # Use image dimensions as default if available
         height = req.height or img_height or self.default_sample_size * self.vae_scale_factor
         width = req.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.num_inference_steps or 50
         guidance_scale = req.guidance_scale or 1.5
 
-        # 0. Validate inputs
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
 
         batch_size = 1
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        # Set seed if provided
         generator = None
         if req.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
-        # 1. Get prior tokens - either from external source (multistage) or generate internally
-        # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
+        # 1. Get prior tokens
+        t_prior_start = time.perf_counter()
         external_prior_tokens = req.extra.get("prior_token_ids") if req.extra else None
         external_prior_image_ids = req.extra.get("prior_token_image_ids") if req.extra else None
 
         if external_prior_tokens is not None:
-            # Multistage mode: use externally provided prior tokens from vLLM AR stage
-            logger.info("Using externally provided prior tokens from AR stage...")
             prior_token_id = external_prior_tokens
             if isinstance(prior_token_id, list):
                 prior_token_id = torch.tensor(prior_token_id, dtype=torch.long, device=self.device)
             elif isinstance(prior_token_id, torch.Tensor):
                 prior_token_id = prior_token_id.to(device=self.device, dtype=torch.long)
-            # Ensure shape is [1, num_tokens] for batch processing
             if prior_token_id.dim() == 1:
                 prior_token_id = prior_token_id.unsqueeze(0)
             prior_token_image_ids = external_prior_image_ids
         else:
-            # Single-stage mode: generate prior tokens with internal AR model
-            logger.info("Generating prior tokens with AR model...")
             prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
                 prompt=prompt,
                 image=condition_images,
                 height=height,
                 width=width,
             )
+        t_prior_end = time.perf_counter()
 
         # 2. Encode prompt for glyph embeddings
-        logger.info("Encoding prompt...")
+        t_encode_start = time.perf_counter()
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt,
             do_classifier_free_guidance=do_classifier_free_guidance,
@@ -891,19 +874,20 @@ class GlmImagePipeline(nn.Module):
             device=self.device,
             dtype=self.transformer.dtype,
         )
+        t_encode_end = time.perf_counter()
 
         # 3. Prepare KV cache for Image Edit mode
+        t_kvcache_start = time.perf_counter()
         kv_caches = None
         if is_image_edit and prior_token_image_ids is not None:
-            logger.info("Preparing KV cache for Image Edit mode...")
             kv_caches = self._prepare_condition_image_kv_cache(
                 condition_images=preprocessed_images,
                 prior_token_image_ids=prior_token_image_ids,
                 prompt_embeds=prompt_embeds,
                 generator=generator,
             )
-            # Switch to read mode for denoising
             kv_caches.set_mode("read")
+        t_kvcache_end = time.perf_counter()
 
         # 4. Prepare latents
         latent_channels = self.transformer.in_channels
@@ -937,8 +921,8 @@ class GlmImagePipeline(nn.Module):
         target_size = torch.tensor([[height, width]], dtype=prompt_embeds.dtype, device=self.device)
         crop_coords = torch.zeros((1, 2), dtype=prompt_embeds.dtype, device=self.device)
 
-        # 7. Denoising loop with CFG-parallel support
-        logger.info(f"Starting denoising loop with {num_inference_steps} steps...")
+        # 7. Denoising loop
+        t_denoise_start = time.perf_counter()
         latents = self.diffuse(
             latents=latents,
             prior_token_id=prior_token_id,
@@ -951,9 +935,10 @@ class GlmImagePipeline(nn.Module):
             do_classifier_free_guidance=do_classifier_free_guidance,
             kv_caches=kv_caches,
         )
+        t_denoise_end = time.perf_counter()
 
         # 8. VAE decode
-        logger.info("Decoding latents with VAE...")
+        t_vae_start = time.perf_counter()
         latents = latents.to(self.vae.dtype)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -967,8 +952,19 @@ class GlmImagePipeline(nn.Module):
         )
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        t_vae_end = time.perf_counter()
 
-        # 9. Leave post-process to vllm-omni pipeline
+        t_forward_end = time.perf_counter()
+
+        # Profile logging
+        logger.info(
+            f"[Profile] Diffusion forward: total={t_forward_end - t_forward_start:.3f}s | "
+            f"prior_tokens={t_prior_end - t_prior_start:.3f}s, "
+            f"prompt_encode={t_encode_end - t_encode_start:.3f}s, "
+            f"kv_cache={t_kvcache_end - t_kvcache_start:.3f}s, "
+            f"denoise({num_inference_steps} steps)={t_denoise_end - t_denoise_start:.3f}s, "
+            f"vae_decode={t_vae_end - t_vae_start:.3f}s"
+        )
 
         return DiffusionOutput(output=image)
 

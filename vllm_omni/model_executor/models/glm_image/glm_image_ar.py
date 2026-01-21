@@ -2272,13 +2272,15 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         values across all dimensions, while image tokens use 2D grid positions.
 
         For text-to-image, also pre-computes decode positions for generated tokens.
+        For image-to-image, detects consecutive image_token_id blocks as source images.
 
         Returns:
             Tuple of (position_ids [3, total_len], mrope_position_delta)
         """
         hf_config = self.config
-        image_start_token_id = hf_config.image_start_token_id
-        image_end_token_id = hf_config.image_end_token_id
+        image_token_id = hf_config.image_token_id  # 167855, repeated for each image patch
+        image_start_token_id = hf_config.image_start_token_id  # 16384, marks generation start
+        image_end_token_id = hf_config.image_end_token_id  # 16385, marks image end
 
         # Get image_grid_thw from either the direct arg or mm_features
         if image_grid_thw is None and mm_features is not None:
@@ -2320,61 +2322,67 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         seq_len = len(input_tokens)
         llm_pos_ids_list: list[torch.Tensor] = []
 
-        # Count completed images (have end marker) vs images to generate
-        num_complete_images = sum(1 for t in input_tokens if t == image_end_token_id)
+        # Detect source images by finding consecutive blocks of image_token_id
+        # For i2i: input is [image_token × 1024] + [text tokens...] + [image_start_token]
+        # For t2i: input is [text tokens...] + [image_start_token]
+        source_image_regions: list[tuple[int, int]] = []  # (start_idx, length)
+        i = 0
+        while i < seq_len:
+            if input_tokens[i] == image_token_id:
+                start = i
+                while i < seq_len and input_tokens[i] == image_token_id:
+                    i += 1
+                source_image_regions.append((start, i - start))
+            else:
+                i += 1
 
-        if image_grid_thw:
-            # Build position IDs considering image regions
-            # For M-RoPE, we use 3D positional encoding (T, H, W)
-            # - T (temporal): constant for static images, increments across sequence
-            # - H (height): row position within image grid
-            # - W (width): column position within image grid
-            #
-            # Key insight: All three dimensions share the same base offset (st_idx),
-            # and within an image, T is constant while H and W encode 2D grid positions.
-            # This matches GLM4V's approach.
+        # Number of source images = number of image regions detected
+        num_source_images = len(source_image_regions)
+
+        if image_grid_thw and num_source_images > 0:
+            # Image-to-image mode: we have source images to encode
+            # Build position IDs for M-RoPE (T, H, W)
             current_pos = 0
-            image_idx = 0
+            region_idx = 0
             i = 0
 
             while i < seq_len:
-                token = input_tokens[i]
+                # Check if this position starts a source image region
+                if region_idx < num_source_images and i == source_image_regions[region_idx][0]:
+                    region_start, region_len = source_image_regions[region_idx]
 
-                if token == image_start_token_id and image_idx < num_complete_images:
-                    # This is a completed image (source image for i2i)
-                    # Add position for the start marker
-                    llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
-                    current_pos += 1
-                    i += 1
+                    # Get grid dimensions for this source image
+                    if region_idx < len(image_grid_thw):
+                        t, h, w = image_grid_thw[region_idx]
+                        expected_tokens = t * h * w
 
-                    # Get grid dimensions for this image
-                    t, h, w = image_grid_thw[image_idx]
-                    total_image_tokens = h * w
+                        # Verify region length matches grid dimensions
+                        if region_len == expected_tokens:
+                            # Build 2D position IDs for image tokens following GLM4V pattern:
+                            # - t_index: temporal index (0 for single frame)
+                            # - h_index: height index [0, 1, ..., h-1] repeated w times per t
+                            # - w_index: width index [0, 1, ..., w-1] for each row
+                            # All shifted by current_pos uniformly
+                            t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
+                            h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+                            w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
 
-                    # Build 2D position IDs for image tokens following GLM4V pattern:
-                    # - t_index: temporal index (constant 0 for single images)
-                    # - h_index: height index [0, 1, ..., h-1] repeated w times
-                    # - w_index: width index [0, 1, ..., w-1] for each row
-                    # All shifted by current_pos uniformly
-                    t_index = torch.zeros(total_image_tokens, dtype=torch.long)
-                    h_index = torch.arange(h).view(-1, 1).expand(h, w).flatten()
-                    w_index = torch.arange(w).view(1, -1).expand(h, w).flatten()
+                            llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index], dim=0) + current_pos)
 
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index], dim=0) + current_pos)
+                            # Advance position by max(t, h, w) to maintain spatial coherence
+                            current_pos += max(t, h, w)
+                            i += region_len
+                            region_idx += 1
+                            continue
 
-                    # Skip image tokens, advance position by max(h, w) to maintain spatial coherence
-                    i += total_image_tokens
-                    current_pos += max(h, w)
-                    image_idx += 1
-
-                elif token == image_end_token_id:
-                    # End marker - just add normal position
-                    llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
-                    current_pos += 1
-                    i += 1
-
+                    # Fallback: treat as regular tokens if grid doesn't match
+                    for _ in range(region_len):
+                        llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
+                        current_pos += 1
+                    i += region_len
+                    region_idx += 1
                 else:
-                    # Regular text token (or trailing start marker for generation)
+                    # Regular text token or special token
                     llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
                     current_pos += 1
                     i += 1
@@ -2382,30 +2390,24 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
 
             # Pre-compute decode positions for images that will be generated
-            # This is critical for text-to-image where we need to generate image tokens
-            num_decode_grids = len(image_grid_thw) - num_complete_images
+            # For i2i: source images are already encoded, generation targets are in remaining grids
+            num_decode_grids = len(image_grid_thw) - num_source_images
 
             if num_decode_grids > 0:
                 decode_pos_lists: list[torch.Tensor] = []
                 decode_pos = current_pos
 
-                # Process grids in reverse order (last grid first for GLM-Image t2i)
-                # For t2i with grids [[1,32,32], [1,16,16]]:
-                # - First generate small image (16x16 = 256 tokens)
-                # - Then generate large image (32x32 = 1024 tokens)
-                # - Finally generate EOS
-                for grid_i in range(1, num_decode_grids + 1):
-                    grid_idx = -grid_i
-                    _, h, w = image_grid_thw[grid_idx]
-                    total_tokens = h * w
+                # Process decode grids (those after source images)
+                for grid_i in range(num_source_images, len(image_grid_thw)):
+                    t, h, w = image_grid_thw[grid_i]
 
-                    # Build 2D positions for generated image following same pattern
-                    t_index = torch.zeros(total_tokens, dtype=torch.long)
-                    h_index = torch.arange(h).view(-1, 1).expand(h, w).flatten()
-                    w_index = torch.arange(w).view(1, -1).expand(h, w).flatten()
+                    # Build 2D positions for generated image
+                    t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
+                    h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+                    w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
 
                     decode_pos_lists.append(torch.stack([t_index, h_index, w_index], dim=0) + decode_pos)
-                    decode_pos = decode_pos + max(h, w)
+                    decode_pos += max(t, h, w)
 
                 # Add position for EOS token
                 decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
@@ -2416,6 +2418,46 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
             else:
                 llm_positions = prefill_positions
+
+        elif image_grid_thw:
+            # Text-to-image mode: no source images, just text + generation positions
+            # Build position IDs considering image regions for decode phase
+            current_pos = 0
+
+            # All prefill tokens get sequential 1D positions
+            for i in range(seq_len):
+                llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
+                current_pos += 1
+
+            prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
+
+            # Pre-compute decode positions for all grids (all for generation)
+            decode_pos_lists: list[torch.Tensor] = []
+            decode_pos = current_pos
+
+            # For t2i with grids [[1,32,32], [1,16,16]]:
+            # - First generate small image (16x16 = 256 tokens)
+            # - Then generate large image (32x32 = 1024 tokens)
+            # - Finally generate EOS
+            # Process in reverse order for GLM-Image generation pattern
+            for grid_i in range(len(image_grid_thw) - 1, -1, -1):
+                t, h, w = image_grid_thw[grid_i]
+
+                # Build 2D positions for generated image
+                t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
+                h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+                w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+
+                decode_pos_lists.append(torch.stack([t_index, h_index, w_index], dim=0) + decode_pos)
+                decode_pos += max(t, h, w)
+
+            # Add position for EOS token
+            decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
+
+            decode_positions = torch.cat(decode_pos_lists, dim=1)
+
+            # Concatenate prefill and decode positions
+            llm_positions = torch.cat([prefill_positions, decode_positions], dim=1)
         else:
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)

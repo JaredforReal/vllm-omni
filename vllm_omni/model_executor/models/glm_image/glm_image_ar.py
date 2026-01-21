@@ -1750,6 +1750,15 @@ class GlmImageTextModel(nn.Module):
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.embed_tokens
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed input token IDs into hidden states.
+
+        This method is required by vLLM's SupportsMultiModal interface.
+        The parent multimodal model's embed_input_ids calls
+        get_language_model().embed_input_ids() to get text embeddings.
+        """
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -2406,7 +2415,13 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         return llm_positions, mrope_position_delta
 
     def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
+        """Return the underlying language model for text embedding.
+
+        This is required by vLLM's SupportsMultiModal interface.
+        The embed_input_ids() method calls get_language_model().embed_input_ids()
+        to get text token embeddings before merging with multimodal embeddings.
+        """
+        return self.model.language_model
 
     # Flag to indicate this model can output multimodal data (prior_token_image_ids for i2i)
     have_multimodal_outputs = True

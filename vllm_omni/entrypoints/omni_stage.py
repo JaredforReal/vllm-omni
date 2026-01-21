@@ -521,6 +521,28 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
+    # Handle model_subdir for models with config in subdirectory (e.g., GLM-Image AR model)
+    # Also handle tokenizer_subdir for when tokenizer is in a different location than model
+    model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    base_model_path = model  # Keep original model path for tokenizer
+
+    if model_subdir:
+        model = _os.path.join(model, model_subdir)
+        logger.info(f"Using model subdirectory: {model}")
+
+    # Set tokenizer path if different from model path
+    if tokenizer_subdir is not None:
+        # tokenizer_subdir can be empty string "" to use base_model_path directly
+        tokenizer_path = _os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info(f"Using tokenizer from: {tokenizer_path}")
+    elif model_subdir and "tokenizer" not in engine_args:
+        # If model is in subdirectory but tokenizer not specified, use base path
+        # This is common for models like GLM-Image where tokenizer is in root
+        engine_args["tokenizer"] = base_model_path
+        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+
     # Aggregates for running average
     _agg_total_tokens = 0
     _agg_total_gen_time_ms = 0.0
@@ -689,6 +711,10 @@ def _stage_worker(
                 engine_input_source=stage_payload.get("engine_input_source", []),
                 **engine_args,
             )
+            # Pass model path to OmniDiffusion if not already in engine_args
+            if "model" not in engine_args:
+                engine_args["model"] = model
+            stage_engine = OmniDiffusion(**engine_args)
         else:
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
@@ -868,18 +894,27 @@ def _stage_worker(
             gen_outputs: list[Any] = []
             _gen_t0 = _time.time()
             if stage_type == "diffusion":
-                # For diffusion, batch_engine_inputs should be prompts (strings)
-                # Convert to list of strings if needed
+                # For diffusion, batch_engine_inputs can be:
+                # 1. Strings (direct prompts)
+                # 2. Dicts with "prompt" and other fields like "extra", "height", "width"
+                #    (from custom_process_input_func like ar2diffusion)
+                # We need to preserve all fields for proper multistage integration
                 prompts = []
+                per_request_kwargs = []
                 for ein in batch_engine_inputs:
                     if isinstance(ein, str):
                         prompts.append(ein)
-                    elif isinstance(ein, dict) and "prompt" in ein:
-                        prompts.append(ein["prompt"])
+                        per_request_kwargs.append({})
+                    elif isinstance(ein, dict):
+                        prompts.append(ein.get("prompt", ""))
+                        # Extract all non-prompt fields as kwargs for this request
+                        req_kwargs = {k: v for k, v in ein.items() if k != "prompt"}
+                        per_request_kwargs.append(req_kwargs)
                     elif hasattr(ein, "prompt"):
                         prompts.append(ein.prompt)
                     else:
                         prompts.append(str(ein))
+                        per_request_kwargs.append({})
                 # Prepare diffusion kwargs from sampling parameters
                 diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
 
@@ -888,6 +923,29 @@ def _stage_worker(
 
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(prompts, **diffusion_kwargs)
+
+                # For multistage with extra params (like prior_token_ids), process each request
+                # with its specific kwargs merged with global diffusion_kwargs
+                diffusion_results = []
+                for i, (prompt, req_kwargs) in enumerate(zip(prompts, per_request_kwargs)):
+                    # Merge global diffusion_kwargs with per-request kwargs
+                    # Per-request kwargs take precedence (they may contain extra, height, width)
+                    merged_kwargs = {**diffusion_kwargs, **req_kwargs}
+                    # Log to verify extra params are being passed
+                    has_extra = "extra" in merged_kwargs
+                    has_prior_tokens = (
+                        merged_kwargs.get("extra", {}).get("prior_token_ids") is not None if has_extra else False
+                    )
+                    logger.info(
+                        f"[Diffusion] Request {i}: prompt='{prompt[:30] if prompt else ''}...', "
+                        f"has_extra={has_extra}, has_prior_token_ids={has_prior_tokens}"
+                    )
+                    result = stage_engine.generate(prompt, **merged_kwargs)
+                    if isinstance(result, list):
+                        diffusion_results.extend(result)
+                    else:
+                        diffusion_results.append(result)
+
                 # Convert to list format compatible with LLM outputs
                 # Ensure each result has a request_id for proper mapping
                 if isinstance(diffusion_results, list):
@@ -1358,12 +1416,19 @@ async def _stage_worker_async(
                 ein = ein[0]
 
             if stage_type == "diffusion":
-                # For diffusion, ein should be prompts (strings)
-                # Convert to string if needed
+                # For diffusion, ein can be:
+                # 1. A string (direct prompt)
+                # 2. A dict with "prompt" and other fields like "extra", "height", "width"
+                #    (from custom_process_input_func like ar2diffusion)
+                # We need to preserve all fields for proper multistage integration
+                prompt = ""
+                per_request_kwargs = {}
                 if isinstance(ein, str):
                     prompt = ein
-                elif isinstance(ein, dict) and "prompt" in ein:
-                    prompt = ein["prompt"]
+                elif isinstance(ein, dict):
+                    prompt = ein.get("prompt", "")
+                    # Extract all non-prompt fields as kwargs for this request
+                    per_request_kwargs = {k: v for k, v in ein.items() if k != "prompt"}
                 elif hasattr(ein, "prompt"):
                     prompt = ein.prompt
                 else:
@@ -1371,8 +1436,13 @@ async def _stage_worker_async(
 
                 # Prepare diffusion kwargs from sampling parameters
                 diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
+
+                # Merge global diffusion_kwargs with per-request kwargs
+                # Per-request kwargs take precedence (they may contain extra, height, width)
+                merged_kwargs = {**diffusion_kwargs, **per_request_kwargs}
+
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
+                gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **merged_kwargs)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))

@@ -2336,6 +2336,42 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             else:
                 i += 1
 
+        num_source_images = len(source_image_regions)
+
+        # For i2i mode: image_grid_thw may only contain source image grids
+        # We need to add generation target grids for proper M-RoPE position calculation
+        # Check if prompt ends with image_start_token (indicates generation will happen)
+        prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
+        if prompt_ends_with_start and len(image_grid_thw) == num_source_images and num_source_images > 0:
+            # i2i mode: source grids exist but no target grids
+            # Parse target grids from prompt tokens or use defaults
+            parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
+            if parsed_grids:
+                # parsed_grids contains all grids mentioned in prompt
+                # For i2i, we need grids that come AFTER the source image grids
+                # The prompt format includes target dimensions after source image tokens
+                # Add only the generation target grids (those not accounted for by source images)
+                if len(parsed_grids) > num_source_images:
+                    image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
+                else:
+                    # Fallback: add default 1024x1024 generation grids
+                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32], [1, 16, 16]]
+            else:
+                # Fallback to default 1024x1024 grids for generation
+                image_grid_thw = list(image_grid_thw) + [[1, 32, 32], [1, 16, 16]]
+
+        # Reset for the actual position calculation loop
+        source_image_regions = []
+        i = 0
+        while i < seq_len:
+            if input_tokens[i] == image_token_id:
+                start = i
+                while i < seq_len and input_tokens[i] == image_token_id:
+                    i += 1
+                source_image_regions.append((start, i - start))
+            else:
+                i += 1
+
         # Number of source images = number of image regions detected
         num_source_images = len(source_image_regions)
 
@@ -2463,6 +2499,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
 
         mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+
+        # Debug logging for M-RoPE position calculation
+        logger.debug(
+            f"get_mrope_input_positions: seq_len={seq_len}, "
+            f"num_source_images={num_source_images}, "
+            f"image_grid_thw={image_grid_thw}, "
+            f"llm_positions.shape={llm_positions.shape}, "
+            f"llm_positions.max={llm_positions.max().item()}, "
+            f"mrope_position_delta={mrope_position_delta}"
+        )
+
         return llm_positions, mrope_position_delta
 
     def get_language_model(self) -> torch.nn.Module:

@@ -16,6 +16,32 @@ from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
 from vllm_omni.utils import is_npu
 
+# =============================================================================
+# Patch GlmImageTextConfig to expose mrope_section in rope_parameters
+# =============================================================================
+# GLM-Image uses M-RoPE with mrope_section: [8, 12, 12], but transformers'
+# implementation doesn't expose it in rope_parameters. vLLM's uses_mrope
+# detection relies on "mrope_section" being present in rope_parameters.
+# This patch ensures proper M-RoPE detection for GLM-Image.
+try:
+    from transformers.models.glm_image.configuration_glm_image import GlmImageTextConfig
+
+    _original_glm_image_text_config_init = GlmImageTextConfig.__init__
+
+    def _patched_glm_image_text_config_init(self, *args, **kwargs):
+        _original_glm_image_text_config_init(self, *args, **kwargs)
+        # Ensure rope_parameters exists and contains mrope_section
+        if self.rope_parameters is None:
+            self.rope_parameters = {}
+        if isinstance(self.rope_parameters, dict) and "mrope_section" not in self.rope_parameters:
+            # GLM-Image uses mrope_section: [8, 12, 12] for T/H/W dimensions
+            self.rope_parameters["mrope_section"] = [8, 12, 12]
+
+    GlmImageTextConfig.__init__ = _patched_glm_image_text_config_init
+except ImportError:
+    # GlmImageTextConfig not available, skip patching
+    pass
+
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:

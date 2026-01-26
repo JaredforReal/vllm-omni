@@ -888,13 +888,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            model = self.get_model()
-            if model is None:
-                raise RuntimeError(
-                    "Model not loaded. Ensure load_model() is called before execute_model(). "
-                    f"self.model={self.model}, get_model()={model}"
-                )
-            inputs_embeds_scheduled = model.embed_input_ids(
+            inputs_embeds_scheduled = self.model.embed_input_ids(
                 self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
@@ -925,13 +919,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Some tokens ids may need to become embeds
             if token_ids_idx.numel() > 0:
                 token_ids = self.input_ids.gpu[token_ids_idx]
-                model = self.get_model()
-                if model is None:
-                    raise RuntimeError(
-                        "Model not loaded. Ensure load_model() is called before execute_model(). "
-                        f"self.model={self.model}, get_model()={model}"
-                    )
-                tokens_to_embeds = model.embed_input_ids(input_ids=token_ids)
+                tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
                 self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]

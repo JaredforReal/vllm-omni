@@ -40,36 +40,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
 
-        # Override uses_mrope for models that use M-RoPE but vLLM's default
-        # detection fails. GLM-Image uses M-RoPE (mrope_section in config.json)
-        # but transformers ignores it with warning:
-        # "Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section'}"
-        # So we hardcode the detection based on model_type.
-        if not self.uses_mrope:
-            hf_config = self.model_config.hf_config
-            model_type = getattr(hf_config, "model_type", None)
-            # GLM-Image uses M-RoPE with mrope_section: [8, 12, 12]
-            if model_type in ("glm_image",):
-                self.uses_mrope = True
-                logger.info(f"[OmniGPUModelRunner] Enabling M-RoPE for model_type={model_type}")
-
     def load_model(self, *args, **kwargs) -> None:
-        logger.info("[OmniGPUModelRunner] load_model called with args=%s, kwargs=%s", args, kwargs)
         super().load_model(*args, **kwargs)
-        # Verify model was loaded successfully
-        if not hasattr(self, "model") or self.model is None:
-            logger.error(
-                "[OmniGPUModelRunner] CRITICAL: Model was not loaded after super().load_model(). "
-                "self.model=%s, hasattr='model'=%s. This will cause execute_model to fail.",
-                self.model if hasattr(self, "model") else "NO_ATTR",
-                hasattr(self, "model"),
-            )
-        else:
-            logger.info(
-                "[OmniGPUModelRunner] Model loaded successfully: self.model type=%s, get_model()=%s",
-                type(self.model).__name__,
-                type(self.get_model()).__name__ if self.get_model() is not None else None,
-            )
         # TODO move this model specific logic to a separate class
         if hasattr(self.model, "talker_mtp") and self.model.talker is not None:
             self.talker_mtp = self.model.talker_mtp
@@ -90,9 +62,13 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
 
-        Extracts multimodal feature metadata (image grids, video grids,
-        audio features) and computes M-RoPE positions for proper positional
-        encoding of multimodal tokens.
+        This method follows the vLLM native interface more closely.
+        Models implementing SupportsMRoPE should handle extracting
+        multimodal metadata from mm_features themselves.
+
+        For models not implementing SupportsMRoPE, we fall back to
+        MRotaryEmbedding.get_input_positions_tensor with extracted
+        multimodal metadata.
 
         Args:
             req_state: Cached request state containing multimodal features
@@ -100,41 +76,39 @@ class OmniGPUModelRunner(GPUModelRunner):
         Raises:
             AssertionError: If the model does not support M-RoPE
         """
-        image_grid_thw = []
-        video_grid_thw = []
-        second_per_grid_ts = []
-        audio_feature_lengths = []
-        use_audio_in_video = False
-        for mm_feature in req_state.mm_features:
-            mm_item = mm_feature.data
-            if mm_item is None:
-                continue
-            mm_input = mm_item.get_data()
-            if (t := mm_input.get("image_grid_thw")) is not None:
-                image_grid_thw.append(t.tolist())
-            if (t := mm_input.get("video_grid_thw")) is not None:
-                video_grid_thw.append(t.tolist())
-            if (t := mm_input.get("second_per_grid_ts")) is not None:
-                second_per_grid_ts.append(t)
-            if (t := mm_input.get("audio_feature_lengths")) is not None:
-                audio_feature_lengths.append(t)
-            # Check for use_audio_in_video
-            use_audio_in_video_value = mm_input.get("use_audio_in_video")
-            if use_audio_in_video_value is not None:
-                use_audio_in_video = bool(use_audio_in_video_value.item())
+        model = self.get_model()
 
-        if supports_mrope(self.get_model()):
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+        if supports_mrope(model):
+            # Model implements SupportsMRoPE - let it handle everything
+            req_state.mrope_positions, req_state.mrope_position_delta = model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                mm_features=req_state.mm_features,
-                hf_config=self.model_config.hf_config,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                audio_feature_lengths=audio_feature_lengths,
-                use_audio_in_video=use_audio_in_video,
+                req_state.mm_features,
             )
         else:
+            # Fallback: extract multimodal metadata and use MRotaryEmbedding
+            image_grid_thw = []
+            video_grid_thw = []
+            second_per_grid_ts = []
+            audio_feature_lengths = []
+            use_audio_in_video = False
+
+            for mm_feature in req_state.mm_features:
+                mm_item = mm_feature.data
+                if mm_item is None:
+                    continue
+                mm_input = mm_item.get_data()
+                if (t := mm_input.get("image_grid_thw")) is not None:
+                    image_grid_thw.append(t.tolist())
+                if (t := mm_input.get("video_grid_thw")) is not None:
+                    video_grid_thw.append(t.tolist())
+                if (t := mm_input.get("second_per_grid_ts")) is not None:
+                    second_per_grid_ts.append(t)
+                if (t := mm_input.get("audio_feature_lengths")) is not None:
+                    audio_feature_lengths.append(t)
+                use_audio_in_video_value = mm_input.get("use_audio_in_video")
+                if use_audio_in_video_value is not None:
+                    use_audio_in_video = bool(use_audio_in_video_value.item())
+
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
                 hf_config=self.model_config.hf_config,
@@ -144,70 +118,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
-
-    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
-        """Calculate M-RoPE positions for scheduled tokens.
-
-        Overrides base vLLM to use pre-computed 2D spatial positions for decode
-        phase (for models like GLM-Image) instead of linear positions.
-        """
-        from vllm.utils import length_from_prompt_token_ids_or_embeds
-
-        mrope_pos_ptr = 0
-        for index, req_id in enumerate(self.input_batch.req_ids):
-            req = self.requests[req_id]
-            assert req.mrope_positions is not None
-
-            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
-
-            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
-                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
-                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
-            else:
-                prompt_part_len = num_scheduled_tokens
-                completion_part_len = 0
-
-            assert num_scheduled_tokens == prompt_part_len + completion_part_len
-
-            if prompt_part_len > 0:
-                # prompt's mrope_positions are pre-computed
-                dst_start = mrope_pos_ptr
-                dst_end = mrope_pos_ptr + prompt_part_len
-                src_start = num_computed_tokens
-                src_end = num_computed_tokens + prompt_part_len
-
-                self.mrope_positions.np[:, dst_start:dst_end] = req.mrope_positions[:, src_start:src_end]
-                mrope_pos_ptr += prompt_part_len
-
-            if completion_part_len > 0:
-                dst_start = mrope_pos_ptr
-
-                # Check if pre-computed decode positions are available
-                # GLM-Image's get_mrope_input_positions returns positions for
-                # both prefill and decode phases with proper 2D spatial encoding
-                total_precomputed = req.mrope_positions.shape[1]
-                decode_start = num_computed_tokens + prompt_part_len
-                decode_end = decode_start + completion_part_len
-
-                if decode_end <= total_precomputed:
-                    # Use pre-computed decode positions (for GLM-Image 2D spatial)
-                    self.mrope_positions.np[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
-                        :, decode_start:decode_end
-                    ]
-                else:
-                    # Fallback to default linear positions for text-only generation
-                    assert req.mrope_position_delta is not None
-                    MRotaryEmbedding.get_next_input_positions_tensor(
-                        out=self.mrope_positions.np,
-                        out_offset=dst_start,
-                        mrope_position_delta=req.mrope_position_delta,
-                        context_len=num_computed_tokens + prompt_part_len,
-                        num_new_tokens=completion_part_len,
-                    )
-
-                mrope_pos_ptr += completion_part_len
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler

@@ -201,17 +201,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 context_len=context_len,
                 seq_len=seq_len,
             )
-        elif hf_config.model_type == "glm_image":
-            # GLM-Image is an image generation model.
-            # For text-to-image mode (no input images), use simple text-only positions.
-            # For image-to-image mode, use GLM4V-style position encoding.
-            return cls._glm_image_get_input_positions_tensor(
-                input_tokens=input_tokens,
-                hf_config=hf_config,
-                image_grid_thw=image_grid_thw,
-                context_len=context_len,
-                seq_len=seq_len,
-            )
         else:
             return cls._vl_get_input_positions_tensor(
                 input_tokens=input_tokens,
@@ -316,81 +305,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                     video_frame_num = 1
 
         else:
-            text_len = len(input_tokens)
-            llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1))
-
-        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-        llm_positions = llm_positions[:, context_len:seq_len]
-        mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
-        return llm_positions, mrope_position_delta
-
-    @classmethod
-    def _glm_image_get_input_positions_tensor(
-        cls,
-        input_tokens: list[int],
-        hf_config: PretrainedConfig,
-        image_grid_thw: list[list[int]] | torch.Tensor | None,
-        context_len: int = 0,
-        seq_len: int | None = None,
-    ) -> tuple[torch.Tensor, int]:
-        """Get mrope input positions for GLM-Image model.
-
-        GLM-Image is an image GENERATION model, not understanding.
-        - For text-to-image: no input images, just text positions
-        - For image-to-image: source images have grid positions
-
-        Unlike Qwen2-VL, GLM-Image doesn't have video support.
-        """
-        llm_pos_ids_list: list = []
-
-        # Check if we have any image inputs (image-to-image mode)
-        has_image_input = image_grid_thw is not None and len(image_grid_thw) > 0
-
-        if has_image_input:
-            # Image-to-image mode: handle source image positions
-            image_token_id = getattr(hf_config, "image_token_id", None)
-            spatial_merge_size = getattr(hf_config.vision_config, "spatial_merge_size", 1)
-
-            if isinstance(image_grid_thw, torch.Tensor):
-                image_grid_thw = image_grid_thw.tolist()
-
-            input_tokens_tensor = torch.tensor(input_tokens)
-            image_indices = torch.argwhere(input_tokens_tensor == image_token_id).squeeze(1).tolist()
-
-            st = 0
-            image_idx = 0
-            for i, token_pos in enumerate(image_indices):
-                # Text before this image
-                if token_pos > st:
-                    text_len = token_pos - st
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-                    st = token_pos
-
-                # Image tokens
-                if image_idx < len(image_grid_thw):
-                    t, h, w = image_grid_thw[image_idx]
-                    llm_grid_t = t
-                    llm_grid_h = h // spatial_merge_size
-                    llm_grid_w = w // spatial_merge_size
-
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + st_idx)
-
-                    num_image_tokens = llm_grid_t * llm_grid_h * llm_grid_w
-                    st += num_image_tokens
-                    image_idx += 1
-
-            # Remaining text after last image
-            if st < len(input_tokens):
-                text_len = len(input_tokens) - st
-                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-        else:
-            # Text-to-image mode: simple sequential positions
             text_len = len(input_tokens)
             llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1))
 

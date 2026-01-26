@@ -53,7 +53,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -1481,6 +1480,193 @@ class GlmImageVisionModel(nn.Module):
 # === Text Model Components ===
 
 
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_glm_image_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply GLM-Image rotary position embedding to query and key tensors.
+
+    Args:
+        q: Query tensor [num_tokens, num_heads, head_dim]
+        k: Key tensor [num_tokens, num_kv_heads, head_dim]
+        cos: Cosine values [num_tokens, rotary_dim]
+        sin: Sine values [num_tokens, rotary_dim]
+
+    Returns:
+        Tuple of (rotated_q, rotated_k) with same shapes as input
+    """
+    # cos/sin shape: [num_tokens, rotary_dim]
+    # Need to unsqueeze for broadcasting with heads dimension
+    cos = cos.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
+    sin = sin.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
+
+    rotary_dim = cos.shape[-1]
+
+    # Split into rotary and pass-through parts
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    # Apply rotary embeddings
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    # Concatenate back
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+
+    return q_embed, k_embed
+
+
+class GlmImageRotaryEmbedding(nn.Module):
+    """
+    Custom Rotary Embedding for GLM-Image with M-RoPE support.
+
+    GLM-Image uses a 3D position encoding (temporal, height, width) with
+    M-RoPE sections [8, 12, 12]. This means:
+    - First 8 dims use temporal positions
+    - Next 12 dims use height positions
+    - Next 12 dims use width positions
+    - Pattern repeats for remaining dims
+
+    Unlike vLLM's standard MRotaryEmbedding which uses cache-based lookup,
+    this implementation computes cos/sin dynamically to handle arbitrary
+    position values without cache size limitations.
+
+    This follows the transformers reference implementation:
+    - inv_freq is expanded to (3, ...) for 3D positions
+    - freqs = inv_freq @ position_ids
+    - apply_mrope interleaves frequency chunks from different dimensions
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_position_embeddings: int = 32768,
+        rope_theta: float = 10000.0,
+        partial_rotary_factor: float = 1.0,
+        mrope_section: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
+
+        # Compute rotary dimension
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
+
+        # Default mrope_section for GLM-Image
+        self.mrope_section = mrope_section if mrope_section is not None else [8, 12, 12]
+
+        # Compute inverse frequencies
+        # inv_freq shape: [rotary_dim // 2]
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
+        """
+        Apply M-RoPE section interleaving.
+
+        For mrope_section = [8, 12, 12]:
+        - Split freqs into chunks of size [8, 12, 12, 8, 12, 12, ...]
+        - Take chunk[i % 3] from each split (alternating T, H, W dimensions)
+        - Concatenate back
+
+        Args:
+            freqs: Frequency tensor [3, num_tokens, rotary_dim // 2]
+
+        Returns:
+            Interleaved frequencies [num_tokens, rotary_dim // 2]
+        """
+        # freqs shape: [3, num_tokens, rotary_dim // 2]
+        # Split along last dimension according to mrope_section
+        chunks = freqs.split(self.mrope_section, dim=-1)
+
+        # Take chunk[i % 3] from each split
+        # chunks[i] has shape [3, num_tokens, section_size]
+        # We select dimension 0 (T), 1 (H), or 2 (W) based on i % 3
+        result = torch.cat([chunk[i % 3] for i, chunk in enumerate(chunks)], dim=-1)
+
+        return result
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply rotary position embeddings to query and key.
+
+        Args:
+            positions: Position IDs
+                - Shape [num_tokens] for 1D positions (text-only)
+                - Shape [3, num_tokens] for 3D M-RoPE positions (T, H, W)
+            query: Query tensor [num_tokens, num_heads * head_dim]
+            key: Key tensor [num_tokens, num_kv_heads * head_dim]
+
+        Returns:
+            Tuple of (rotated_query, rotated_key) with same shapes as input
+        """
+        num_tokens = positions.shape[-1]
+        device = positions.device
+        dtype = query.dtype
+
+        # Ensure inv_freq is on same device
+        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+
+        if positions.ndim == 1:
+            # 1D positions: expand to 3D with same values
+            # Shape: [1, num_tokens] -> [3, num_tokens]
+            positions_3d = positions.unsqueeze(0).expand(3, -1)
+        else:
+            # Already 3D: [3, num_tokens]
+            positions_3d = positions
+
+        # Compute frequencies: [3, num_tokens, rotary_dim // 2]
+        # inv_freq: [rotary_dim // 2]
+        # positions_3d: [3, num_tokens]
+        # freqs = positions @ inv_freq -> [3, num_tokens, rotary_dim // 2]
+        inv_freq_expanded = inv_freq[None, None, :].expand(3, num_tokens, -1)  # [3, num_tokens, rotary_dim // 2]
+        positions_expanded = positions_3d[:, :, None].float()  # [3, num_tokens, 1]
+        freqs = positions_expanded * inv_freq_expanded  # [3, num_tokens, rotary_dim // 2]
+
+        # Apply M-RoPE interleaving
+        freqs = self._apply_mrope(freqs)  # [num_tokens, rotary_dim // 2]
+
+        # Build cos/sin embeddings
+        # Concatenate freqs with itself for full rotary_dim
+        emb = torch.cat((freqs, freqs), dim=-1)  # [num_tokens, rotary_dim]
+        cos = emb.cos().to(dtype)  # [num_tokens, rotary_dim]
+        sin = emb.sin().to(dtype)  # [num_tokens, rotary_dim]
+
+        # Reshape query and key for rotary application
+        # query: [num_tokens, num_heads * head_dim] -> [num_tokens, num_heads, head_dim]
+        query_shape = query.shape
+        key_shape = key.shape
+
+        query = query.view(num_tokens, -1, self.head_dim)
+        key = key.view(num_tokens, -1, self.head_dim)
+
+        # Apply rotary embeddings
+        query, key = apply_glm_image_rotary_pos_emb(query, key, cos, sin)
+
+        # Reshape back
+        query = query.view(query_shape)
+        key = key.view(key_shape)
+
+        return query, key
+
+
 class GlmImageTextMLP(nn.Module):
     """
     MLP module for GLM-Image text model.
@@ -1580,12 +1766,25 @@ class GlmImageTextAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # M-RoPE for 3D position encoding
+        # M-RoPE for 3D position encoding (temporal, height, width)
+        # Use custom GlmImageRotaryEmbedding instead of vLLM's get_rope
+        # to properly handle 3D positions with mrope_section interleaving
         rope_parameters = getattr(config, "rope_parameters", None)
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters=rope_parameters,
+        rope_theta = 10000.0
+        partial_rotary_factor = 1.0
+        mrope_section = [8, 12, 12]  # Default for GLM-Image
+
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", rope_theta)
+            partial_rotary_factor = rope_parameters.get("partial_rotary_factor", partial_rotary_factor)
+            mrope_section = rope_parameters.get("mrope_section", mrope_section)
+
+        self.rotary_emb = GlmImageRotaryEmbedding(
+            head_dim=self.head_dim,
+            max_position_embeddings=max_position_embeddings,
+            rope_theta=rope_theta,
+            partial_rotary_factor=partial_rotary_factor,
+            mrope_section=mrope_section,
         )
 
         self.attn = Attention(

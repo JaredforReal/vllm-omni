@@ -1542,9 +1542,9 @@ class GlmImageRotaryEmbedding(nn.Module):
     this implementation computes cos/sin dynamically to handle arbitrary
     position values without cache size limitations.
 
-    This follows the transformers reference implementation:
-    - inv_freq is expanded to (3, ...) for 3D positions
-    - freqs = inv_freq @ position_ids
+    This follows the transformers reference implementation exactly:
+    - inv_freq is expanded for matmul with position_ids
+    - freqs = inv_freq @ position_ids (matrix multiplication)
     - apply_mrope interleaves frequency chunks from different dimensions
     """
 
@@ -1617,7 +1617,12 @@ class GlmImageRotaryEmbedding(nn.Module):
         Returns:
             Tuple of (rotated_query, rotated_key) with same shapes as input
         """
-        num_tokens = positions.shape[-1]
+        # Get dimensions
+        if positions.ndim == 1:
+            num_tokens = positions.shape[0]
+        else:
+            num_tokens = positions.shape[1]
+
         device = positions.device
         dtype = query.dtype
 
@@ -1626,25 +1631,36 @@ class GlmImageRotaryEmbedding(nn.Module):
 
         if positions.ndim == 1:
             # 1D positions: expand to 3D with same values
-            # Shape: [1, num_tokens] -> [3, num_tokens]
+            # Shape: [num_tokens] -> [3, num_tokens]
             positions_3d = positions.unsqueeze(0).expand(3, -1)
         else:
             # Already 3D: [3, num_tokens]
             positions_3d = positions
 
-        # Compute frequencies: [3, num_tokens, rotary_dim // 2]
+        # Follow reference implementation exactly:
+        # Reference: inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, bs, -1, 1)
+        # Reference: position_ids_expanded = position_ids[:, :, None, :].float()  # (3, bs, 1, positions)
+        # Reference: freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+        #
+        # For vLLM (no batch dim):
         # inv_freq: [rotary_dim // 2]
         # positions_3d: [3, num_tokens]
-        # freqs = positions @ inv_freq -> [3, num_tokens, rotary_dim // 2]
-        inv_freq_expanded = inv_freq[None, None, :].expand(3, num_tokens, -1)  # [3, num_tokens, rotary_dim // 2]
-        positions_expanded = positions_3d[:, :, None].float()  # [3, num_tokens, 1]
+        #
+        # We want: freqs[i, j, k] = positions_3d[i, j] * inv_freq[k]
+        # So: freqs = positions_3d[:, :, None] * inv_freq[None, None, :]
+        # Shape: [3, num_tokens, 1] * [1, 1, rotary_dim // 2] = [3, num_tokens, rotary_dim // 2]
+
+        # Compute frequencies using broadcasting (equivalent to matmul in reference)
+        positions_expanded = positions_3d.unsqueeze(-1).float()  # [3, num_tokens, 1]
+        inv_freq_expanded = inv_freq.unsqueeze(0).unsqueeze(0)  # [1, 1, rotary_dim // 2]
         freqs = positions_expanded * inv_freq_expanded  # [3, num_tokens, rotary_dim // 2]
 
         # Apply M-RoPE interleaving
+        # This selects different frequency dims from different position dims
         freqs = self._apply_mrope(freqs)  # [num_tokens, rotary_dim // 2]
 
         # Build cos/sin embeddings
-        # Concatenate freqs with itself for full rotary_dim
+        # Concatenate freqs with itself for full rotary_dim (real and imaginary parts)
         emb = torch.cat((freqs, freqs), dim=-1)  # [num_tokens, rotary_dim]
         cos = emb.cos().to(dtype)  # [num_tokens, rotary_dim]
         sin = emb.sin().to(dtype)  # [num_tokens, rotary_dim]

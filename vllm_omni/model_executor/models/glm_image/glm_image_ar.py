@@ -2625,19 +2625,30 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
                         # Verify region length matches grid dimensions
                         if region_len == expected_tokens:
-                            # Build 2D position IDs for image tokens following GLM4V pattern:
-                            # - t_index: temporal index (0 for single frame)
-                            # - h_index: height index [0, 1, ..., h-1] repeated w times per t
-                            # - w_index: width index [0, 1, ..., w-1] for each row
-                            # All shifted by current_pos uniformly
-                            t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
-                            h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
-                            w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+                            # Build 2D position IDs for source image tokens following GLM-Image pattern:
+                            # - temporal: constant at current_pos (same for all tokens in image)
+                            # - height: [current_pos, current_pos, ..., current_pos+1, current_pos+1, ...]
+                            # - width: [current_pos, current_pos+1, ..., current_pos+w-1, current_pos, ...]
+                            # Reference: modeling_glm_image.py get_rope_index()
+                            total_tokens = h * w
 
-                            llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index], dim=0) + current_pos)
+                            # Temporal: all tokens have same position
+                            position_temporal = torch.full((total_tokens,), current_pos, dtype=torch.long)
 
-                            # Advance position by max(t, h, w) to maintain spatial coherence
-                            current_pos += max(t, h, w)
+                            # Height: increments every w tokens
+                            h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
+                            position_height = current_pos + h_indices
+
+                            # Width: cycles 0 to w-1 for each row
+                            w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+                            position_width = current_pos + w_indices
+
+                            llm_pos_ids_list.append(
+                                torch.stack([position_temporal, position_height, position_width], dim=0)
+                            )
+
+                            # Advance position by max(h, w) to maintain spatial coherence
+                            current_pos += max(h, w)
                             i += region_len
                             region_idx += 1
                             continue
@@ -2664,17 +2675,26 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 decode_pos_lists: list[torch.Tensor] = []
                 decode_pos = current_pos
 
-                # Process decode grids (those after source images)
-                for grid_i in range(num_source_images, len(image_grid_thw)):
-                    t, h, w = image_grid_thw[grid_i]
+                # Process decode grids in REVERSE order (last grid first)
+                # GLM-Image generates small image first (e.g., 16x16), then large (32x32)
+                for i in range(1, num_decode_grids + 1):
+                    grid_idx = len(image_grid_thw) - i  # -1, -2, ... from end
+                    t, h, w = image_grid_thw[grid_idx]
+                    total_tokens = h * w
 
-                    # Build 2D positions for generated image
-                    t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
-                    h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
-                    w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+                    # Build 2D positions following reference implementation:
+                    # temporal: constant at decode_pos
+                    # height: decode_pos + [0,0,...,1,1,...,h-1,h-1,...]
+                    # width: decode_pos + [0,1,...,w-1,0,1,...,w-1,...]
+                    h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
+                    w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
 
-                    decode_pos_lists.append(torch.stack([t_index, h_index, w_index], dim=0) + decode_pos)
-                    decode_pos += max(t, h, w)
+                    decode_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                    decode_height = decode_pos + h_indices
+                    decode_width = decode_pos + w_indices
+
+                    decode_pos_lists.append(torch.stack([decode_temporal, decode_height, decode_width], dim=0))
+                    decode_pos += max(h, w)
 
                 # Add position for EOS token
                 decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))
@@ -2703,20 +2723,28 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             decode_pos = current_pos
 
             # For t2i with grids [[1,32,32], [1,16,16]]:
-            # - First generate small image (16x16 = 256 tokens)
-            # - Then generate large image (32x32 = 1024 tokens)
+            # - First generate small image (16x16 = 256 tokens) from grid[-1]
+            # - Then generate large image (32x32 = 1024 tokens) from grid[-2]
             # - Finally generate EOS
             # Process in reverse order for GLM-Image generation pattern
-            for grid_i in range(len(image_grid_thw) - 1, -1, -1):
-                t, h, w = image_grid_thw[grid_i]
+            for i in range(1, len(image_grid_thw) + 1):
+                grid_idx = -i  # -1, -2, ... (last grid first)
+                t, h, w = image_grid_thw[grid_idx]
+                total_tokens = h * w
 
-                # Build 2D positions for generated image
-                t_index = torch.arange(t).view(-1, 1).expand(t, h * w).flatten()
-                h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
-                w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+                # Build 2D positions following reference implementation:
+                # temporal: constant at decode_pos
+                # height: decode_pos + [0,0,...,1,1,...,h-1,h-1,...]
+                # width: decode_pos + [0,1,...,w-1,0,1,...,w-1,...]
+                h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
+                w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
 
-                decode_pos_lists.append(torch.stack([t_index, h_index, w_index], dim=0) + decode_pos)
-                decode_pos += max(t, h, w)
+                decode_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                decode_height = decode_pos + h_indices
+                decode_width = decode_pos + w_indices
+
+                decode_pos_lists.append(torch.stack([decode_temporal, decode_height, decode_width], dim=0))
+                decode_pos += max(h, w)
 
             # Add position for EOS token
             decode_pos_lists.append(torch.tensor([[decode_pos], [decode_pos], [decode_pos]]))

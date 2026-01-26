@@ -2317,11 +2317,15 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         image_input: dict,
     ) -> list[torch.Tensor]:
         """
-        Process image input through vision encoder to get embeddings.
+        Process image input through vision encoder and VQ-VAE to get text embeddings.
 
-        For GLM-Image, we extract features using the vision encoder.
-        These are used for multimodal profiling. The actual VQ-VAE tokenization
-        happens during the forward pass.
+        For GLM-Image, we:
+        1. Extract features using the vision encoder (1536 dim)
+        2. Quantize features to discrete tokens using VQ-VAE
+        3. Embed tokens using text embedding layer (4096 dim)
+
+        This follows the same pattern as Chameleon - returning text-space embeddings
+        that can be directly scattered into the input_embeds tensor.
         """
         pixel_values = image_input["pixel_values"]
         image_grid_thw = image_input["image_grid_thw"]
@@ -2329,11 +2333,18 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Get image features from vision encoder
         image_features = self.model.get_image_features(pixel_values, image_grid_thw)
 
+        # Quantize to discrete tokens using VQ-VAE
+        image_tokens = self.model.get_image_tokens(image_features, image_grid_thw)
+
+        # Get text embeddings for the image tokens
+        # This converts from vision token IDs to text-space embeddings (4096 dim)
+        image_embeddings = self.model.language_model.embed_input_ids(image_tokens)
+
         # Split by image grid sizes
         split_sizes = (image_grid_thw.prod(dim=-1)).tolist()
-        image_features_list = torch.split(image_features, split_sizes, dim=0)
+        image_embeddings_list = torch.split(image_embeddings, split_sizes, dim=0)
 
-        return list(image_features_list)
+        return list(image_embeddings_list)
 
     def embed_multimodal(
         self,
@@ -2342,12 +2353,17 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         """
         Embed multimodal inputs (images) for vLLM's multimodal processing.
 
-        For GLM-Image, this extracts image features using the vision encoder.
-        These embeddings are used by vLLM for multimodal budget profiling.
-        The actual token replacement (via VQ-VAE) happens in the forward pass.
+        For GLM-Image (similar to Chameleon), we:
+        1. Extract features using the vision encoder (1536 dim)
+        2. Quantize features to discrete tokens using VQ-VAE
+        3. Embed tokens using text embedding layer (4096 dim)
+
+        This returns text-space embeddings that can be directly scattered
+        into the input_embeds tensor by vLLM's _merge_multimodal_embeddings.
 
         Returns:
-            Tuple of image embedding tensors, one per image
+            Tuple of image embedding tensors, one per image, each with shape
+            [num_patches, text_hidden_size]
         """
         # Debug: log kwargs keys
         logger.debug(f"embed_multimodal called with kwargs keys: {list(kwargs.keys())}")

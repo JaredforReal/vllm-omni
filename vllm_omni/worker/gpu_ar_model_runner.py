@@ -272,17 +272,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                raw_hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
-                hidden_states = model_output
+                raw_hidden_states = model_output
                 aux_hidden_states = None
 
             # Extract multimodal outputs if model supports it
             # This handles both OmniOutput objects and plain tensors
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(raw_hidden_states)
 
-            if multimodal_outputs is not None and multimodal_outputs:
+            if multimodal_outputs:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
                     if isinstance(multimodal_outputs, dict)
@@ -290,7 +290,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 )
                 logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
             else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
+                logger.debug("[AR] execute_model: multimodal_outputs empty")
 
             if not self.broadcast_pp_output:
                 # Common case.

@@ -2191,6 +2191,14 @@ class GlmImageModel(nn.Module):
                 "image_grid_thw": image_grid_thw.tolist(),
             }
 
+            # Debug: log prior_token_image_ids_info
+            shapes = [t.shape for t in upsampled_token_ids]
+            logger.info(
+                f"[GlmImageModel.forward] Built prior_token_image_ids_info: "
+                f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
+                f"image_grid_thw={image_grid_thw.tolist()}"
+            )
+
             # Replace placeholder tokens with actual image tokens
             # Only do this if input_ids is provided (not during profile_run)
             if input_ids is not None:
@@ -2429,15 +2437,18 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         For text-to-image, the prompt format is:
         "text<sop>H W<eop><sop>h w<eop><bos>"
 
+        For image-to-image, the prompt format is:
+        "text<sop>H W<eop><bos>"
+
         Where:
         - <sop> is grid_bos_token_id (start of phrase, marks grid dimension start)
         - <eop> is grid_eos_token_id (end of phrase, marks grid dimension end)
         - H W is large image grid (e.g., "32 32" for 1024x1024)
-        - h w is small image grid (e.g., "16 16" for preview)
+        - h w is small image grid for preview (t2i only)
         - <bos> is image_start_token_id (16384, marks start of image generation)
 
         Returns:
-            List of grids [[1, H, W], [1, h, w]] or None if parsing fails
+            List of grids [[1, H, W], ...] or None if parsing fails
         """
         try:
             # Get special token IDs from config or tokenizer
@@ -2495,7 +2506,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 else:
                     i += 1
 
-            if len(grids) >= 2:
+            # Return grids if we found any (1 for i2i, 2 for t2i)
+            if len(grids) >= 1:
                 return grids
 
             return None
@@ -2575,6 +2587,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         image_end_positions = torch.where(input_tokens_tensor == image_end_token_id)[0]
         image_start_positions = torch.where(input_tokens_tensor == image_start_token_id)[0]
 
+        logger.debug(
+            f"get_mrope_input_positions: seq_len={seq_len}, "
+            f"image_start_positions={image_start_positions.tolist()}, "
+            f"image_end_positions={image_end_positions.tolist()}"
+        )
+
         # Filter start positions: only those followed by image tokens (not the final <bos>)
         # A valid image start is followed by image_token_id, not followed by end of sequence
         valid_start_positions = []
@@ -2582,6 +2600,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Check if there's a token after this start and it's an image token
             if start_pos + 1 < seq_len and input_tokens[start_pos + 1] == image_token_id:
                 valid_start_positions.append(start_pos.item() + 1)  # +1 to skip the start marker
+
+        logger.debug(f"get_mrope_input_positions: valid_start_positions={valid_start_positions}")
 
         # Pair starts with ends to find complete image regions
         num_complete_images = min(len(valid_start_positions), len(image_end_positions))
@@ -2621,18 +2641,44 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 start = valid_start_positions[img_idx]  # First image token position
                 end = image_end_positions[img_idx].item()  # End marker position
 
+                # Actual number of image tokens in input_ids
+                actual_image_tokens = end - start
+
+                logger.debug(
+                    f"get_mrope_input_positions: processing image {img_idx}, "
+                    f"start={start}, end={end}, actual_tokens={actual_image_tokens}, "
+                    f"prev_image_end={prev_image_end}, current_pos={current_pos}"
+                )
+
                 # Get grid dimensions for this source image
                 if img_idx < len(image_grid_thw):
                     t, h, w = image_grid_thw[img_idx]
+                    expected_tokens = h * w
+                    # Verify token count matches grid
+                    if actual_image_tokens != expected_tokens:
+                        logger.warning(
+                            f"Image {img_idx}: token count mismatch! "
+                            f"actual={actual_image_tokens}, expected={expected_tokens} (h={h}, w={w}). "
+                            f"Using actual token count."
+                        )
+                        # Recalculate h, w from actual token count
+                        h = w = int(actual_image_tokens**0.5)
+                        if h * w != actual_image_tokens:
+                            # Non-square, try to find factors
+                            for factor in range(int(actual_image_tokens**0.5), 0, -1):
+                                if actual_image_tokens % factor == 0:
+                                    h = factor
+                                    w = actual_image_tokens // factor
+                                    break
                 else:
                     # Fallback: estimate from token count
-                    image_tokens = end - start
-                    h = w = int(image_tokens**0.5)
+                    h = w = int(actual_image_tokens**0.5)
                     t = 1
 
                 # Text tokens before this image (from prev_image_end to start)
                 # Note: start points to first image token, so text is [prev_image_end, start)
                 text_length = start - prev_image_end
+                logger.debug(f"get_mrope_input_positions: text_length={text_length} (from {prev_image_end} to {start})")
                 if text_length > 0:
                     # Text tokens get sequential 1D positions
                     text_positions = torch.arange(current_pos, current_pos + text_length, dtype=torch.long)
@@ -2641,20 +2687,36 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     current_pos += text_length
 
                 # Image tokens with 2D spatial encoding
+                # CRITICAL: Use actual_image_tokens to match input_ids length exactly
                 # For an image with height H and width W:
                 # - temporal: constant at current_pos
                 # - height: cycles [current_pos, ..., current_pos+h-1] repeated w times each
                 # - width: cycles [current_pos, ..., current_pos+w-1] repeated h times
-                total_tokens = h * w
 
                 # Temporal: all tokens have same position
-                position_temporal = torch.full((total_tokens,), current_pos, dtype=torch.long)
+                position_temporal = torch.full((actual_image_tokens,), current_pos, dtype=torch.long)
 
-                # Height: repeat_interleave pattern
+                # Height: repeat_interleave pattern (clip to actual_image_tokens)
                 position_height = torch.arange(current_pos, current_pos + h, dtype=torch.long).repeat_interleave(w)
+                if len(position_height) != actual_image_tokens:
+                    position_height = (
+                        position_height[:actual_image_tokens]
+                        if len(position_height) > actual_image_tokens
+                        else F.pad(
+                            position_height, (0, actual_image_tokens - len(position_height)), value=current_pos + h - 1
+                        )
+                    )
 
-                # Width: repeat pattern
+                # Width: repeat pattern (clip to actual_image_tokens)
                 position_width = torch.arange(current_pos, current_pos + w, dtype=torch.long).repeat(h)
+                if len(position_width) != actual_image_tokens:
+                    position_width = (
+                        position_width[:actual_image_tokens]
+                        if len(position_width) > actual_image_tokens
+                        else F.pad(
+                            position_width, (0, actual_image_tokens - len(position_width)), value=current_pos + w - 1
+                        )
+                    )
 
                 vision_position_ids = torch.stack([position_temporal, position_height, position_width], dim=0)
                 llm_pos_ids_list.append(vision_position_ids)
@@ -2668,6 +2730,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
             # Remaining text tokens after the last image (including grid tokens and final <bos>)
             remaining_length = seq_len - prev_image_end
+            logger.debug(
+                f"get_mrope_input_positions: remaining_length={remaining_length} "
+                f"(seq_len={seq_len} - prev_image_end={prev_image_end})"
+            )
             if remaining_length > 0:
                 text_positions = torch.arange(current_pos, current_pos + remaining_length, dtype=torch.long)
                 text_pos_3d = text_positions.unsqueeze(0).expand(3, -1)
@@ -2675,6 +2741,14 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 current_pos += remaining_length
 
             prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
+
+            # Verify prefill positions length matches seq_len
+            if prefill_positions.shape[1] != seq_len:
+                logger.error(
+                    f"Position length mismatch! prefill_positions.shape[1]={prefill_positions.shape[1]}, "
+                    f"seq_len={seq_len}. This will cause incorrect attention. "
+                    f"num_complete_images={num_complete_images}, image_grid_thw={image_grid_thw}"
+                )
 
             # Pre-compute decode positions for images that will be generated
             # For i2i: source images are already encoded, generation targets are in remaining grids

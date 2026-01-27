@@ -626,13 +626,95 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             tokenization_kwargs=tokenization_kwargs,
         )
 
+        # In this path we do NOT call HF apply_chat_template, so we must still
+        # provide full grids (source + target) for M-RoPE to compute decode positions.
+        # Keep `image_grid_thw` source-only for MM batching/validation.
+        try:
+            source_grid_thw = mm_processed_data.get("image_grid_thw")
+            if source_grid_thw is not None and isinstance(source_grid_thw, torch.Tensor):
+                # Compute target grid following HF GlmImageProcessor: factor=32.
+                # Prefer explicit target_h/target_w if present, otherwise fall back.
+                target_h = (
+                    hf_processor_mm_kwargs.get("target_h")
+                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
+                    else None
+                )
+                target_w = (
+                    hf_processor_mm_kwargs.get("target_w")
+                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
+                    else None
+                )
+                if target_h is None or target_w is None:
+                    # Some callers pass generation size as height/width.
+                    target_h = (
+                        hf_processor_mm_kwargs.get("height")
+                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
+                        else 1024
+                    )
+                    target_w = (
+                        hf_processor_mm_kwargs.get("width")
+                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
+                        else 1024
+                    )
+
+                factor = 32
+                target_h = (target_h // factor) * factor
+                target_w = (target_w // factor) * factor
+                token_h = target_h // factor
+                token_w = target_w // factor
+                target_grid = torch.tensor([[1, token_h, token_w]], dtype=source_grid_thw.dtype)
+
+                mm_processed_data["mrope_image_grid_thw"] = torch.cat([source_grid_thw, target_grid], dim=0)
+        except Exception:
+            # Best-effort only; M-RoPE has additional fallbacks.
+            pass
+
         # Build prompt_ids with image placeholders
         # _apply_prompt_updates will replace each [image_token_id] with expanded tokens
         tokenizer = self.info.get_tokenizer()
         image_token_id = tokenizer.convert_tokens_to_ids("<|image|>")
 
         if isinstance(prompt, str):
-            text_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            # Match HF GlmImageProcessor behavior: append target grid tokens + BOS.
+            # This helps M-RoPE/grid parsing and keeps i2i vs t2i behavior aligned.
+            try:
+                grid_bos = getattr(tokenizer, "grid_bos_token", "")
+                grid_eos = getattr(tokenizer, "grid_eos_token", "")
+                bos = getattr(tokenizer, "bos_token", "")
+
+                # Use the same target sizes we used for mrope grids when available.
+                target_h = (
+                    hf_processor_mm_kwargs.get("target_h")
+                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
+                    else None
+                )
+                target_w = (
+                    hf_processor_mm_kwargs.get("target_w")
+                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
+                    else None
+                )
+                if target_h is None or target_w is None:
+                    target_h = (
+                        hf_processor_mm_kwargs.get("height")
+                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
+                        else 1024
+                    )
+                    target_w = (
+                        hf_processor_mm_kwargs.get("width")
+                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
+                        else 1024
+                    )
+
+                factor = 32
+                target_h = (target_h // factor) * factor
+                target_w = (target_w // factor) * factor
+                token_h = target_h // factor
+                token_w = target_w // factor
+
+                expanded_prompt = f"{prompt}{grid_bos}{token_h} {token_w}{grid_eos}{bos}"
+                text_ids = tokenizer.encode(expanded_prompt, add_special_tokens=False)
+            except Exception:
+                text_ids = tokenizer.encode(prompt, add_special_tokens=False)
         else:
             text_ids = list(prompt)
 

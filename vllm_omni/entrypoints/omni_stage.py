@@ -934,10 +934,7 @@ def _stage_worker(
                 # Pass batch_request_ids to ensure correct ID mapping
                 diffusion_kwargs["request_ids"] = batch_request_ids
 
-                # Diffusion generate returns results directly, not an iterator
-                diffusion_results = stage_engine.generate(prompts, **diffusion_kwargs)
-
-                # For multistage with extra params (like prior_token_ids), process each request
+                # For multistage with extra params (like prior_token_ids, pil_image), process each request
                 # with its specific kwargs merged with global diffusion_kwargs
                 diffusion_results = []
                 for i, (prompt, req_kwargs) in enumerate(zip(prompts, per_request_kwargs)):

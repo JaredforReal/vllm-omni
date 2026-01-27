@@ -79,14 +79,26 @@ def _parse_generated_tokens(
     )
 
     if is_i2i:
-        # Image-to-image mode: large image tokens are at the beginning
-        # (no small preview tokens in i2i mode)
-        prior_token_ids_d32 = token_tensor[:large_image_tokens]
-        actual_h, actual_w = token_h, token_w
-        logger.info(
-            f"[_parse_generated_tokens] i2i mode (explicit): extracting tokens [0:{large_image_tokens}], "
-            f"grid={actual_h}x{actual_w}"
-        )
+        # Image-to-image mode: check if AR generated small+large tokens (like t2i) or just large tokens
+        # Some AR models output small+large even in i2i mode
+        if actual_tokens >= small_image_tokens + large_image_tokens:
+            # AR generated full t2i-style output, extract large tokens after small
+            large_start = small_image_tokens
+            large_end = large_start + large_image_tokens
+            prior_token_ids_d32 = token_tensor[large_start:large_end]
+            actual_h, actual_w = token_h, token_w
+            logger.info(
+                f"[_parse_generated_tokens] i2i mode (t2i-style output): extracting tokens [{large_start}:{large_end}], "
+                f"grid={actual_h}x{actual_w}"
+            )
+        else:
+            # AR generated only large tokens (pure i2i output)
+            prior_token_ids_d32 = token_tensor[:large_image_tokens]
+            actual_h, actual_w = token_h, token_w
+            logger.info(
+                f"[_parse_generated_tokens] i2i mode (pure): extracting tokens [0:{large_image_tokens}], "
+                f"grid={actual_h}x{actual_w}"
+            )
     elif actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens

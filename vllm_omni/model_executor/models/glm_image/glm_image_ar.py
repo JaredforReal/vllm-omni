@@ -2156,11 +2156,19 @@ class GlmImageModel(nn.Module):
 
         # Process source images if provided (image-to-image generation)
         if pixel_values is not None and image_grid_thw is not None:
+            # Determine target device from available tensors
+            if input_ids is not None:
+                target_device = input_ids.device
+            elif inputs_embeds is not None:
+                target_device = inputs_embeds.device
+            else:
+                target_device = positions.device
+
             # Encode images
             image_features = self.get_image_features(pixel_values, image_grid_thw)
             # Tokenize with VQ-VAE
             image_tokens = self.get_image_tokens(image_features, image_grid_thw)
-            image_tokens = image_tokens.to(input_ids.device)
+            image_tokens = image_tokens.to(target_device)
 
             # Store prior_token_image_ids for diffusion stage (i2i mode)
             # The tokens need to be upsampled from d32 to d16 (2x) for the DiT
@@ -2224,6 +2232,13 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     - Pipeline Parallelism
     - Image-to-Image and Text-to-Image generation
     """
+
+    # Use raw input mode: pass pixel_values to forward instead of embed_multimodal
+    # This is required for GLM-Image i2i mode to generate prior_token_image_ids
+    supports_multimodal_raw_input_only = True
+
+    # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
+    supports_mrope = True
 
     packed_modules_mapping = {
         "qkv_proj": [

@@ -2235,10 +2235,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     - Image-to-Image and Text-to-Image generation
     """
 
-    # Use raw input mode: pass pixel_values to forward instead of embed_multimodal
-    # This is required for GLM-Image i2i mode to generate prior_token_image_ids
-    supports_multimodal_raw_input_only = True
-
     # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
     supports_mrope = True
 

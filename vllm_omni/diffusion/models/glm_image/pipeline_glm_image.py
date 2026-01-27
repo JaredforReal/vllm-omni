@@ -787,6 +787,9 @@ class GlmImagePipeline(nn.Module):
         # Process each condition image through transformer to populate KV cache
         for condition_image, condition_prior_token_id in zip(condition_images, prior_token_image_ids):
             condition_image = condition_image.to(device=self.device, dtype=prompt_embeds.dtype)
+            # Move prior token ids to device (may come from CPU due to serialization)
+            if isinstance(condition_prior_token_id, torch.Tensor):
+                condition_prior_token_id = condition_prior_token_id.to(device=self.device)
 
             # Encode condition image to latent space
             # Use argmax (mode) for deterministic encoding of condition images

@@ -2412,7 +2412,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             tokens_2d = tokens.view(1, 1, grid_h, grid_w)
             # Upsample by 2x (nearest neighbor)
             tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
-            upsampled_token_ids.append(tokens_upsampled.view(-1))
+            # Convert to Python list to avoid vLLM serialization issues with tensors in pooling_output
+            upsampled_token_ids.append(tokens_upsampled.view(-1).tolist())
 
         prior_token_info = {
             "prior_token_image_ids": upsampled_token_ids,
@@ -2420,7 +2421,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         }
 
         # Debug: log prior_token_info
-        shapes = [t.shape for t in upsampled_token_ids]
+        shapes = [len(t) for t in upsampled_token_ids]
         logger.info(
             f"[_process_image_input] Built prior_token_info: "
             f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "

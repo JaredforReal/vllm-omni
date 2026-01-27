@@ -198,16 +198,34 @@ def ar2diffusion(
             if isinstance(mm_output, dict):
                 raw_prior_image_ids = mm_output.get("prior_token_image_ids")
                 if raw_prior_image_ids is not None:
-                    # Wrap in list if it's a single tensor (expected by diffusion pipeline)
+                    # Handle different formats:
+                    # 1. Single tensor -> wrap in list
+                    # 2. List of tensors -> use as-is
+                    # 3. List of Python lists (from serialization) -> convert to tensors
                     if isinstance(raw_prior_image_ids, torch.Tensor):
                         prior_token_image_ids = [raw_prior_image_ids]
                         logger.info(
                             f"[ar2diffusion] Request {i}: got prior_token_image_ids tensor, shape={raw_prior_image_ids.shape}"
                         )
                     elif isinstance(raw_prior_image_ids, list):
-                        prior_token_image_ids = raw_prior_image_ids
-                        shapes = [t.shape if isinstance(t, torch.Tensor) else type(t) for t in raw_prior_image_ids]
-                        logger.info(f"[ar2diffusion] Request {i}: got prior_token_image_ids list, shapes={shapes}")
+                        # Check if elements are tensors or Python lists
+                        if raw_prior_image_ids and isinstance(raw_prior_image_ids[0], torch.Tensor):
+                            prior_token_image_ids = raw_prior_image_ids
+                            shapes = [t.shape for t in raw_prior_image_ids]
+                            logger.info(
+                                f"[ar2diffusion] Request {i}: got prior_token_image_ids list of tensors, shapes={shapes}"
+                            )
+                        elif raw_prior_image_ids and isinstance(raw_prior_image_ids[0], list):
+                            # Convert Python lists back to tensors
+                            prior_token_image_ids = [torch.tensor(ids, dtype=torch.long) for ids in raw_prior_image_ids]
+                            shapes = [t.shape for t in prior_token_image_ids]
+                            logger.info(
+                                f"[ar2diffusion] Request {i}: converted prior_token_image_ids from Python lists, shapes={shapes}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[ar2diffusion] Request {i}: unexpected prior_token_image_ids format: {type(raw_prior_image_ids[0]) if raw_prior_image_ids else 'empty'}"
+                            )
         else:
             # Fallback: also check output (CompletionOutput) in case of different vLLM versions
             if hasattr(output, "multimodal_output") and output.multimodal_output:

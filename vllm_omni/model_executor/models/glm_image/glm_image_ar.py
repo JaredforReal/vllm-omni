@@ -336,6 +336,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Debug: log mm_data contents
         # NOTE: vLLM's ImageProcessorItems.get_processor_data() returns {"images": [...]} (plural)
         # because ProcessorBatchItems adds 's' suffix: {f"{self.modality}s": self.get_all()}
+        print(
+            f"[GLM-Image] _call_hf_processor: mm_data keys={list(mm_data.keys()) if mm_data else None}, "
+            f"has_images={bool(mm_data and mm_data.get('images'))}"
+        )
         logger.info(
             f"_call_hf_processor: mm_data keys={list(mm_data.keys()) if mm_data else None}, "
             f"has_images={bool(mm_data and mm_data.get('images'))}"
@@ -347,6 +351,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         if not mm_data or not mm_data.get("images"):
             # Text-to-image mode
+            print("[GLM-Image] _call_hf_processor: entering t2i mode (no images)")
             logger.info("_call_hf_processor: entering t2i mode (no images)")
             if processor is not None:
                 # Build messages format expected by processor
@@ -496,6 +501,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
+        print(f"[GLM-Image] _apply_hf_processor_mm_only: mm_counts={mm_counts}, num_images={num_images}")
+        logger.info(f"_apply_hf_processor_mm_only: mm_counts={mm_counts}, num_images={num_images}")
+
         if num_images == 0:
             # No images - call parent implementation
             return super()._apply_hf_processor_mm_only(
@@ -580,7 +588,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         Solution: For i2i mode, we build prompt_ids that include image placeholders,
         and return is_update_applied=False so _apply_prompt_updates can expand them.
         """
-        num_images = mm_items.get_all_counts().get("image", 0)
+        mm_counts = mm_items.get_all_counts()
+        num_images = mm_counts.get("image", 0)
+
+        print(
+            f"[GLM-Image] _apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}, enable_hf_prompt_update={enable_hf_prompt_update}"
+        )
+        logger.info(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
 
         if num_images == 0 or enable_hf_prompt_update:
             # t2i mode or normal flow - use parent implementation

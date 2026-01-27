@@ -80,8 +80,19 @@ class OmniInputPreprocessor(InputPreprocessor):
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 
+        multi_modal_data = parsed_content.get("multi_modal_data")
+        print(
+            f"[OmniInputPreprocessor] _process_tokens: multi_modal_data={type(multi_modal_data).__name__ if multi_modal_data else None}, keys={list(multi_modal_data.keys()) if multi_modal_data else None}"
+        )
+        logger.info(
+            f"_process_tokens: multi_modal_data keys={list(multi_modal_data.keys()) if multi_modal_data else None}"
+        )
+
         inputs: OmniTokenInputs | MultiModalInputs
-        if multi_modal_data := parsed_content.get("multi_modal_data"):
+        if multi_modal_data:
+            print(
+                f"[OmniInputPreprocessor] _process_tokens: calling _process_multimodal with {len(prompt_token_ids)} tokens"
+            )
             inputs = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,

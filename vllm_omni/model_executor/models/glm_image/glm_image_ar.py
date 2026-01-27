@@ -413,50 +413,27 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
             logger.debug(f"_call_hf_processor: apply_chat_template returned keys: {list(hf_inputs.keys())}")
 
-            # IMPORTANT (i2i): keep *full* image_grid_thw (source + target) for M-RoPE,
-            # but expose *source-only* grids under the standard key so vLLM multimodal
-            # batching matches pixel_values.
-            #
-            # HuggingFace GlmImageProcessor returns image_grid_thw as:
-            #   [sample0_source_grids..., sample0_target_grid, sample1_source..., sample1_target, ...]
-            #
-            # vLLM's multimodal image encoder only receives source images (pixel_values),
-            # so we must not include target grids in the per-image batched field.
+            # IMPORTANT (i2i): vLLM multimodal encoder must see source-only grids
+            # (matching pixel_values and number of images), but M-RoPE needs full
+            # grids (source + target) to compute correct decode positions.
             image_grid_thw = hf_inputs.get("image_grid_thw")
-            images_per_sample = hf_inputs.get("images_per_sample")
-            if image_grid_thw is not None and images_per_sample is not None:
-                # Preserve full grids for M-RoPE
+            if image_grid_thw is not None:
+                # Preserve full grids for M-RoPE.
                 hf_inputs["mrope_image_grid_thw"] = image_grid_thw
 
-                try:
-                    # Build source-only grids by dropping the last (target) grid per sample.
-                    if isinstance(images_per_sample, torch.Tensor):
-                        per_sample = images_per_sample.view(-1).tolist()
-                    else:
-                        per_sample = list(images_per_sample)
-
-                    grids_split = torch.split(image_grid_thw, per_sample)
-                    source_grids_split = [g[:-1] for g in grids_split if g.numel() > 0]
-                    source_grids = torch.cat(source_grids_split, dim=0) if source_grids_split else image_grid_thw[:0]
+                # Expose source-only grids for MM.
+                # In most i2i requests, we process one prompt at a time here,
+                # so `len(images)` is the number of source images.
+                num_source_images = len(images)
+                if image_grid_thw.shape[0] != num_source_images:
+                    source_grids = image_grid_thw[:num_source_images]
                     hf_inputs["image_grid_thw"] = source_grids
-
                     logger.debug(
-                        "_call_hf_processor: preserved full image_grid_thw for M-RoPE (%s), "
-                        "exposed source-only grids for MM (%s)",
+                        "_call_hf_processor: adjusted image_grid_thw for MM from %s to %s (num_source_images=%d)",
                         tuple(image_grid_thw.shape),
                         tuple(source_grids.shape),
+                        num_source_images,
                     )
-                except Exception as e:
-                    # Fallback: batch_size==1 common path, drop last grid as target.
-                    logger.warning(
-                        "_call_hf_processor: failed to split image_grid_thw via images_per_sample (%s); "
-                        "falling back to drop-last. Error: %s",
-                        images_per_sample,
-                        e,
-                    )
-                    if image_grid_thw is not None and len(image_grid_thw) > 0:
-                        hf_inputs["mrope_image_grid_thw"] = image_grid_thw
-                        hf_inputs["image_grid_thw"] = image_grid_thw[:-1]
 
             # Debug: Analyze input_ids for image tokens
             input_ids = hf_inputs.get("input_ids")
@@ -560,6 +537,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Get grid info for source images only (no target)
         pixel_values = image_inputs.get("pixel_values")
         image_grid_thw = image_inputs.get("image_grid_thw")
+        if image_grid_thw is not None and image_grid_thw.shape[0] != num_images:
+            # Be defensive: some processors may include extra target grids.
+            image_grid_thw = image_grid_thw[:num_images]
+            image_inputs["image_grid_thw"] = image_grid_thw
 
         logger.debug(
             f"_apply_hf_processor_mm_only: pixel_values shape=\

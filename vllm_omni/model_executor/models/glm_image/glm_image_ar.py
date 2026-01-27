@@ -653,12 +653,14 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         result = {}
 
         # Debug: log hf_inputs keys
-        logger.debug(f"_get_mm_fields_config: hf_inputs keys: {list(hf_inputs.keys())}")
+        print(f"[GLM-Image] _get_mm_fields_config: hf_inputs keys: {list(hf_inputs.keys())}")
+        logger.info(f"_get_mm_fields_config: hf_inputs keys: {list(hf_inputs.keys())}")
 
         # Get image_grid_thw if present (already sliced in _call_hf_processor)
         image_grid_thw = hf_inputs.get("image_grid_thw")
 
         if "pixel_values" in hf_inputs and image_grid_thw is not None:
+            print(f"[GLM-Image] _get_mm_fields_config: i2i mode detected, image_grid_thw={image_grid_thw}")
             # i2i mode: pixel_values contains patches for source images
             # image_grid_thw has already been sliced to only include source grids
             num_source_images = len(image_grid_thw)
@@ -2158,6 +2160,16 @@ class GlmImageModel(nn.Module):
         """
         prior_token_image_ids_info = None
 
+        # Debug: log pixel_values presence
+        has_pixel_values = pixel_values is not None
+        has_image_grid_thw = image_grid_thw is not None
+        print(
+            f"[GLM-Image] GlmImageModel.forward: has_pixel_values={has_pixel_values}, has_image_grid_thw={has_image_grid_thw}"
+        )
+        logger.info(
+            f"GlmImageModel.forward: has_pixel_values={has_pixel_values}, has_image_grid_thw={has_image_grid_thw}"
+        )
+
         # Handle intermediate tensors for pipeline parallelism
         if intermediate_tensors is not None:
             hidden_states = self.language_model(
@@ -2401,7 +2413,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             [num_patches, text_hidden_size]
         """
         # Debug: log kwargs keys
-        logger.debug(f"embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
+        print(f"[GLM-Image] embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
+        logger.info(f"embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
 
         # Parse image inputs - check for multiple possible keys
         pixel_values = kwargs.get("pixel_values")

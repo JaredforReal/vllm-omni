@@ -8,7 +8,7 @@ stage_args:
 - stage_id: 0
   runtime:
     devices: "0,1"
-    max_batch_size: 1
+    max_batch_size: 5
   engine_args:
     model_stage: thinker
     model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -39,7 +39,7 @@ stage_args:
 - stage_id: 1
   runtime:
     devices: "1"
-    max_batch_size: 1
+    max_batch_size: 5
   engine_args:
     model_stage: talker
     model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -79,7 +79,7 @@ stage_args:
     engine_output_type: audio  # Final output: audio waveform
     gpu_memory_utilization: 0.1
     distributed_executor_backend: "mp"
-    max_num_batched_tokens: 1000000
+    max_num_batched_tokens: 100000
     hf_config_name: thinker_config
     async_scheduling: false
   engine_input_source: [1]

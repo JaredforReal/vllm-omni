@@ -502,7 +502,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
 
-        self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
+        self._process_additional_information_updates(
+            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
+        )
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
@@ -762,8 +764,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         for attempt in range(max_retries):
             try:
+                put_key = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 success, size, metadata = connector.put(
-                    from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
+                    from_stage=from_stage, to_stage=to_stage, put_key=put_key, data=data
                 )
                 if success:
                     return success, size, metadata

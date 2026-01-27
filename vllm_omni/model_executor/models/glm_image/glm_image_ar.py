@@ -2326,6 +2326,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
+        # Cache for prior_token_image_ids computed in embed_multimodal
+        # This is needed because vLLM's multimodal flow calls embed_multimodal first,
+        # then forward. We need to pass the VQ-VAE tokens from embed_multimodal to forward.
+        self._prior_token_cache: dict | None = None
+
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.get_input_embeddings()
 
@@ -2362,7 +2367,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     def _process_image_input(
         self,
         image_input: dict,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], dict]:
         """
         Process image input through vision encoder and VQ-VAE to get text embeddings.
 
@@ -2370,9 +2375,15 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         1. Extract features using the vision encoder (1536 dim)
         2. Quantize features to discrete tokens using VQ-VAE
         3. Embed tokens using text embedding layer (4096 dim)
+        4. Upsample VQ-VAE tokens for diffusion stage (d32 -> d16)
 
         This follows the same pattern as Chameleon - returning text-space embeddings
         that can be directly scattered into the input_embeds tensor.
+
+        Returns:
+            Tuple of (image_embeddings_list, prior_token_info)
+            - image_embeddings_list: List of embeddings per image
+            - prior_token_info: Dict with upsampled VQ-VAE tokens for diffusion stage
         """
         pixel_values = image_input["pixel_values"]
         image_grid_thw = image_input["image_grid_thw"]
@@ -2390,8 +2401,33 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Split by image grid sizes
         split_sizes = (image_grid_thw.prod(dim=-1)).tolist()
         image_embeddings_list = torch.split(image_embeddings, split_sizes, dim=0)
+        image_tokens_list = torch.split(image_tokens, split_sizes, dim=0)
 
-        return list(image_embeddings_list)
+        # Upsample VQ-VAE tokens for diffusion stage (from d32 to d16)
+        # This is needed for the DiT model which operates at higher resolution
+        upsampled_token_ids = []
+        for i, tokens in enumerate(image_tokens_list):
+            grid_t, grid_h, grid_w = image_grid_thw[i].tolist()
+            # Reshape to 2D grid
+            tokens_2d = tokens.view(1, 1, grid_h, grid_w)
+            # Upsample by 2x (nearest neighbor)
+            tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
+            upsampled_token_ids.append(tokens_upsampled.view(-1))
+
+        prior_token_info = {
+            "prior_token_image_ids": upsampled_token_ids,
+            "image_grid_thw": image_grid_thw.tolist(),
+        }
+
+        # Debug: log prior_token_info
+        shapes = [t.shape for t in upsampled_token_ids]
+        logger.info(
+            f"[_process_image_input] Built prior_token_info: "
+            f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
+            f"image_grid_thw={image_grid_thw.tolist()}"
+        )
+
+        return list(image_embeddings_list), prior_token_info
 
     def embed_multimodal(
         self,
@@ -2449,8 +2485,19 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         if image_input is None:
             return ()
 
-        # Process images through vision encoder
-        image_embeddings = self._process_image_input(image_input)
+        # Process images through vision encoder and get VQ-VAE tokens
+        image_embeddings, prior_token_info = self._process_image_input(image_input)
+
+        # Cache prior_token_info for retrieval in forward()
+        # This is needed because vLLM doesn't pass pixel_values to forward
+        self._prior_token_cache = prior_token_info
+        print(
+            f"[GLM-Image] embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
+        )
+        logger.info(
+            f"embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
+        )
+
         return tuple(image_embeddings)
 
     def _parse_grid_from_tokens(
@@ -2919,9 +2966,18 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             return hidden_states
 
         # Build multimodal outputs for i2i mode
+        # First check if model returned prior_token_image_ids_info (from pixel_values path)
+        # If not, check the cache (from embed_multimodal path)
         multimodal_outputs = None
         if prior_token_image_ids_info is not None:
             multimodal_outputs = prior_token_image_ids_info
+            logger.info("forward: got prior_token_info from model (pixel_values path)")
+        elif self._prior_token_cache is not None:
+            # Retrieve cached prior_token_info from embed_multimodal
+            multimodal_outputs = self._prior_token_cache
+            self._prior_token_cache = None  # Clear after use
+            print("[GLM-Image] forward: got prior_token_info from cache (embed_multimodal path)")
+            logger.info("forward: got prior_token_info from cache (embed_multimodal path)")
 
         return OmniOutput(
             text_hidden_states=hidden_states,

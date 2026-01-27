@@ -413,22 +413,50 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
             logger.debug(f"_call_hf_processor: apply_chat_template returned keys: {list(hf_inputs.keys())}")
 
-            # CRITICAL: Slice image_grid_thw to only include source image grids
-            # GLM-Image's image_grid_thw has [num_source_images + 1, 3] shape:
-            # - First N entries are for source images (these need visual encoding)
-            # - Last entry is for the target image (for generation, no visual encoding)
-            # We need to slice it so batching works correctly with num_images
+            # IMPORTANT (i2i): keep *full* image_grid_thw (source + target) for M-RoPE,
+            # but expose *source-only* grids under the standard key so vLLM multimodal
+            # batching matches pixel_values.
+            #
+            # HuggingFace GlmImageProcessor returns image_grid_thw as:
+            #   [sample0_source_grids..., sample0_target_grid, sample1_source..., sample1_target, ...]
+            #
+            # vLLM's multimodal image encoder only receives source images (pixel_values),
+            # so we must not include target grids in the per-image batched field.
             image_grid_thw = hf_inputs.get("image_grid_thw")
-            if image_grid_thw is not None and len(image_grid_thw) > 1:
-                num_source_images = len(image_grid_thw) - 1
-                # Keep only source image grids for multimodal processing
-                source_grids = image_grid_thw[:num_source_images]
-                hf_inputs["image_grid_thw"] = source_grids
-                logger.debug(
-                    f"_call_hf_processor: sliced image_grid_thw from {len(image_grid_thw)} \
-                        to {len(source_grids)} entries"
-                )
-                logger.debug(f"_call_hf_processor: source_grids={source_grids.tolist()}")
+            images_per_sample = hf_inputs.get("images_per_sample")
+            if image_grid_thw is not None and images_per_sample is not None:
+                # Preserve full grids for M-RoPE
+                hf_inputs["mrope_image_grid_thw"] = image_grid_thw
+
+                try:
+                    # Build source-only grids by dropping the last (target) grid per sample.
+                    if isinstance(images_per_sample, torch.Tensor):
+                        per_sample = images_per_sample.view(-1).tolist()
+                    else:
+                        per_sample = list(images_per_sample)
+
+                    grids_split = torch.split(image_grid_thw, per_sample)
+                    source_grids_split = [g[:-1] for g in grids_split if g.numel() > 0]
+                    source_grids = torch.cat(source_grids_split, dim=0) if source_grids_split else image_grid_thw[:0]
+                    hf_inputs["image_grid_thw"] = source_grids
+
+                    logger.debug(
+                        "_call_hf_processor: preserved full image_grid_thw for M-RoPE (%s), "
+                        "exposed source-only grids for MM (%s)",
+                        tuple(image_grid_thw.shape),
+                        tuple(source_grids.shape),
+                    )
+                except Exception as e:
+                    # Fallback: batch_size==1 common path, drop last grid as target.
+                    logger.warning(
+                        "_call_hf_processor: failed to split image_grid_thw via images_per_sample (%s); "
+                        "falling back to drop-last. Error: %s",
+                        images_per_sample,
+                        e,
+                    )
+                    if image_grid_thw is not None and len(image_grid_thw) > 0:
+                        hf_inputs["mrope_image_grid_thw"] = image_grid_thw
+                        hf_inputs["image_grid_thw"] = image_grid_thw[:-1]
 
             # Debug: Analyze input_ids for image tokens
             input_ids = hf_inputs.get("input_ids")
@@ -2620,13 +2648,19 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         image_start_token_id = hf_config.image_start_token_id  # 16384, marks image start / generation bos
         image_end_token_id = hf_config.image_end_token_id  # 16385, marks image end
 
-        # Get image_grid_thw from either the direct arg or mm_features
+        # Prefer full grids preserved by the processor for M-RoPE.
+        # In i2i, vLLM multimodal batching must use *source-only* grids for pixel_values,
+        # but M-RoPE needs *source + target* grids to precompute decode positions.
+        mrope_grid = kwargs.get("mrope_image_grid_thw")
+        if image_grid_thw is None and mrope_grid is not None:
+            if isinstance(mrope_grid, torch.Tensor):
+                image_grid_thw = [row.tolist() for row in mrope_grid]
+            elif isinstance(mrope_grid, list):
+                image_grid_thw = mrope_grid
+
+        # Fallback: get image_grid_thw from mm_features (usually source-only grids).
         if image_grid_thw is None and mm_features is not None:
-            # Gather image grid info from multimodal features
-            feature_kwargs = MultiModalFeatureSpec.gather_kwargs(
-                mm_features,
-                {"image_grid_thw"},
-            )
+            feature_kwargs = MultiModalFeatureSpec.gather_kwargs(mm_features, {"image_grid_thw"})
             image_grid_thw = [item.tolist() for item in feature_kwargs.get("image_grid_thw", [])]
 
         if image_grid_thw is None:

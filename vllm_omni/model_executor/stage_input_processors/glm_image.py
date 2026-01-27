@@ -39,8 +39,18 @@ def _parse_generated_tokens(
     height: int,
     width: int,
     factor: int = 32,
+    is_i2i: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
-    """Parse AR-generated tokens to extract prior_token_ids."""
+    """Parse AR-generated tokens to extract prior_token_ids.
+
+    Args:
+        token_ids: Generated token IDs from AR model
+        height: Target image height
+        width: Target image width
+        factor: Downsampling factor (default 32)
+        is_i2i: Whether this is image-to-image mode. In i2i mode, the AR model
+                generates only large image tokens (no small preview tokens).
+    """
     # Calculate token dimensions for target image
     token_h = height // factor
     token_w = width // factor
@@ -68,7 +78,16 @@ def _parse_generated_tokens(
         f"actual_tokens={actual_tokens}"
     )
 
-    if actual_tokens >= small_image_tokens + large_image_tokens:
+    if is_i2i:
+        # Image-to-image mode: large image tokens are at the beginning
+        # (no small preview tokens in i2i mode)
+        prior_token_ids_d32 = token_tensor[:large_image_tokens]
+        actual_h, actual_w = token_h, token_w
+        logger.info(
+            f"[_parse_generated_tokens] i2i mode (explicit): extracting tokens [0:{large_image_tokens}], "
+            f"grid={actual_h}x{actual_w}"
+        )
+    elif actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens
         large_end = large_start + large_image_tokens
@@ -172,9 +191,17 @@ def ar2diffusion(
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
 
+        # Detect i2i mode first by checking if multimodal_output contains prior_token_image_ids
+        is_i2i = False
+        if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
+            mm_output = ar_output.multimodal_output
+            if isinstance(mm_output, dict) and mm_output.get("prior_token_image_ids") is not None:
+                is_i2i = True
+        logger.debug(f"[ar2diffusion] Request {i}: detected is_i2i={is_i2i}")
+
         # Parse and upsample prior tokens
         t_parse_start = time.perf_counter()
-        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width)
+        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width, is_i2i=is_i2i)
         t_parse_end = time.perf_counter()
 
         # Get prior_token_image_ids from AR model output (for i2i mode)

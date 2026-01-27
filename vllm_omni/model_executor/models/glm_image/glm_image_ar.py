@@ -2192,10 +2192,12 @@ class GlmImageModel(nn.Module):
             }
 
             # Replace placeholder tokens with actual image tokens
-            special_image_mask = input_ids == self.image_token_id
-            if special_image_mask.sum() > 0:
-                input_ids = input_ids.clone()
-                input_ids[special_image_mask] = image_tokens
+            # Only do this if input_ids is provided (not during profile_run)
+            if input_ids is not None:
+                special_image_mask = input_ids == self.image_token_id
+                if special_image_mask.sum() > 0:
+                    input_ids = input_ids.clone()
+                    input_ids[special_image_mask] = image_tokens
 
         # Get embeddings
         if inputs_embeds is None:

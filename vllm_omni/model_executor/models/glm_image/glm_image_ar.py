@@ -2516,14 +2516,18 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         values across all dimensions, while image tokens use 2D grid positions.
 
         For text-to-image, also pre-computes decode positions for generated tokens.
-        For image-to-image, detects consecutive image_token_id blocks as source images.
+        For image-to-image, uses image_start_token_id and image_end_token_id to
+        find image boundaries (following reference implementation).
+
+        Token structure for i2i:
+        [text...] <image_start=16384> [image_token=167855 × N] <image_end=16385> [text...] <grid> <bos=16384>
 
         Returns:
             Tuple of (position_ids [3, total_len], mrope_position_delta)
         """
         hf_config = self.config
         image_token_id = hf_config.image_token_id  # 167855, repeated for each image patch
-        image_start_token_id = hf_config.image_start_token_id  # 16384, marks generation start
+        image_start_token_id = hf_config.image_start_token_id  # 16384, marks image start / generation bos
         image_end_token_id = hf_config.image_end_token_id  # 16385, marks image end
 
         # Get image_grid_thw from either the direct arg or mm_features
@@ -2564,27 +2568,29 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                         image_grid_thw = [[1, 32, 32], [1, 16, 16]]
 
         seq_len = len(input_tokens)
-        llm_pos_ids_list: list[torch.Tensor] = []
+        input_tokens_tensor = torch.tensor(input_tokens, dtype=torch.long)
 
-        # Detect source images by finding consecutive blocks of image_token_id
-        # For i2i: input is [image_token × 1024] + [text tokens...] + [image_start_token]
-        # For t2i: input is [text tokens...] + [image_start_token]
-        source_image_regions: list[tuple[int, int]] = []  # (start_idx, length)
-        i = 0
-        while i < seq_len:
-            if input_tokens[i] == image_token_id:
-                start = i
-                while i < seq_len and input_tokens[i] == image_token_id:
-                    i += 1
-                source_image_regions.append((start, i - start))
-            else:
-                i += 1
+        # Find image boundaries using image_start_token_id and image_end_token_id
+        # This follows the reference implementation in modeling_glm_image.py get_rope_index()
+        image_end_positions = torch.where(input_tokens_tensor == image_end_token_id)[0]
+        image_start_positions = torch.where(input_tokens_tensor == image_start_token_id)[0]
 
-        num_source_images = len(source_image_regions)
+        # Filter start positions: only those followed by image tokens (not the final <bos>)
+        # A valid image start is followed by image_token_id, not followed by end of sequence
+        valid_start_positions = []
+        for start_pos in image_start_positions:
+            # Check if there's a token after this start and it's an image token
+            if start_pos + 1 < seq_len and input_tokens[start_pos + 1] == image_token_id:
+                valid_start_positions.append(start_pos.item() + 1)  # +1 to skip the start marker
+
+        # Pair starts with ends to find complete image regions
+        num_complete_images = min(len(valid_start_positions), len(image_end_positions))
+
+        # Count source images for grid handling
+        num_source_images = num_complete_images
 
         # For i2i mode: image_grid_thw may only contain source image grids
         # We need to add generation target grids for proper M-RoPE position calculation
-        # Check if prompt ends with image_start_token (indicates generation will happen)
         prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
         if prompt_ends_with_start and len(image_grid_thw) == num_source_images and num_source_images > 0:
             # i2i mode: source grids exist but no target grids
@@ -2592,91 +2598,81 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
             if parsed_grids:
                 # parsed_grids contains all grids mentioned in prompt
-                # For i2i, we need grids that come AFTER the source image grids
-                # The prompt format includes target dimensions after source image tokens
-                # Add only the generation target grids (those not accounted for by source images)
+                # For i2i, add only the generation target grids
                 if len(parsed_grids) > num_source_images:
                     image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
                 else:
-                    # Fallback: add default 1024x1024 generation grids
-                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32], [1, 16, 16]]
+                    # Fallback: add default 1024x1024 generation grids (1 target for i2i)
+                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
             else:
                 # Fallback to default 1024x1024 grids for generation
-                image_grid_thw = list(image_grid_thw) + [[1, 32, 32], [1, 16, 16]]
+                image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
 
-        # Reset for the actual position calculation loop
-        source_image_regions = []
-        i = 0
-        while i < seq_len:
-            if input_tokens[i] == image_token_id:
-                start = i
-                while i < seq_len and input_tokens[i] == image_token_id:
-                    i += 1
-                source_image_regions.append((start, i - start))
-            else:
-                i += 1
-
-        # Number of source images = number of image regions detected
-        num_source_images = len(source_image_regions)
+        llm_pos_ids_list: list[torch.Tensor] = []
 
         if image_grid_thw and num_source_images > 0:
             # Image-to-image mode: we have source images to encode
-            # Build position IDs for M-RoPE (T, H, W)
+            # Build position IDs following reference implementation exactly
             current_pos = 0
-            region_idx = 0
-            i = 0
+            prev_image_end = 0  # Track position in input_ids of last image end
 
-            while i < seq_len:
-                # Check if this position starts a source image region
-                if region_idx < num_source_images and i == source_image_regions[region_idx][0]:
-                    region_start, region_len = source_image_regions[region_idx]
+            # Process each complete image (source images)
+            for img_idx in range(num_complete_images):
+                start = valid_start_positions[img_idx]  # First image token position
+                end = image_end_positions[img_idx].item()  # End marker position
 
-                    # Get grid dimensions for this source image
-                    if region_idx < len(image_grid_thw):
-                        t, h, w = image_grid_thw[region_idx]
-                        expected_tokens = t * h * w
-
-                        # Verify region length matches grid dimensions
-                        if region_len == expected_tokens:
-                            # Build 2D position IDs for source image tokens following GLM-Image pattern:
-                            # - temporal: constant at current_pos (same for all tokens in image)
-                            # - height: [current_pos, current_pos, ..., current_pos+1, current_pos+1, ...]
-                            # - width: [current_pos, current_pos+1, ..., current_pos+w-1, current_pos, ...]
-                            # Reference: modeling_glm_image.py get_rope_index()
-                            total_tokens = h * w
-
-                            # Temporal: all tokens have same position
-                            position_temporal = torch.full((total_tokens,), current_pos, dtype=torch.long)
-
-                            # Height: increments every w tokens
-                            h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
-                            position_height = current_pos + h_indices
-
-                            # Width: cycles 0 to w-1 for each row
-                            w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
-                            position_width = current_pos + w_indices
-
-                            llm_pos_ids_list.append(
-                                torch.stack([position_temporal, position_height, position_width], dim=0)
-                            )
-
-                            # Advance position by max(h, w) to maintain spatial coherence
-                            current_pos += max(h, w)
-                            i += region_len
-                            region_idx += 1
-                            continue
-
-                    # Fallback: treat as regular tokens if grid doesn't match
-                    for _ in range(region_len):
-                        llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
-                        current_pos += 1
-                    i += region_len
-                    region_idx += 1
+                # Get grid dimensions for this source image
+                if img_idx < len(image_grid_thw):
+                    t, h, w = image_grid_thw[img_idx]
                 else:
-                    # Regular text token or special token
-                    llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
-                    current_pos += 1
-                    i += 1
+                    # Fallback: estimate from token count
+                    image_tokens = end - start
+                    h = w = int(image_tokens**0.5)
+                    t = 1
+
+                # Text tokens before this image (from prev_image_end to start)
+                # Note: start points to first image token, so text is [prev_image_end, start)
+                text_length = start - prev_image_end
+                if text_length > 0:
+                    # Text tokens get sequential 1D positions
+                    text_positions = torch.arange(current_pos, current_pos + text_length, dtype=torch.long)
+                    text_pos_3d = text_positions.unsqueeze(0).expand(3, -1)
+                    llm_pos_ids_list.append(text_pos_3d)
+                    current_pos += text_length
+
+                # Image tokens with 2D spatial encoding
+                # For an image with height H and width W:
+                # - temporal: constant at current_pos
+                # - height: cycles [current_pos, ..., current_pos+h-1] repeated w times each
+                # - width: cycles [current_pos, ..., current_pos+w-1] repeated h times
+                total_tokens = h * w
+
+                # Temporal: all tokens have same position
+                position_temporal = torch.full((total_tokens,), current_pos, dtype=torch.long)
+
+                # Height: repeat_interleave pattern
+                position_height = torch.arange(current_pos, current_pos + h, dtype=torch.long).repeat_interleave(w)
+
+                # Width: repeat pattern
+                position_width = torch.arange(current_pos, current_pos + w, dtype=torch.long).repeat(h)
+
+                vision_position_ids = torch.stack([position_temporal, position_height, position_width], dim=0)
+                llm_pos_ids_list.append(vision_position_ids)
+
+                # Advance position by max(h, w) to maintain spatial coherence
+                current_pos += max(h, w)
+
+                # Update prev_image_end to the END marker position (not current_pos!)
+                # This is the position in input_ids, used for text length calculation
+                prev_image_end = end
+
+            # Remaining text tokens after the last image (including grid tokens and final <bos>)
+            remaining_length = seq_len - prev_image_end
+            if remaining_length > 0:
+                text_positions = torch.arange(current_pos, current_pos + remaining_length, dtype=torch.long)
+                text_pos_3d = text_positions.unsqueeze(0).expand(3, -1)
+                llm_pos_ids_list.append(text_pos_3d)
+                current_pos += remaining_length
 
             prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
 
@@ -2695,18 +2691,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                     t, h, w = image_grid_thw[grid_idx]
                     total_tokens = h * w
 
-                    # Build 2D positions following reference implementation:
-                    # temporal: constant at decode_pos
-                    # height: decode_pos + [0,0,...,1,1,...,h-1,h-1,...]
-                    # width: decode_pos + [0,1,...,w-1,0,1,...,w-1,...]
-                    h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
-                    w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+                    # Build 2D positions following reference implementation
+                    position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                    position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
+                    position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
 
-                    decode_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
-                    decode_height = decode_pos + h_indices
-                    decode_width = decode_pos + w_indices
-
-                    decode_pos_lists.append(torch.stack([decode_temporal, decode_height, decode_width], dim=0))
+                    decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
                     decode_pos += max(h, w)
 
                 # Add position for EOS token
@@ -2725,11 +2715,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             current_pos = 0
 
             # All prefill tokens get sequential 1D positions
-            for i in range(seq_len):
-                llm_pos_ids_list.append(torch.tensor([[current_pos], [current_pos], [current_pos]]))
-                current_pos += 1
-
-            prefill_positions = torch.cat(llm_pos_ids_list, dim=1)
+            prefill_positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, -1)
+            current_pos = seq_len
 
             # Pre-compute decode positions for all grids (all for generation)
             decode_pos_lists: list[torch.Tensor] = []
@@ -2745,18 +2732,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 t, h, w = image_grid_thw[grid_idx]
                 total_tokens = h * w
 
-                # Build 2D positions following reference implementation:
-                # temporal: constant at decode_pos
-                # height: decode_pos + [0,0,...,1,1,...,h-1,h-1,...]
-                # width: decode_pos + [0,1,...,w-1,0,1,...,w-1,...]
-                h_indices = torch.arange(h).unsqueeze(1).expand(h, w).flatten()
-                w_indices = torch.arange(w).unsqueeze(0).expand(h, w).flatten()
+                # Build 2D positions following reference implementation
+                position_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
+                position_height = torch.arange(decode_pos, decode_pos + h, dtype=torch.long).repeat_interleave(w)
+                position_width = torch.arange(decode_pos, decode_pos + w, dtype=torch.long).repeat(h)
 
-                decode_temporal = torch.full((total_tokens,), decode_pos, dtype=torch.long)
-                decode_height = decode_pos + h_indices
-                decode_width = decode_pos + w_indices
-
-                decode_pos_lists.append(torch.stack([decode_temporal, decode_height, decode_width], dim=0))
+                decode_pos_lists.append(torch.stack([position_temporal, position_height, position_width], dim=0))
                 decode_pos += max(h, w)
 
             # Add position for EOS token

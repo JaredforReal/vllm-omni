@@ -878,9 +878,12 @@ def _stage_worker(
             if isinstance(ein, dict):
                 has_mm = "multi_modal_data" in ein
                 mm_keys = list(ein.get("multi_modal_data", {}).keys()) if has_mm else []
+                has_pil = "pil_image" in ein and ein.get("pil_image") is not None
+                pil_type = type(ein.get("pil_image")).__name__ if has_pil else "N/A"
                 logger.info(
                     f"[Stage-{stage_id}] Request {rid}: engine_inputs is dict, "
-                    f"has multi_modal_data={has_mm}, mm_keys={mm_keys}"
+                    f"has multi_modal_data={has_mm}, mm_keys={mm_keys}, "
+                    f"has_pil_image={has_pil}, pil_type={pil_type}"
                 )
 
             if isinstance(ein, list):
@@ -946,9 +949,11 @@ def _stage_worker(
                     has_prior_tokens = (
                         merged_kwargs.get("extra", {}).get("prior_token_ids") is not None if has_extra else False
                     )
+                    has_pil_image = "pil_image" in merged_kwargs and merged_kwargs["pil_image"] is not None
                     logger.info(
                         f"[Diffusion] Request {i}: prompt='{prompt[:30] if prompt else ''}...', "
-                        f"has_extra={has_extra}, has_prior_token_ids={has_prior_tokens}"
+                        f"has_extra={has_extra}, has_prior_token_ids={has_prior_tokens}, "
+                        f"has_pil_image={has_pil_image}"
                     )
                     result = stage_engine.generate(prompt, **merged_kwargs)
                     if isinstance(result, list):

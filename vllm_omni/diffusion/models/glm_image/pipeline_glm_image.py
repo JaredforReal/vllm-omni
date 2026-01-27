@@ -80,8 +80,12 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(requests: list[OmniDiffusionRequest]):
         """Pre-process condition images for Image Edit mode."""
-        for req in requests:
+        for i, req in enumerate(requests):
             images = req.pil_image
+            logger.info(
+                f"[pre_process_func] Request {i}: pil_image={'present' if images else 'None'}, "
+                f"type={type(images).__name__ if images else 'N/A'}"
+            )
             if images is None:
                 # Text-to-image mode, no preprocessing needed
                 continue
@@ -830,6 +834,14 @@ class GlmImagePipeline(nn.Module):
         img_width = req.width
         is_image_edit = preprocessed_images is not None
 
+        # Debug logging for i2i detection
+        logger.info(
+            f"[forward] is_image_edit={is_image_edit}, "
+            f"preprocessed_image={'present' if preprocessed_images else 'None'}, "
+            f"pil_image={'present' if req.pil_image else 'None'}, "
+            f"prompt_image={'present' if condition_images else 'None'}"
+        )
+
         height = req.height or img_height or self.default_sample_size * self.vae_scale_factor
         width = req.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.num_inference_steps or 50
@@ -882,7 +894,12 @@ class GlmImagePipeline(nn.Module):
         # 3. Prepare KV cache for Image Edit mode
         t_kvcache_start = time.perf_counter()
         kv_caches = None
+        logger.info(
+            f"[forward] KV cache check: is_image_edit={is_image_edit}, "
+            f"prior_token_image_ids={'present' if prior_token_image_ids else 'None'}"
+        )
         if is_image_edit and prior_token_image_ids is not None:
+            logger.info(f"[forward] Building KV cache with {len(preprocessed_images)} condition images")
             kv_caches = self._prepare_condition_image_kv_cache(
                 condition_images=preprocessed_images,
                 prior_token_image_ids=prior_token_image_ids,

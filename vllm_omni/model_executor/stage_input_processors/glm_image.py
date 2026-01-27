@@ -203,6 +203,12 @@ def ar2diffusion(
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
 
+        # Debug: log original_prompt structure
+        logger.debug(
+            f"[ar2diffusion] Request {i}: original_prompt type={type(original_prompt).__name__}, "
+            f"keys={list(original_prompt.keys()) if isinstance(original_prompt, dict) else 'N/A'}"
+        )
+
         # Detect i2i mode first by checking if multimodal_output contains prior_token_image_ids
         is_i2i = False
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
@@ -297,8 +303,24 @@ def ar2diffusion(
 
         if requires_multimodal_data:
             mm_data = original_prompt.get("multi_modal_data")
+            logger.info(
+                f"[ar2diffusion] Request {i}: requires_multimodal_data=True, "
+                f"mm_data_keys={list(mm_data.keys()) if mm_data else None}, "
+                f"original_prompt_keys={list(original_prompt.keys()) if isinstance(original_prompt, dict) else type(original_prompt)}"
+            )
             if mm_data:
-                diffusion_input["pil_image"] = mm_data.get("image")
+                pil_image = mm_data.get("image")
+                if pil_image is None:
+                    # Try "images" (plural) as fallback
+                    images = mm_data.get("images")
+                    if images:
+                        pil_image = images[0] if isinstance(images, list) else images
+                        logger.info(f"[ar2diffusion] Request {i}: found image in 'images' (plural)")
+                diffusion_input["pil_image"] = pil_image
+                logger.info(
+                    f"[ar2diffusion] Request {i}: pil_image={'present' if pil_image else 'None'}, "
+                    f"type={type(pil_image).__name__ if pil_image else 'N/A'}"
+                )
 
         for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:
             if key in original_prompt:

@@ -336,7 +336,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Debug: log mm_data contents
         # NOTE: vLLM's ImageProcessorItems.get_processor_data() returns {"images": [...]} (plural)
         # because ProcessorBatchItems adds 's' suffix: {f"{self.modality}s": self.get_all()}
-        logger.debug(
+        logger.info(
             f"_call_hf_processor: mm_data keys={list(mm_data.keys()) if mm_data else None}, "
             f"has_images={bool(mm_data and mm_data.get('images'))}"
         )
@@ -347,7 +347,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         if not mm_data or not mm_data.get("images"):
             # Text-to-image mode
-            logger.debug("_call_hf_processor: entering t2i mode (no images)")
+            logger.info("_call_hf_processor: entering t2i mode (no images)")
             if processor is not None:
                 # Build messages format expected by processor
                 messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]

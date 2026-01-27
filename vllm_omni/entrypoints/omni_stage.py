@@ -873,6 +873,16 @@ def _stage_worker(
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
+
+            # Debug: log engine_inputs content for multimodal data
+            if isinstance(ein, dict):
+                has_mm = "multi_modal_data" in ein
+                mm_keys = list(ein.get("multi_modal_data", {}).keys()) if has_mm else []
+                logger.info(
+                    f"[Stage-{stage_id}] Request {rid}: engine_inputs is dict, "
+                    f"has multi_modal_data={has_mm}, mm_keys={mm_keys}"
+                )
+
             if isinstance(ein, list):
                 batch_engine_inputs.extend(ein)
             elif isinstance(ein, dict):

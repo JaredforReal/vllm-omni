@@ -12,6 +12,7 @@ stage_args:
       process: true
       devices: "0"
       max_batch_size: 1
+      requires_multimodal_data: true # Required for i2i mode to receive source images
     engine_args:
       model_stage: ar
       model_arch: GlmImageForConditionalGeneration

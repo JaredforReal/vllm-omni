@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
-import time
 from typing import Any
 
 import torch
@@ -67,7 +66,6 @@ def _parse_generated_tokens(
     eos_token_id = 16385
     if len(token_ids) > 0 and token_ids[-1] == eos_token_id:
         token_tensor = token_tensor[:-1]
-        logger.debug(f"[_parse_generated_tokens] Removed EOS token, new length={len(token_tensor)}")
 
     actual_tokens = len(token_tensor)
 
@@ -87,36 +85,20 @@ def _parse_generated_tokens(
             large_end = large_start + large_image_tokens
             prior_token_ids_d32 = token_tensor[large_start:large_end]
             actual_h, actual_w = token_h, token_w
-            logger.info(
-                f"[_parse_generated_tokens] i2i mode (t2i-style output): extracting tokens [{large_start}:{large_end}], "
-                f"grid={actual_h}x{actual_w}"
-            )
         else:
             # AR generated only large tokens (pure i2i output)
             prior_token_ids_d32 = token_tensor[:large_image_tokens]
             actual_h, actual_w = token_h, token_w
-            logger.info(
-                f"[_parse_generated_tokens] i2i mode (pure): extracting tokens [0:{large_image_tokens}], "
-                f"grid={actual_h}x{actual_w}"
-            )
     elif actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens
         large_end = large_start + large_image_tokens
         prior_token_ids_d32 = token_tensor[large_start:large_end]
         actual_h, actual_w = token_h, token_w
-        logger.info(
-            f"[_parse_generated_tokens] t2i mode: extracting tokens [{large_start}:{large_end}], "
-            f"grid={actual_h}x{actual_w}"
-        )
     elif actual_tokens >= large_image_tokens:
         # Image-to-image: large image tokens are at the beginning
         prior_token_ids_d32 = token_tensor[:large_image_tokens]
         actual_h, actual_w = token_h, token_w
-        logger.info(
-            f"[_parse_generated_tokens] i2i mode: extracting tokens [0:{large_image_tokens}], "
-            f"grid={actual_h}x{actual_w}"
-        )
     else:
         # Insufficient tokens - try to infer the actual grid size
         import math
@@ -165,8 +147,6 @@ def ar2diffusion(
     requires_multimodal_data: bool = False,
 ) -> list[dict[str, Any]]:
     """Process AR stage outputs to create Diffusion stage inputs."""
-    t_start = time.perf_counter()
-
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
 
@@ -203,43 +183,24 @@ def ar2diffusion(
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
 
-        # Debug: log original_prompt structure
-        logger.debug(
-            f"[ar2diffusion] Request {i}: original_prompt type={type(original_prompt).__name__}, "
-            f"keys={list(original_prompt.keys()) if isinstance(original_prompt, dict) else 'N/A'}"
-        )
-
         # Detect i2i mode first by checking if multimodal_output contains prior_token_image_ids
         is_i2i = False
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
             if isinstance(mm_output, dict) and mm_output.get("prior_token_image_ids") is not None:
                 is_i2i = True
-        logger.debug(f"[ar2diffusion] Request {i}: detected is_i2i={is_i2i}")
 
         # Parse and upsample prior tokens
-        t_parse_start = time.perf_counter()
         prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width, is_i2i=is_i2i)
-        t_parse_end = time.perf_counter()
 
         # Get prior_token_image_ids from AR model output (for i2i mode)
         # This contains VQ-VAE tokens from input image, used for KV cache conditioning
         # NOTE: multimodal_output is attached to ar_output (RequestOutput), NOT output (CompletionOutput)
         prior_token_image_ids = None
 
-        # Debug: log available attributes
-        logger.debug(
-            f"[ar2diffusion] Request {i}: "
-            f"ar_output type={type(ar_output).__name__}, "
-            f"has multimodal_output={hasattr(ar_output, 'multimodal_output')}"
-        )
-
         # Check ar_output (RequestOutput) for multimodal_output - this is the correct location
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            logger.debug(
-                f"[ar2diffusion] Request {i}: multimodal_output keys={list(mm_output.keys()) if isinstance(mm_output, dict) else type(mm_output)}"
-            )
             if isinstance(mm_output, dict):
                 raw_prior_image_ids = mm_output.get("prior_token_image_ids")
                 if raw_prior_image_ids is not None:
@@ -249,27 +210,17 @@ def ar2diffusion(
                     # 3. List of Python lists (from serialization) -> convert to tensors
                     if isinstance(raw_prior_image_ids, torch.Tensor):
                         prior_token_image_ids = [raw_prior_image_ids]
-                        logger.info(
-                            f"[ar2diffusion] Request {i}: got prior_token_image_ids tensor, shape={raw_prior_image_ids.shape}"
-                        )
                     elif isinstance(raw_prior_image_ids, list):
                         # Check if elements are tensors or Python lists
                         if raw_prior_image_ids and isinstance(raw_prior_image_ids[0], torch.Tensor):
                             prior_token_image_ids = raw_prior_image_ids
-                            shapes = [t.shape for t in raw_prior_image_ids]
-                            logger.info(
-                                f"[ar2diffusion] Request {i}: got prior_token_image_ids list of tensors, shapes={shapes}"
-                            )
                         elif raw_prior_image_ids and isinstance(raw_prior_image_ids[0], list):
                             # Convert Python lists back to tensors
                             prior_token_image_ids = [torch.tensor(ids, dtype=torch.long) for ids in raw_prior_image_ids]
-                            shapes = [t.shape for t in prior_token_image_ids]
-                            logger.info(
-                                f"[ar2diffusion] Request {i}: converted prior_token_image_ids from Python lists, shapes={shapes}"
-                            )
                         else:
                             logger.warning(
-                                f"[ar2diffusion] Request {i}: unexpected prior_token_image_ids format: {type(raw_prior_image_ids[0]) if raw_prior_image_ids else 'empty'}"
+                                f"[ar2diffusion] Request {i}: unexpected prior_token_image_ids format: "
+                                f"{type(raw_prior_image_ids[0]) if raw_prior_image_ids else 'empty'}"
                             )
         else:
             # Fallback: also check output (CompletionOutput) in case of different vLLM versions
@@ -294,20 +245,8 @@ def ar2diffusion(
             },
         }
 
-        # Log whether this is t2i or i2i mode
-        mode = "i2i" if prior_token_image_ids is not None else "t2i"
-        logger.info(
-            f"[ar2diffusion] Request {i}: mode={mode}, "
-            f"prior_token_image_ids={'present' if prior_token_image_ids else 'None'}"
-        )
-
         if requires_multimodal_data:
             mm_data = original_prompt.get("multi_modal_data")
-            logger.info(
-                f"[ar2diffusion] Request {i}: requires_multimodal_data=True, "
-                f"mm_data_keys={list(mm_data.keys()) if mm_data else None}, "
-                f"original_prompt_keys={list(original_prompt.keys()) if isinstance(original_prompt, dict) else type(original_prompt)}"
-            )
             if mm_data:
                 pil_image = mm_data.get("image")
                 if pil_image is None:
@@ -315,27 +254,12 @@ def ar2diffusion(
                     images = mm_data.get("images")
                     if images:
                         pil_image = images[0] if isinstance(images, list) else images
-                        logger.info(f"[ar2diffusion] Request {i}: found image in 'images' (plural)")
                 diffusion_input["pil_image"] = pil_image
-                logger.info(
-                    f"[ar2diffusion] Request {i}: pil_image={'present' if pil_image else 'None'}, "
-                    f"type={type(pil_image).__name__ if pil_image else 'N/A'}"
-                )
 
         for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:
             if key in original_prompt:
                 diffusion_input[key] = original_prompt[key]
 
         diffusion_inputs.append(diffusion_input)
-        logger.info(
-            f"[Profile] ar2diffusion request {i}: parse_tokens={t_parse_end - t_parse_start:.4f}s, "
-            f"num_ar_tokens={len(generated_token_ids)}, prior_shape={prior_token_ids.shape}"
-        )
-
-    t_end = time.perf_counter()
-    logger.info(
-        f"[Profile] ar2diffusion total: {t_end - t_start:.4f}s, "
-        f"processed {len(ar_outputs)} AR outputs → {len(diffusion_inputs)} diffusion inputs"
-    )
 
     return diffusion_inputs

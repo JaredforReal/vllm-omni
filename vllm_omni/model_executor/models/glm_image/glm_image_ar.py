@@ -333,26 +333,12 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         processor = self.info.get_hf_processor()
 
-        # Debug: log mm_data contents
-        # NOTE: vLLM's ImageProcessorItems.get_processor_data() returns {"images": [...]} (plural)
-        # because ProcessorBatchItems adds 's' suffix: {f"{self.modality}s": self.get_all()}
-        print(
-            f"[GLM-Image] _call_hf_processor: mm_data keys={list(mm_data.keys()) if mm_data else None}, "
-            f"has_images={bool(mm_data and mm_data.get('images'))}"
-        )
-        logger.info(
-            f"_call_hf_processor: mm_data keys={list(mm_data.keys()) if mm_data else None}, "
-            f"has_images={bool(mm_data and mm_data.get('images'))}"
-        )
-
         # Get target dimensions from mm_kwargs or use defaults
         target_h = mm_kwargs.get("target_h", 1024) if mm_kwargs else 1024
         target_w = mm_kwargs.get("target_w", 1024) if mm_kwargs else 1024
 
         if not mm_data or not mm_data.get("images"):
             # Text-to-image mode
-            print("[GLM-Image] _call_hf_processor: entering t2i mode (no images)")
-            logger.info("_call_hf_processor: entering t2i mode (no images)")
             if processor is not None:
                 # Build messages format expected by processor
                 messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -506,9 +492,6 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        print(f"[GLM-Image] _apply_hf_processor_mm_only: mm_counts={mm_counts}, num_images={num_images}")
-        logger.info(f"_apply_hf_processor_mm_only: mm_counts={mm_counts}, num_images={num_images}")
-
         if num_images == 0:
             # No images - call parent implementation
             return super()._apply_hf_processor_mm_only(
@@ -600,10 +583,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        print(
-            f"[GLM-Image] _apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}, enable_hf_prompt_update={enable_hf_prompt_update}"
-        )
-        logger.info(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
+        logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
 
         if num_images == 0 or enable_hf_prompt_update:
             # t2i mode or normal flow - use parent implementation
@@ -743,15 +723,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         """
         result = {}
 
-        # Debug: log hf_inputs keys
-        print(f"[GLM-Image] _get_mm_fields_config: hf_inputs keys: {list(hf_inputs.keys())}")
-        logger.info(f"_get_mm_fields_config: hf_inputs keys: {list(hf_inputs.keys())}")
-
         # Get image_grid_thw if present (already sliced in _call_hf_processor)
         image_grid_thw = hf_inputs.get("image_grid_thw")
 
         if "pixel_values" in hf_inputs and image_grid_thw is not None:
-            print(f"[GLM-Image] _get_mm_fields_config: i2i mode detected, image_grid_thw={image_grid_thw}")
             # i2i mode: pixel_values contains patches for source images
             # image_grid_thw has already been sliced to only include source grids
             num_source_images = len(image_grid_thw)
@@ -2254,10 +2229,7 @@ class GlmImageModel(nn.Module):
         # Debug: log pixel_values presence
         has_pixel_values = pixel_values is not None
         has_image_grid_thw = image_grid_thw is not None
-        print(
-            f"[GLM-Image] GlmImageModel.forward: has_pixel_values={has_pixel_values}, has_image_grid_thw={has_image_grid_thw}"
-        )
-        logger.info(
+        logger.debug(
             f"GlmImageModel.forward: has_pixel_values={has_pixel_values}, has_image_grid_thw={has_image_grid_thw}"
         )
 
@@ -2543,9 +2515,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             Tuple of image embedding tensors, one per image, each with shape
             [num_patches, text_hidden_size]
         """
-        # Debug: log kwargs keys
-        print(f"[GLM-Image] embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
-        logger.info(f"embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
+        logger.debug(f"embed_multimodal called with kwargs keys: {list(kwargs.keys())}")
 
         # Parse image inputs - check for multiple possible keys
         pixel_values = kwargs.get("pixel_values")
@@ -2586,10 +2556,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Cache prior_token_info for retrieval in forward()
         # This is needed because vLLM doesn't pass pixel_values to forward
         self._prior_token_cache = prior_token_info
-        print(
-            f"[GLM-Image] embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
-        )
-        logger.info(
+        logger.debug(
             f"embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
         )
 
@@ -3072,13 +3039,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         multimodal_outputs = None
         if prior_token_image_ids_info is not None:
             multimodal_outputs = prior_token_image_ids_info
-            logger.info("forward: got prior_token_info from model (pixel_values path)")
+            logger.debug("forward: got prior_token_info from model (pixel_values path)")
         elif self._prior_token_cache is not None:
             # Retrieve cached prior_token_info from embed_multimodal
             multimodal_outputs = self._prior_token_cache
             self._prior_token_cache = None  # Clear after use
-            print("[GLM-Image] forward: got prior_token_info from cache (embed_multimodal path)")
-            logger.info("forward: got prior_token_info from cache (embed_multimodal path)")
+            logger.debug("forward: got prior_token_info from cache (embed_multimodal path)")
 
         return OmniOutput(
             text_hidden_states=hidden_states,

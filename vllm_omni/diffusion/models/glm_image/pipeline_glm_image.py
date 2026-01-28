@@ -652,11 +652,23 @@ class GlmImagePipeline(nn.Module):
         if isinstance(prompt, list):
             prompt = prompt[0] if prompt else ""
 
+        # NOTE: DiffusionEngine does an internal warmup "dummy run" during
+        # initialization. That request has no request_id and does not carry
+        # Stage-0 (AR) outputs via req.extra. For GLM-Image, we allow that
+        # specific warmup request to proceed by synthesizing minimal prior
+        # tokens, while still raising a clear error for real requests.
+        is_dummy_warmup = (
+            not getattr(req, "request_id", None) and prompt == "dummy run" and (req.num_inference_steps == 1)
+        )
+
         prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
         preprocessed_images = req.preprocessed_image
         img_height = req.height
         img_width = req.width
-        is_image_edit = preprocessed_images is not None
+
+        # Warmup may include a dummy image for image-input-capable models.
+        # Treat that as t2i warmup to avoid requiring i2i-only KV-cache inputs.
+        is_image_edit = (preprocessed_images is not None) and (not is_dummy_warmup)
 
         height = req.height or img_height or self.default_sample_size * self.vae_scale_factor
         width = req.width or img_width or self.default_sample_size * self.vae_scale_factor
@@ -701,6 +713,15 @@ class GlmImagePipeline(nn.Module):
                         tensor_item = tensor_item.unsqueeze(0)
                     normalized.append(tensor_item)
                 prior_token_image_ids = normalized
+        elif is_dummy_warmup:
+            # Synthesize a minimal, shape-correct prior token sequence.
+            # The diffusion transformer expects prior_token_id shape:
+            #   [B, (H_lat/p)*(W_lat/p)] where H_lat=H/vae_scale_factor.
+            h_lat = height // self.vae_scale_factor
+            w_lat = width // self.vae_scale_factor
+            seq_len = (h_lat * w_lat) // (self._patch_size**2)
+            prior_token_id = torch.zeros((1, seq_len), dtype=torch.long, device=self.device)
+            prior_token_image_ids = None
         else:
             raise ValueError(
                 "GLM-Image diffusion pipeline expects prior tokens from the vLLM AR stage. "

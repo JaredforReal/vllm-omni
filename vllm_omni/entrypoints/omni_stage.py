@@ -486,6 +486,44 @@ class OmniStage:
             )
 
 
+def _resolve_model_tokenizer_paths(
+    model: str,
+    engine_args: dict,
+) -> str:
+    """Resolve model and tokenizer paths for non-standard directory structures.
+
+    Some models (e.g., GLM-Image) have tokenizer in root and model in subdirectory.
+    This function handles model_subdir and tokenizer_subdir engine_args.
+
+    Args:
+        model: Base model path
+        engine_args: Engine arguments (modified in-place to remove subdir args
+            and set tokenizer if needed)
+
+    Returns:
+        Resolved model path (may be subdirectory of original)
+    """
+    import os
+
+    model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    base_model_path = model
+
+    if model_subdir:
+        model = os.path.join(model, model_subdir)
+        logger.info(f"Using model subdirectory: {model}")
+
+    if tokenizer_subdir is not None:
+        tokenizer_path = os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info(f"Using tokenizer from: {tokenizer_path}")
+    elif model_subdir and "tokenizer" not in engine_args:
+        engine_args["tokenizer"] = base_model_path
+        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+
+    return model
+
+
 def _stage_worker(
     model: str,
     stage_payload: dict[str, Any],
@@ -521,27 +559,8 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
-    # Handle model_subdir for models with config in subdirectory (e.g., GLM-Image AR model)
-    # Also handle tokenizer_subdir for when tokenizer is in a different location than model
-    model_subdir = engine_args.pop("model_subdir", None)
-    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
-    base_model_path = model  # Keep original model path for tokenizer
-
-    if model_subdir:
-        model = _os.path.join(model, model_subdir)
-        logger.info(f"Using model subdirectory: {model}")
-
-    # Set tokenizer path if different from model path
-    if tokenizer_subdir is not None:
-        # tokenizer_subdir can be empty string "" to use base_model_path directly
-        tokenizer_path = _os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
-        engine_args["tokenizer"] = tokenizer_path
-        logger.info(f"Using tokenizer from: {tokenizer_path}")
-    elif model_subdir and "tokenizer" not in engine_args:
-        # If model is in subdirectory but tokenizer not specified, use base path
-        # This is common for models like GLM-Image where tokenizer is in root
-        engine_args["tokenizer"] = base_model_path
-        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -898,11 +917,8 @@ def _stage_worker(
             gen_outputs: list[Any] = []
             _gen_t0 = _time.time()
             if stage_type == "diffusion":
-                # For diffusion, batch_engine_inputs can be:
-                # 1. Strings (direct prompts)
-                # 2. Dicts with "prompt" and other fields like "extra", "height", "width"
-                #    (from custom_process_input_func like ar2diffusion)
-                # We need to preserve all fields for proper multistage integration
+                # Extract prompts and per-request kwargs from engine inputs
+                # Inputs can be strings, dicts with "prompt" + extra fields, or objects
                 prompts = []
                 per_request_kwargs = []
                 for ein in batch_engine_inputs:
@@ -911,26 +927,21 @@ def _stage_worker(
                         per_request_kwargs.append({})
                     elif isinstance(ein, dict):
                         prompts.append(ein.get("prompt", ""))
-                        # Extract all non-prompt fields as kwargs for this request
-                        req_kwargs = {k: v for k, v in ein.items() if k != "prompt"}
-                        per_request_kwargs.append(req_kwargs)
+                        per_request_kwargs.append({k: v for k, v in ein.items() if k != "prompt"})
                     elif hasattr(ein, "prompt"):
                         prompts.append(ein.prompt)
+                        per_request_kwargs.append({})
                     else:
                         prompts.append(str(ein))
                         per_request_kwargs.append({})
-                # Prepare diffusion kwargs from sampling parameters
-                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
 
-                # Pass batch_request_ids to ensure correct ID mapping
+                # Prepare base diffusion kwargs
+                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
                 diffusion_kwargs["request_ids"] = batch_request_ids
 
-                # For multistage with extra params (like prior_token_ids, pil_image), process each request
-                # with its specific kwargs merged with global diffusion_kwargs
+                # Generate for each request with merged kwargs
                 diffusion_results = []
-                for i, (prompt, req_kwargs) in enumerate(zip(prompts, per_request_kwargs)):
-                    # Merge global diffusion_kwargs with per-request kwargs
-                    # Per-request kwargs take precedence (they may contain extra, height, width)
+                for prompt, req_kwargs in zip(prompts, per_request_kwargs):
                     merged_kwargs = {**diffusion_kwargs, **req_kwargs}
                     result = stage_engine.generate(prompt, **merged_kwargs)
                     if isinstance(result, list):
@@ -1101,27 +1112,8 @@ async def _stage_worker_async(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
-    # Handle model_subdir for models with config in subdirectory (e.g., GLM-Image AR model)
-    # Also handle tokenizer_subdir for when tokenizer is in a different location than model
-    model_subdir = engine_args.pop("model_subdir", None)
-    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
-    base_model_path = model  # Keep original model path for tokenizer
-
-    if model_subdir:
-        model = _os.path.join(model, model_subdir)
-        logger.info(f"Using model subdirectory: {model}")
-
-    # Set tokenizer path if different from model path
-    if tokenizer_subdir is not None:
-        # tokenizer_subdir can be empty string "" to use base_model_path directly
-        tokenizer_path = _os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
-        engine_args["tokenizer"] = tokenizer_path
-        logger.info(f"Using tokenizer from: {tokenizer_path}")
-    elif model_subdir and "tokenizer" not in engine_args:
-        # If model is in subdirectory but tokenizer not specified, use base path
-        # This is common for models like GLM-Image where tokenizer is in root
-        engine_args["tokenizer"] = base_model_path
-        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
 
     in_q = omni_stage._in_q
     out_q = omni_stage._out_q
@@ -1438,32 +1430,23 @@ async def _stage_worker_async(
                 ein = ein[0]
 
             if stage_type == "diffusion":
-                # For diffusion, ein can be:
-                # 1. A string (direct prompt)
-                # 2. A dict with "prompt" and other fields like "extra", "height", "width"
-                #    (from custom_process_input_func like ar2diffusion)
-                # We need to preserve all fields for proper multistage integration
+                # Extract prompt and per-request kwargs from engine input
                 prompt = ""
                 per_request_kwargs = {}
                 if isinstance(ein, str):
                     prompt = ein
                 elif isinstance(ein, dict):
                     prompt = ein.get("prompt", "")
-                    # Extract all non-prompt fields as kwargs for this request
                     per_request_kwargs = {k: v for k, v in ein.items() if k != "prompt"}
                 elif hasattr(ein, "prompt"):
                     prompt = ein.prompt
                 else:
                     prompt = str(ein)
 
-                # Prepare diffusion kwargs from sampling parameters
+                # Merge global diffusion kwargs with per-request kwargs
                 diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
-
-                # Merge global diffusion_kwargs with per-request kwargs
-                # Per-request kwargs take precedence (they may contain extra, height, width)
                 merged_kwargs = {**diffusion_kwargs, **per_request_kwargs}
 
-                # AsyncOmniDiffusion.generate returns a single result, not an async generator
                 gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **merged_kwargs)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0

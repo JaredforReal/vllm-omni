@@ -17,25 +17,6 @@ logging.basicConfig(level=logging.INFO)
 
 logger = init_logger(__name__)
 
-# Model type to pipeline class mapping
-MODEL_TYPE_TO_PIPELINE = {
-    "bagel": "BagelPipeline",
-    "glm-image": "GlmImagePipeline",
-}
-ARCH_TO_PIPELINE = {
-    "BagelForConditionalGeneration": "BagelPipeline",
-    "GlmImageForConditionalGeneration": "GlmImagePipeline",
-}
-
-
-def _load_transformer_config(model_path: str) -> TransformerConfig:
-    """Try to load transformer config, return empty config on failure."""
-    try:
-        tf_config_dict = get_hf_file_to_dict("transformer/config.json", model_path)
-        return TransformerConfig.from_dict(tf_config_dict)
-    except (AttributeError, OSError, ValueError):
-        return TransformerConfig()
-
 
 def prepare_requests(prompt: str | list[str], **kwargs):
     field_names = {f.name for f in fields(OmniDiffusionRequest)}
@@ -67,8 +48,6 @@ class OmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
-        # Extract model_arch before passing to OmniDiffusionConfig (not a valid config field)
-        model_arch = kwargs.pop("model_arch", None)
 
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
@@ -88,55 +67,40 @@ class OmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
+        # Detect model class and load config
         # Diffusers-style models expose `model_index.json` with `_class_name`.
-        # Bagel models (and other non-diffusers) typically expose `config.json`.
-        config_dict = get_hf_file_to_dict(
-            "model_index.json",
-            od_config.model,
-        )
-        od_config.model_class_name = config_dict.get("_class_name", None)
-        od_config.update_multimodal_support()
-        # Detect model_class_name if not already set
-        if od_config.model_class_name is None:
-            od_config.model_class_name = self._detect_model_class(model_arch)
+        # Non-diffusers models (Bagel, GLM-Image) use `config.json`.
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+            od_config.model_class_name = config_dict.get("_class_name", None)
+            od_config.update_multimodal_support()
 
-        # Load transformer config and update multimodal support
-        od_config.tf_model_config = _load_transformer_config(od_config.model)
-        od_config.update_multimodal_support()
+            tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        except (AttributeError, OSError, ValueError):
+            # Non-diffusers model: detect pipeline from config.json
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+            # Map model_type or architecture to pipeline class
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+
+            pipeline_class = None
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                pipeline_class = "BagelPipeline"
+            elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+                pipeline_class = "GlmImagePipeline"
+
+            if pipeline_class is None:
+                raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
+
+            od_config.model_class_name = pipeline_class
+            od_config.tf_model_config = TransformerConfig()
+            od_config.update_multimodal_support()
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
-
-    def _detect_model_class(self, model_arch: str | None) -> str:
-        """Detect the pipeline class name from model config."""
-        model_path = self.od_config.model
-
-        # Use explicit model_arch if provided
-        if model_arch:
-            logger.info(f"Using model_arch '{model_arch}' as model_class_name")
-            return model_arch
-
-        # Try diffusers-style model_index.json
-        try:
-            config_dict = get_hf_file_to_dict("model_index.json", model_path)
-            if class_name := config_dict.get("_class_name"):
-                return class_name
-        except (AttributeError, OSError, ValueError):
-            pass
-
-        # Fall back to config.json for non-diffusers models
-        cfg = get_hf_file_to_dict("config.json", model_path)
-        if cfg is None:
-            raise ValueError(f"Could not find config.json or model_index.json for model {model_path}")
-
-        model_type = cfg.get("model_type")
-        if model_type in MODEL_TYPE_TO_PIPELINE:
-            return MODEL_TYPE_TO_PIPELINE[model_type]
-
-        for arch in cfg.get("architectures") or []:
-            if arch in ARCH_TO_PIPELINE:
-                return ARCH_TO_PIPELINE[arch]
-
-        raise ValueError(f"Unknown model type: {model_type}, architectures: {cfg.get('architectures')}")
 
     def generate(
         self,

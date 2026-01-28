@@ -29,10 +29,9 @@ class OmniInputPreprocessor(InputPreprocessor):
     ) -> OmniTokenInputs | MultiModalInputs:
         """Process text prompts with support for mm_processor_kwargs.
 
-        Override the base class to support passing mm_processor_kwargs even when
-        there's no multi_modal_data. This is needed for models like GLM-Image
-        where text-to-image generation requires processor kwargs (target_h, target_w)
-        to properly format the prompt with grid tokens.
+        Extends base class to support mm_processor_kwargs without multi_modal_data.
+        This is needed for models like GLM-Image where text-to-image generation
+        requires processor kwargs (target_h, target_w) to format the prompt.
         """
         prompt_text = parsed_content["prompt"]
         mm_processor_kwargs = parsed_content.get("mm_processor_kwargs") or {}
@@ -46,16 +45,16 @@ class OmniInputPreprocessor(InputPreprocessor):
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )
+            # Preserve prompt_embeds and additional_information
+            prompt_embeds = parsed_content.get("prompt_embeds")
+            if prompt_embeds is not None:
+                inputs["prompt_embeds"] = prompt_embeds
+            additional_information = parsed_content.get("additional_information")
+            if additional_information is not None:
+                inputs["additional_information"] = additional_information
         elif mm_processor_kwargs:
             # Support mm_processor_kwargs without multi_modal_data
-            #
-            # Use case: GLM-Image text-to-image mode
-            # - No input image (multi_modal_data is empty)
-            # - But processor needs target_h/target_w to build prompt with grid tokens
-            # - Grid tokens encode the output image dimensions for the AR model
-            #
-            # This is a valid extension: some models need processor kwargs for
-            # text-only inputs when the processor generates special tokens.
+            # Use case: GLM-Image text-to-image needs processor to generate grid tokens
             inputs = self._process_multimodal(
                 prompt_text,
                 {},  # Empty multi_modal_data
@@ -68,7 +67,11 @@ class OmniInputPreprocessor(InputPreprocessor):
                 prompt_text,
                 tokenization_kwargs=tokenization_kwargs,
             )
-            inputs = token_inputs_omni(prompt_token_ids=prompt_token_ids)
+            inputs = token_inputs_omni(
+                prompt_token_ids,
+                prompt_embeds=parsed_content.get("prompt_embeds"),
+                additional_information=parsed_content.get("additional_information"),
+            )
 
         if cache_salt := parsed_content.get("cache_salt"):
             inputs["cache_salt"] = cache_salt

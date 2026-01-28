@@ -62,13 +62,9 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
 
-        This method follows the vLLM native interface more closely.
-        Models implementing SupportsMRoPE should handle extracting
-        multimodal metadata from mm_features themselves.
-
-        For models not implementing SupportsMRoPE, we fall back to
-        MRotaryEmbedding.get_input_positions_tensor with extracted
-        multimodal metadata.
+        Extracts multimodal feature metadata (image grids, video grids,
+        audio features) and computes M-RoPE positions for proper positional
+        encoding of multimodal tokens.
 
         Args:
             req_state: Cached request state containing multimodal features
@@ -76,39 +72,43 @@ class OmniGPUModelRunner(GPUModelRunner):
         Raises:
             AssertionError: If the model does not support M-RoPE
         """
-        model = self.get_model()
+        image_grid_thw = []
+        video_grid_thw = []
+        second_per_grid_ts = []
+        audio_feature_lengths = []
+        use_audio_in_video = False
+        for mm_feature in req_state.mm_features:
+            mm_item = mm_feature.data
+            if mm_item is None:
+                continue
+            mm_input = mm_item.get_data()
+            if (t := mm_input.get("image_grid_thw")) is not None:
+                image_grid_thw.append(t.tolist())
+            if (t := mm_input.get("video_grid_thw")) is not None:
+                video_grid_thw.append(t.tolist())
+            if (t := mm_input.get("second_per_grid_ts")) is not None:
+                second_per_grid_ts.append(t)
+            if (t := mm_input.get("audio_feature_lengths")) is not None:
+                audio_feature_lengths.append(t)
+            # Check for use_audio_in_video
+            use_audio_in_video_value = mm_input.get("use_audio_in_video")
+            if use_audio_in_video_value is not None:
+                use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        if supports_mrope(model):
-            # Model implements SupportsMRoPE - let it handle everything
-            req_state.mrope_positions, req_state.mrope_position_delta = model.get_mrope_input_positions(
+        if supports_mrope(self.get_model()):
+            # Model implements SupportsMRoPE interface
+            # Pass all extracted metadata; models use what they need via **kwargs
+            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                req_state.mm_features,
+                mm_features=req_state.mm_features,
+                hf_config=self.model_config.hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                audio_feature_lengths=audio_feature_lengths,
+                use_audio_in_video=use_audio_in_video,
             )
         else:
-            # Fallback: extract multimodal metadata and use MRotaryEmbedding
-            image_grid_thw = []
-            video_grid_thw = []
-            second_per_grid_ts = []
-            audio_feature_lengths = []
-            use_audio_in_video = False
-
-            for mm_feature in req_state.mm_features:
-                mm_item = mm_feature.data
-                if mm_item is None:
-                    continue
-                mm_input = mm_item.get_data()
-                if (t := mm_input.get("image_grid_thw")) is not None:
-                    image_grid_thw.append(t.tolist())
-                if (t := mm_input.get("video_grid_thw")) is not None:
-                    video_grid_thw.append(t.tolist())
-                if (t := mm_input.get("second_per_grid_ts")) is not None:
-                    second_per_grid_ts.append(t)
-                if (t := mm_input.get("audio_feature_lengths")) is not None:
-                    audio_feature_lengths.append(t)
-                use_audio_in_video_value = mm_input.get("use_audio_in_video")
-                if use_audio_in_video_value is not None:
-                    use_audio_in_video = bool(use_audio_in_video_value.item())
-
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
                 hf_config=self.model_config.hf_config,
@@ -123,13 +123,20 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Calculate M-RoPE positions for scheduled tokens.
 
         This override extends vLLM's base implementation to support models
-        (like GLM-Image) that pre-compute 2D spatial positions for the decode
-        phase. For such models, get_mrope_input_positions returns positions
-        for both prefill and decode phases.
+        that pre-compute 2D spatial positions for the decode phase.
+
+        Background:
+        - Standard text models use linear position increments during decode
+        - Image generation models (like GLM-Image) output tokens in 2D grid order
+        - These models pre-compute all positions (prefill + decode) upfront
+        - The positions for decode tokens follow 2D spatial patterns, not linear
 
         The logic is backwards-compatible:
         - If pre-computed positions are available for decode tokens, use them
         - Otherwise, fall back to the default linear position computation
+
+        This modification is necessary for GLM-Image and similar image generation
+        models that use M-RoPE with 2D spatial encoding for generated tokens.
         """
         from vllm.utils import length_from_prompt_token_ids_or_embeds
 

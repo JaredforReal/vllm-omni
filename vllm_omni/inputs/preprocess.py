@@ -47,9 +47,15 @@ class OmniInputPreprocessor(InputPreprocessor):
                 mm_uuids=mm_uuids,
             )
         elif mm_processor_kwargs:
-            # Handle case where mm_processor_kwargs is provided without multi_modal_data
-            # This is needed for GLM-Image text-to-image mode where the processor
-            # needs target_h/target_w to build the prompt with grid tokens
+            # Support mm_processor_kwargs without multi_modal_data
+            #
+            # Use case: GLM-Image text-to-image mode
+            # - No input image (multi_modal_data is empty)
+            # - But processor needs target_h/target_w to build prompt with grid tokens
+            # - Grid tokens encode the output image dimensions for the AR model
+            #
+            # This is a valid extension: some models need processor kwargs for
+            # text-only inputs when the processor generates special tokens.
             inputs = self._process_multimodal(
                 prompt_text,
                 {},  # Empty multi_modal_data

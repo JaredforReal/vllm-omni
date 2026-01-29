@@ -731,8 +731,14 @@ class GlmImagePipeline(nn.Module):
 
         # 1. Get prior tokens - either from external source (multistage) or generate internally
         # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
+        # First try sampling_params.extra_args (for direct API usage)
+        # Then try prompt["extra"] (for multistage ar2diffusion output)
         external_prior_tokens = req.sampling_params.extra_args.get("prior_token_ids")
         external_prior_image_ids = req.sampling_params.extra_args.get("prior_token_image_ids")
+        if external_prior_tokens is None and isinstance(first_prompt, dict):
+            prompt_extra = first_prompt.get("extra", {})
+            external_prior_tokens = prompt_extra.get("prior_token_ids")
+            external_prior_image_ids = prompt_extra.get("prior_token_image_ids")
 
         if external_prior_tokens is not None:
             prior_token_id = external_prior_tokens

@@ -428,6 +428,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
         engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        # Preserve the text prompt for downstream stages (e.g., diffusion models need it)
+        if "prompt" in prompt_inputs:
+            engine_prompt["prompt"] = prompt_inputs["prompt"]
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
 

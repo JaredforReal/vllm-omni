@@ -625,7 +625,7 @@ class GlmImagePipeline(nn.Module):
             # Encode condition image to latent space
             # Use argmax (mode) for deterministic encoding of condition images
             condition_latent = retrieve_latents(
-                self.vae.encode(condition_image), generator=generator, sample_mode="argmax"
+                self.vae.encode(condition_image.unsqueeze(0)), generator=generator, sample_mode="argmax"
             )
             condition_latent = (condition_latent - latents_mean) / latents_std
 

@@ -428,9 +428,36 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
         engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
-        # Preserve the text prompt for downstream stages (e.g., diffusion models need it)
-        if "prompt" in prompt_inputs:
-            engine_prompt["prompt"] = prompt_inputs["prompt"]
+        # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
+        # For /v1/chat/completions, `request_prompt` is often the rendered chat template.
+        # Diffusion models generally want the raw user caption instead.
+        try:
+            output_modalities = getattr(self.engine_client, "output_modalities", None)
+            if output_modalities and ("image" in output_modalities):
+                messages_as_dicts: list[dict[str, Any]] = []
+                for msg in messages:
+                    if hasattr(msg, "model_dump"):
+                        messages_as_dicts.append(msg.model_dump())
+                    elif isinstance(msg, dict):
+                        messages_as_dicts.append(msg)
+                    else:
+                        messages_as_dicts.append(
+                            {
+                                "role": getattr(msg, "role", "user"),
+                                "content": getattr(msg, "content", ""),
+                            }
+                        )
+                extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+                if extracted_prompt:
+                    engine_prompt["prompt"] = extracted_prompt
+                elif "prompt" in prompt_inputs:
+                    engine_prompt["prompt"] = prompt_inputs["prompt"]
+            elif "prompt" in prompt_inputs:
+                engine_prompt["prompt"] = prompt_inputs["prompt"]
+        except Exception:
+            # Best-effort: never fail chat preprocessing due to prompt extraction.
+            if "prompt" in prompt_inputs:
+                engine_prompt["prompt"] = prompt_inputs["prompt"]
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
 

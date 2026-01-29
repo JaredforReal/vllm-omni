@@ -687,9 +687,11 @@ class GlmImagePipeline(nn.Module):
         # specific warmup request to proceed by synthesizing minimal prior
         # tokens, while still raising a clear error for real requests.
         is_dummy_warmup = (
-            not getattr(req, "request_id", None) and prompt == "dummy run" and (req.num_inference_steps == 1)
+            not getattr(req, "request_id", None)
+            and prompt == "dummy run"
+            and (req.sampling_params.num_inference_steps == 1)
         )
-        
+
         # Get pre-computed prompt embeddings if provided
         if isinstance(first_prompt, str):
             prompt_embeds = None
@@ -704,11 +706,6 @@ class GlmImagePipeline(nn.Module):
             None
             if isinstance(first_prompt, str)
             else first_prompt.get("additional_information", {}).get("preprocessed_image")
-        )
-        condition_images = (
-            None
-            if isinstance(first_prompt, str)
-            else first_prompt.get("additional_information", {}).get("prompt_image")
         )
         img_height = req.sampling_params.height
         img_width = req.sampling_params.width

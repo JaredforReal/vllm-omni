@@ -45,6 +45,7 @@ from pathlib import Path
 from PIL import Image
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Default stage config path (relative to vllm_omni package)
 DEFAULT_CONFIG_PATH = "vllm_omni/model_executor/stage_configs/glm_image.yaml"
@@ -289,13 +290,13 @@ def main(args: argparse.Namespace) -> None:
 
     # For diffusion stage, sampling_params contains diffusion-specific parameters
     # These are passed as kwargs to the diffusion engine
-    diffusion_sampling_params = {
-        "num_inference_steps": args.num_inference_steps,
-        "guidance_scale": args.guidance_scale,
-        "height": prompt_dict.get("height", 1024),
-        "width": prompt_dict.get("width", 1024),
-        "seed": args.seed,
-    }
+    diffusion_sampling_params = OmniDiffusionSamplingParams(
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        height=prompt_dict.get("height", 1024),
+        width=prompt_dict.get("width", 1024),
+        seed=args.seed,
+    )
 
     # For multistage, we need sampling_params for each stage
     # Stage 0 (AR): SamplingParams for vLLM

@@ -60,11 +60,8 @@ stage_args:
     final_output: true
     final_output_type: image
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      # Diffusion-specific parameters only (no LLM params like temperature/top_p/top_k)
       seed: 42
-      detokenize: true
       num_inference_steps: 50
       guidance_scale: 1.5
       height: 1024

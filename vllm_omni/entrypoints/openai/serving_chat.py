@@ -311,17 +311,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
+                # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
+                mm_processor_kwargs: dict[str, Any] = {}
                 if height is not None:
-                    tprompt["height"] = height
+                    mm_processor_kwargs["target_h"] = height
                 if width is not None:
-                    tprompt["width"] = width
+                    mm_processor_kwargs["target_w"] = width
+                if mm_processor_kwargs:
+                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
 
                 request_prompts = [extracted_prompt]
                 engine_prompts = [tprompt]
+                # Store height/width for applying to diffusion stage sampling params later
+                _image_gen_height = height
+                _image_gen_width = width
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
+                _image_gen_height = None
+                _image_gen_width = None
+        else:
+            _image_gen_height = None
+            _image_gen_width = None
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -332,6 +344,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                # Apply user-specified height/width to diffusion stage(s) for image generation
+                if _image_gen_height is not None or _image_gen_width is not None:
+                    for idx, sp in enumerate(sampling_params_list):
+                        # Diffusion stages typically have height/width attributes
+                        if hasattr(sp, "height") and _image_gen_height is not None:
+                            sp.height = _image_gen_height
+                        if hasattr(sp, "width") and _image_gen_width is not None:
+                            sp.width = _image_gen_width
 
                 self._log_inputs(
                     request_id,

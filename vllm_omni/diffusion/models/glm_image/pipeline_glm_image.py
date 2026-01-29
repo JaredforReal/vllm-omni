@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from typing import cast
 
 import numpy as np
 import PIL.Image
@@ -46,6 +47,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -75,16 +77,26 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
     # GLM-Image uses patch_size=2 for transformer
     patch_size = 2
 
-    def pre_process_func(requests: list[OmniDiffusionRequest]):
+    def pre_process_func(request: OmniDiffusionRequest):
         """Pre-process condition images for Image Edit mode."""
-        for req in requests:
-            images = req.pil_image
-            if images is None:
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
+
+            if raw_image is None:
                 # Text-to-image mode, no preprocessing needed
                 continue
 
-            if not isinstance(images, list):
-                images = [images]
+            if not isinstance(raw_image, list):
+                raw_image = [raw_image]
+            images = [
+                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+                for im in raw_image
+            ]
 
             preprocessed = []
             height, width = None, None
@@ -108,14 +120,19 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
                     height, width = img_h, img_w
 
             # Store in request
-            req.preprocessed_image = preprocessed
-            req.prompt_image = images  # Keep original PIL images
-            if req.height is None:
-                req.height = height
-            if req.width is None:
-                req.width = width
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt, additional_information={})
+            elif "additional_information" not in prompt:
+                prompt["additional_information"] = {}
+            prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
+            prompt["additional_information"]["prompt_image"] = images  # type: ignore
+            request.prompts[i] = prompt
+            if request.sampling_params.height is None:
+                request.sampling_params.height = height
+            if request.sampling_params.width is None:
+                request.sampling_params.width = width
 
-        return requests
+        return request
 
     return pre_process_func
 
@@ -647,10 +664,22 @@ class GlmImagePipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """Main generation forward pass."""
-        prompt = req.prompt or ""
-        if isinstance(prompt, list):
-            prompt = prompt[0] if prompt else ""
+        """
+        Main generation forward pass.
+
+        Args:
+            req: OmniDiffusionRequest with generation parameters
+
+        Returns:
+            DiffusionOutput containing generated image
+        """
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
         # NOTE: DiffusionEngine does an internal warmup "dummy run" during
         # initialization. That request has no request_id and does not carry
@@ -660,20 +689,39 @@ class GlmImagePipeline(nn.Module):
         is_dummy_warmup = (
             not getattr(req, "request_id", None) and prompt == "dummy run" and (req.num_inference_steps == 1)
         )
+        
+        # Get pre-computed prompt embeddings if provided
+        if isinstance(first_prompt, str):
+            prompt_embeds = None
+        else:
+            prompt_embeds = first_prompt.get("prompt_embeds")
+            if not isinstance(prompt_embeds, torch.Tensor):
+                prompt_embeds = None
 
-        prompt_embeds = req.prompt_embeds if isinstance(req.prompt_embeds, torch.Tensor) else None
-        preprocessed_images = req.preprocessed_image
-        img_height = req.height
-        img_width = req.width
+        # Get condition images for Image Edit mode
+        # Use pre-processed images from pre_process_func
+        preprocessed_images = (
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("additional_information", {}).get("preprocessed_image")
+        )
+        condition_images = (
+            None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("additional_information", {}).get("prompt_image")
+        )
+        img_height = req.sampling_params.height
+        img_width = req.sampling_params.width
 
         # Warmup may include a dummy image for image-input-capable models.
         # Treat that as t2i warmup to avoid requiring i2i-only KV-cache inputs.
         is_image_edit = (preprocessed_images is not None) and (not is_dummy_warmup)
 
-        height = req.height or img_height or self.default_sample_size * self.vae_scale_factor
-        width = req.width or img_width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.num_inference_steps or 50
-        guidance_scale = req.guidance_scale or 1.5
+        # Use image dimensions as default if available
+        height = req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
+        guidance_scale = req.sampling_params.guidance_scale or 1.5
 
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
 
@@ -681,12 +729,13 @@ class GlmImagePipeline(nn.Module):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         generator = None
-        if req.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.seed)
+        if req.sampling_params.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
 
-        # 1. Get prior tokens
-        external_prior_tokens = req.extra.get("prior_token_ids") if req.extra else None
-        external_prior_image_ids = req.extra.get("prior_token_image_ids") if req.extra else None
+        # 1. Get prior tokens - either from external source (multistage) or generate internally
+        # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
+        external_prior_tokens = req.sampling_params.extra_args.get("prior_token_ids")
+        external_prior_image_ids = req.sampling_params.extra_args.get("prior_token_image_ids")
 
         if external_prior_tokens is not None:
             prior_token_id = external_prior_tokens

@@ -1095,7 +1095,7 @@ async def _stage_worker_async(
 
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
-    
+
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 

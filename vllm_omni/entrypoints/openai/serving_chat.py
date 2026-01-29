@@ -260,6 +260,69 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
 
+        # Omni multistage image generation: Stage-0 (AR) should receive a clean
+        # text prompt (and optional conditioning image/size) so the model's own
+        # processor can construct the correct inputs.
+        # If we pass pre-tokenized chat-template ids, GLM-Image can become
+        # effectively unconditioned and produce nonsense images.
+        if request.modalities and ("image" in request.modalities):
+            try:
+                messages_as_dicts: list[dict[str, Any]] = []
+                for msg in request.messages:
+                    if hasattr(msg, "model_dump"):
+                        messages_as_dicts.append(msg.model_dump())
+                    elif isinstance(msg, dict):
+                        messages_as_dicts.append(msg)
+                    else:
+                        messages_as_dicts.append(
+                            {
+                                "role": getattr(msg, "role", "user"),
+                                "content": getattr(msg, "content", ""),
+                            }
+                        )
+                extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+                if not extracted_prompt:
+                    return self.create_error_response("No text prompt found in messages")
+
+                extra_body = getattr(request, "extra_body", None) or {}
+                height = extra_body.get("height")
+                width = extra_body.get("width")
+                if "size" in extra_body:
+                    try:
+                        size_str = extra_body["size"]
+                        if isinstance(size_str, str) and "x" in size_str.lower():
+                            w, h = size_str.lower().split("x")
+                            width, height = int(w), int(h)
+                    except Exception:
+                        pass
+                negative_prompt = extra_body.get("negative_prompt")
+
+                engine_prompt_image: dict[str, Any] | None = None
+                if reference_images:
+                    # Best-effort decode first reference image for i2i.
+                    try:
+                        img_bytes = base64.b64decode(reference_images[0])
+                        img = Image.open(BytesIO(img_bytes))
+                        engine_prompt_image = {"image": img}
+                    except Exception:
+                        engine_prompt_image = None
+
+                # Override the prompts produced by chat-template preprocessing.
+                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                if negative_prompt is not None:
+                    tprompt["negative_prompt"] = negative_prompt
+                if height is not None:
+                    tprompt["height"] = height
+                if width is not None:
+                    tprompt["width"] = width
+                if engine_prompt_image is not None:
+                    tprompt["multi_modal_data"] = engine_prompt_image
+
+                request_prompts = [extracted_prompt]
+                engine_prompts = [tprompt]
+            except Exception as e:
+                logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:

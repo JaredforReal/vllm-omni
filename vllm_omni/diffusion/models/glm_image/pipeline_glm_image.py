@@ -705,7 +705,7 @@ class GlmImagePipeline(nn.Module):
         preprocessed_images = (
             None
             if isinstance(first_prompt, str)
-            else first_prompt.get("additional_information", {}).get("preprocessed_image")
+            else [first_prompt.get("additional_information", {}).get("preprocessed_image")]
         )
         img_height = req.sampling_params.height
         img_width = req.sampling_params.width

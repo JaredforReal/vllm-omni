@@ -702,11 +702,12 @@ class GlmImagePipeline(nn.Module):
 
         # Get condition images for Image Edit mode
         # Use pre-processed images from pre_process_func
-        preprocessed_images = (
-            None
-            if isinstance(first_prompt, str)
-            else [first_prompt.get("additional_information", {}).get("preprocessed_image")]
-        )
+        preprocessed_images = None
+        if not isinstance(first_prompt, str):
+            img = first_prompt.get("additional_information", {}).get("preprocessed_image")
+            if img is not None:
+                preprocessed_images = [img]
+
         img_height = req.sampling_params.height
         img_width = req.sampling_params.width
 

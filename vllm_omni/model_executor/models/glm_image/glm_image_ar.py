@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only GLM-Image model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal
 
@@ -34,6 +35,7 @@ from transformers.models.glm_image.configuration_glm_image import (
     GlmImageVisionConfig,
     GlmImageVQVAEConfig,
 )
+from transformers.models.glm_image.processing_glm_image import GlmImageProcessor
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -137,39 +139,28 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
         path points to vision_language_encoder/. We need to go up one level
         and into processor/ to load the GlmImageProcessor.
         """
-        import os
 
-        try:
-            from transformers import GlmImageProcessor
+        # Get the model path from config
+        model_path = self.ctx.model_config.model
 
-            # Get the model path from config
-            model_path = self.ctx.model_config.model
+        # Check if we're in a subdirectory (vision_language_encoder)
+        # and need to go to processor/ instead
+        if model_path.endswith("vision_language_encoder") or "/vision_language_encoder" in model_path:
+            # Go up one level and into processor/
+            base_path = os.path.dirname(model_path.rstrip("/"))
+            processor_path = os.path.join(base_path, "processor")
+        else:
+            # Try processor subdirectory of current path
+            processor_path = os.path.join(model_path, "processor")
+            if not os.path.exists(processor_path):
+                processor_path = model_path
 
-            # Check if we're in a subdirectory (vision_language_encoder)
-            # and need to go to processor/ instead
-            if model_path.endswith("vision_language_encoder") or "/vision_language_encoder" in model_path:
-                # Go up one level and into processor/
-                base_path = os.path.dirname(model_path.rstrip("/"))
-                processor_path = os.path.join(base_path, "processor")
-            else:
-                # Try processor subdirectory of current path
-                processor_path = os.path.join(model_path, "processor")
-                if not os.path.exists(processor_path):
-                    processor_path = model_path
-
-            # Load processor directly from the correct path
-            return GlmImageProcessor.from_pretrained(
-                processor_path,
-                trust_remote_code=self.ctx.model_config.trust_remote_code,
-                **kwargs,
-            )
-        except (ImportError, OSError) as e:
-            # Fallback: return None and handle in processor
-            from vllm.logger import init_logger
-
-            logger = init_logger(__name__)
-            logger.warning(f"Failed to load GlmImageProcessor: {e}")
-            return None
+        # Load processor directly from the correct path
+        return GlmImageProcessor.from_pretrained(
+            processor_path,
+            trust_remote_code=self.ctx.model_config.trust_remote_code,
+            **kwargs,
+        )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         # GLM-Image is an image GENERATION model that supports:

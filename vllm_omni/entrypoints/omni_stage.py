@@ -883,11 +883,7 @@ def _stage_worker(
 
             batch_request_ids.append(rid)
 
-            if isinstance(ein, list):
-                batch_engine_inputs.extend(ein)
-            elif isinstance(ein, dict):
-                batch_engine_inputs.append(ein)
-            elif isinstance(ein, str):
+            if isinstance(ein, (dict, str)):
                 # For diffusion stage-0, ein might be a string prompt directly
                 batch_engine_inputs.append(ein)
             elif isinstance(ein, Sequence):

@@ -289,7 +289,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # This handles both OmniOutput objects and plain tensors
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(raw_hidden_states)
 
-            # Keep multimodal_outputs for downstream hooks; avoid noisy logging here.
+            if multimodal_outputs is not None:
+                keys_or_type = (
+                    list(multimodal_outputs.keys())
+                    if isinstance(multimodal_outputs, dict)
+                    else type(multimodal_outputs)
+                )
+                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
+            else:
+                logger.debug("[AR] execute_model: multimodal_outputs is None")
 
             if not self.broadcast_pp_output:
                 # Common case.

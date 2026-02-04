@@ -222,8 +222,8 @@ class OmniStage:
 
         # Wait for result from worker
         try:
-            # Profiling stop might take time to flush files, give it 180s
-            response = self._out_q.get(timeout=60000)
+            # Profiling stop might take time to flush files, give it 600s
+            response = self._out_q.get(timeout=600)
 
             if isinstance(response, dict):
                 if response.get("type") == "profiler_result":
@@ -674,12 +674,22 @@ def _stage_worker(
                     break
 
         lock_files = acquired_lock_fds
+
+        # Set FD_CLOEXEC on all lock file descriptors to prevent child processes
+        # (e.g., EngineCore) from inheriting them, which would cause deadlock
+        for lock_fd in acquired_lock_fds:
+            try:
+                flags = fcntl.fcntl(lock_fd, fcntl.F_GETFD)
+                fcntl.fcntl(lock_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            except (OSError, ValueError):
+                pass
     except Exception as e:
         logger.debug(
             "[Stage-%s] Failed to set up sequential initialization lock: %s",
             stage_id,
             e,
         )
+
     # Init engine based on stage_type
     logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     if engine_args.get("async_chunk", False):
@@ -718,6 +728,7 @@ def _stage_worker(
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
+        lock_files = []  # Clear after release
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
     connectors: dict[tuple[str, str], OmniConnectorBase] | None = {}

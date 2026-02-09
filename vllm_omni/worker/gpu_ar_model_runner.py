@@ -298,16 +298,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
-                raw_hidden_states, aux_hidden_states = model_output
+                hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
-                raw_hidden_states = model_output
+                hidden_states = model_output
                 aux_hidden_states = None
 
-            # Extract multimodal outputs if model supports it
-            # This handles both OmniOutput objects and plain tensors
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(raw_hidden_states)
-
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())

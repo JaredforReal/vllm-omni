@@ -1133,7 +1133,6 @@ class GlmImageVisionAttention(nn.Module):
             num_heads=self.num_heads_per_partition,
             head_size=self.head_dim,
             scale=self.head_dim**-0.5,
-            multimodal_config=multimodal_config,
         )
 
     def forward(

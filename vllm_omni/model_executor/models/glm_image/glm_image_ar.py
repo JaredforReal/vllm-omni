@@ -1426,7 +1426,6 @@ class GlmImageVisionModel(nn.Module):
         self.attn_backend = get_vit_attn_backend(
             head_size=self.head_dim,
             dtype=torch.get_default_dtype(),
-            attn_backend_override=(multimodal_config.mm_encoder_attn_backend if multimodal_config else None),
         )
 
     @property

@@ -79,6 +79,8 @@ class OmniDiffusion:
                 pipeline_class = "BagelPipeline"
             elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
                 pipeline_class = "GlmImagePipeline"
+            elif architectures and len(architectures) == 1:
+                pipeline_class = architectures[0]
 
             if pipeline_class is None:
                 raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")

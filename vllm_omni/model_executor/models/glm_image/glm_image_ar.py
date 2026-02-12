@@ -58,13 +58,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.models.qwen2 import Qwen2MLP as GlmImageTextMLP
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
 )
+from vllm.model_executor.models.qwen2 import Qwen2MLP as GlmImageTextMLP
 from vllm.model_executor.models.utils import (
     WeightsMapper,
     make_empty_intermediate_tensors_factory,

@@ -42,7 +42,7 @@ try:
 except ImportError:
     # GlmImageTextConfig not available, skip patching
     pass
-  
+
 # Extend RequestStatus enum with omni-specific statuses
 if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # The value - 1 is intentionally chosen to ensure it is treated

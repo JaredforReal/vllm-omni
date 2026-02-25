@@ -710,7 +710,7 @@ def _stage_worker(
 
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
-    
+
     # Resolve ZMQ queue endpoints if needed
     zmq_ctx = None
     if isinstance(in_q, str) or isinstance(out_q, str):

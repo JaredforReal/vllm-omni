@@ -336,7 +336,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
 
-                request_prompts = [extracted_prompt]
                 engine_prompts = [tprompt]
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
@@ -504,63 +503,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request=request
             )
 
-        if tokenizer is None:
-            assert isinstance(request_prompt, str), (
-                "Prompt has to be a string",
-                "when the tokenizer is not initialised",
-            )
-            prompt_inputs = TokensPrompt(prompt=request_prompt, prompt_token_ids=[1])
-        elif isinstance(request_prompt, str):
-            prompt_inputs = await self._tokenize_prompt_input_async(
-                request,
-                tokenizer,
-                request_prompt,
-                add_special_tokens=add_special_tokens,
-            )
-        else:
-            # For MistralTokenizer
-            assert is_list_of(request_prompt, int), "Prompt has to be either a string or a list of token ids"
-            prompt_inputs = TokensPrompt(
-                prompt=tokenizer.decode(request_prompt),
-                prompt_token_ids=request_prompt,
-            )
-
-        engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
         # For /v1/chat/completions, `request_prompt` is often the rendered chat template.
         # Diffusion models generally want the raw user caption instead.
-        try:
-            output_modalities = getattr(self.engine_client, "output_modalities", None)
-            if output_modalities and ("image" in output_modalities):
-                messages_as_dicts: list[dict[str, Any]] = []
-                for msg in messages:
-                    if hasattr(msg, "model_dump"):
-                        messages_as_dicts.append(msg.model_dump())
-                    elif isinstance(msg, dict):
-                        messages_as_dicts.append(msg)
-                    else:
-                        messages_as_dicts.append(
-                            {
-                                "role": getattr(msg, "role", "user"),
-                                "content": getattr(msg, "content", ""),
-                            }
-                        )
-                extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
-                if extracted_prompt:
-                    engine_prompt["prompt"] = extracted_prompt
-                elif "prompt" in prompt_inputs:
-                    engine_prompt["prompt"] = prompt_inputs["prompt"]
-            elif "prompt" in prompt_inputs:
-                engine_prompt["prompt"] = prompt_inputs["prompt"]
-        except Exception:
-            # Best-effort: never fail chat preprocessing due to prompt extraction.
-            if "prompt" in prompt_inputs:
-                engine_prompt["prompt"] = prompt_inputs["prompt"]
-        if mm_data is not None:
-            engine_prompt["multi_modal_data"] = mm_data
-
-        if mm_uuids is not None:
-            engine_prompt["multi_modal_uuids"] = mm_uuids
+        output_modalities = getattr(self.engine_client, "output_modalities", None)
+        if output_modalities and ("image" in output_modalities):
+            messages_as_dicts: list[dict[str, Any]] = []
+            for msg in messages:
+                if hasattr(msg, "model_dump"):
+                    messages_as_dicts.append(msg.model_dump())
+                elif isinstance(msg, dict):
+                    messages_as_dicts.append(msg)
+                else:
+                    messages_as_dicts.append(
+                        {
+                            "role": getattr(msg, "role", "user"),
+                            "content": getattr(msg, "content", ""),
+                        }
+                    )
+            extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+            if extracted_prompt:
+                engine_prompt["prompt"] = extracted_prompt
 
         mm_processor_kwargs = getattr(request, "mm_processor_kwargs", None)
         if mm_processor_kwargs is not None:
@@ -569,7 +532,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
-        return conversation, [request_prompt], [engine_prompt]
+        return conversation, [engine_prompt]
 
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
         final_sampling_params_list = []

@@ -159,21 +159,32 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         """Calculate M-RoPE positions for scheduled tokens.
 
-        This override extends vLLM's base implementation to support models
-        that pre-compute 2D spatial positions for the decode phase.
+        Delegates to the upstream implementation first, then applies a fixup
+        pass for models that pre-compute 2D spatial decode positions (e.g.
+        GLM-Image).  This avoids duplicating the full upstream method while
+        still supporting non-linear decode position patterns.
 
-        Background:
-        - Standard text models use linear position increments during decode
-        - Image generation models (like GLM-Image) output tokens in 2D grid order
-        - These models pre-compute all positions (prefill + decode) upfront
-        - The positions for decode tokens follow 2D spatial patterns, not linear
+        Models opt-in by declaring ``precomputed_mrope_decode = True`` as a
+        class attribute.  When set, ``get_mrope_input_positions`` is expected
+        to return positions covering **both** prefill and decode tokens.
+        """
+        # Run upstream logic (handles prompt positions + linear decode fallback)
+        super()._calc_mrope_positions(scheduler_output)
 
-        The logic is backwards-compatible:
-        - If pre-computed positions are available for decode tokens, use them
-        - Otherwise, fall back to the default linear position computation
+        # Only run the fixup if the model pre-computes decode M-RoPE positions
+        if not getattr(self.get_model(), "precomputed_mrope_decode", False):
+            return
 
-        This modification is necessary for GLM-Image and similar image generation
-        models that use M-RoPE with 2D spatial encoding for generated tokens.
+        self._fixup_precomputed_mrope_decode_positions(scheduler_output)
+
+    def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
+        """Overwrite linear decode M-RoPE positions with pre-computed ones.
+
+        For image-generation models (like GLM-Image) that output tokens in 2D
+        grid order, ``get_mrope_input_positions`` returns positions for the
+        full sequence (prefill + decode).  The upstream runner only uses the
+        prefill portion and falls back to linear increments for decode.  This
+        method patches the decode slice with the correct pre-computed values.
         """
         from vllm.utils import length_from_prompt_token_ids_or_embeds
 
@@ -193,43 +204,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                 prompt_part_len = num_scheduled_tokens
                 completion_part_len = 0
 
-            assert num_scheduled_tokens == prompt_part_len + completion_part_len
-
-            if prompt_part_len > 0:
-                # prompt's mrope_positions are pre-computed
-                dst_start = mrope_pos_ptr
-                dst_end = mrope_pos_ptr + prompt_part_len
-                src_start = num_computed_tokens
-                src_end = num_computed_tokens + prompt_part_len
-
-                self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[:, src_start:src_end]
-                mrope_pos_ptr += prompt_part_len
+            mrope_pos_ptr += prompt_part_len
 
             if completion_part_len > 0:
                 dst_start = mrope_pos_ptr
-
-                # Check if pre-computed decode positions are available
-                # Models like GLM-Image return positions for both prefill and
-                # decode phases with proper 2D spatial encoding
-                total_precomputed = req.mrope_positions.shape[1]
                 decode_start = num_computed_tokens + prompt_part_len
                 decode_end = decode_start + completion_part_len
+                total_precomputed = req.mrope_positions.shape[1]
 
                 if decode_end <= total_precomputed:
-                    # Use pre-computed decode positions (for 2D spatial models)
+                    # Overwrite the linear positions written by upstream with
+                    # the correct pre-computed 2D spatial positions.
                     self.mrope_positions.cpu[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
                         :, decode_start:decode_end
                     ]
-                else:
-                    # Fallback to default linear positions for text-only generation
-                    assert req.mrope_position_delta is not None
-                    MRotaryEmbedding.get_next_input_positions_tensor(
-                        out=self.mrope_positions.np,
-                        out_offset=dst_start,
-                        mrope_position_delta=req.mrope_position_delta,
-                        context_len=num_computed_tokens + prompt_part_len,
-                        num_new_tokens=completion_part_len,
-                    )
 
                 mrope_pos_ptr += completion_part_len
 

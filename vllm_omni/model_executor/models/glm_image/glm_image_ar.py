@@ -2278,6 +2278,12 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
     supports_mrope = True
 
+    # GLM-Image pre-computes M-RoPE positions for both prefill and decode
+    # phases (2D spatial grid encoding for generated image tokens).  This
+    # flag tells the runner to use those positions instead of the default
+    # linear increments during decode.
+    precomputed_mrope_decode = True
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",

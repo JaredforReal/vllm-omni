@@ -67,6 +67,7 @@ _OMNI_MODELS = {
         "fun_audio_chat",
         "cosyvoice",
         "FunAudioChatCosyVoice",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",

@@ -23,7 +23,6 @@ mel spectrograms and a speech tokenizer for discrete audio tokens.
 """
 
 import json
-import os
 import warnings
 from typing import BinaryIO
 
@@ -32,22 +31,13 @@ import numpy as np
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import (
-    PROCESSOR_NAME,
     AudioKwargs,
-    PreTrainedTokenizerBase,
     ProcessingKwargs,
     ProcessorMixin,
     TextKwargs,
     Unpack,
-    custom_object_save,
-    logger,
 )
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.utils import (
-    CHAT_TEMPLATE_DIR,
-    CHAT_TEMPLATE_FILE,
-    LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE,
-)
 from transformers.utils.deprecation import deprecate_kwarg
 
 
@@ -355,30 +345,16 @@ class FunAudioChatProcessor(ProcessorMixin):
     @classmethod
     def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """
-        Identify and instantiate the subcomponents of Processor classes, like image processors
-        and tokenizers.
+        Load subcomponents (feature_extractor, speech_tokenizer, tokenizer)
+        from the pretrained model directory.
+
+        The speech_tokenizer is stored in a subfolder named 'speech_tokenizer',
+        so we pass subfolder= to from_pretrained for that attribute.
         """
         args = []
         for attribute_name in cls.attributes:
             class_name = getattr(cls, f"{attribute_name}_class")
-            if isinstance(class_name, tuple):
-                classes = tuple(cls.get_possibly_dynamic_module(n) if n is not None else None for n in class_name)
-                if attribute_name == "image_processor":
-                    use_fast = kwargs.get("use_fast", None)
-                    if use_fast is None:
-                        logger.warning_once(
-                            "Using a slow image processor as `use_fast` is unset and a slow processor "
-                            "was saved with this model. `use_fast=True` will be the default behavior "
-                            "in v4.52, even if the model was saved with a slow processor."
-                        )
-                else:
-                    use_fast = kwargs.get("use_fast", True)
-                if use_fast and classes[1] is not None:
-                    attribute_class = classes[1]
-                else:
-                    attribute_class = classes[0]
-            else:
-                attribute_class = cls.get_possibly_dynamic_module(class_name)
+            attribute_class = cls.get_possibly_dynamic_module(class_name)
             if attribute_name == "speech_tokenizer":
                 extra_kwargs = {"subfolder": attribute_name}
             else:
@@ -391,112 +367,6 @@ class FunAudioChatProcessor(ProcessorMixin):
         tokenizer_input_names = self.tokenizer.model_input_names
         feature_extractor_input_names = self.feature_extractor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + feature_extractor_input_names + ["feature_attention_mask"]))
-
-    def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
-        """
-        Saves the attributes of this processor (feature extractor, tokenizer...) in the
-        specified directory so that it can be reloaded using the
-        [`~ProcessorMixin.from_pretrained`] method.
-        """
-        use_auth_token = kwargs.pop("use_auth_token", None)
-
-        if use_auth_token is not None:
-            warnings.warn(
-                "The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers. "
-                "Please use `token` instead.",
-                FutureWarning,
-            )
-            if kwargs.get("token", None) is not None:
-                raise ValueError(
-                    "`token` and `use_auth_token` are both specified. Please set only the argument `token`."
-                )
-            kwargs["token"] = use_auth_token
-
-        os.makedirs(save_directory, exist_ok=True)
-
-        if push_to_hub:
-            commit_message = kwargs.pop("commit_message", None)
-            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id = self._create_repo(repo_id, **kwargs)
-            files_timestamps = self._get_files_timestamps(save_directory)
-
-        if self._auto_class is not None:
-            attrs = [getattr(self, attribute_name) for attribute_name in self.attributes]
-            configs = [(a.init_kwargs if isinstance(a, PreTrainedTokenizerBase) else a) for a in attrs]
-            configs.append(self)
-            custom_object_save(self, save_directory, config=configs)
-
-        save_jinja_files = kwargs.get("save_jinja_files", True)
-
-        for attribute_name in self.attributes:
-            attribute = getattr(self, attribute_name)
-            if attribute_name == "tokenizer":
-                attribute.save_pretrained(save_directory, save_jinja_files=save_jinja_files)
-            elif attribute_name == "speech_tokenizer":
-                attribute.save_pretrained(os.path.join(save_directory, attribute_name))
-            else:
-                attribute.save_pretrained(save_directory)
-
-        if self._auto_class is not None:
-            for attribute_name in self.attributes:
-                attribute = getattr(self, attribute_name)
-                if isinstance(attribute, PreTrainedTokenizerBase):
-                    del attribute.init_kwargs["auto_map"]
-
-        output_processor_file = os.path.join(save_directory, PROCESSOR_NAME)
-        output_chat_template_file_jinja = os.path.join(save_directory, CHAT_TEMPLATE_FILE)
-        output_chat_template_file_legacy = os.path.join(save_directory, LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE)
-        chat_template_dir = os.path.join(save_directory, CHAT_TEMPLATE_DIR)
-
-        processor_dict = self.to_dict()
-
-        if self.chat_template is not None:
-            save_jinja_files = kwargs.get("save_jinja_files", True)
-            is_single_template = isinstance(self.chat_template, str)
-            if save_jinja_files and is_single_template:
-                with open(output_chat_template_file_jinja, "w", encoding="utf-8") as f:
-                    f.write(self.chat_template)
-                logger.info(f"chat template saved in {output_chat_template_file_jinja}")
-            elif save_jinja_files and not is_single_template:
-                for template_name, template in self.chat_template.items():
-                    if template_name == "default":
-                        with open(output_chat_template_file_jinja, "w", encoding="utf-8") as f:
-                            f.write(self.chat_template["default"])
-                        logger.info(f"chat template saved in {output_chat_template_file_jinja}")
-                    else:
-                        os.makedirs(chat_template_dir, exist_ok=True)
-                        template_filepath = os.path.join(chat_template_dir, f"{template_name}.jinja")
-                        with open(template_filepath, "w", encoding="utf-8") as f:
-                            f.write(template)
-                        logger.info(f"chat template saved in {template_filepath}")
-            elif is_single_template:
-                chat_template_json_string = (
-                    json.dumps({"chat_template": self.chat_template}, indent=2, sort_keys=True) + "\n"
-                )
-                with open(output_chat_template_file_legacy, "w", encoding="utf-8") as writer:
-                    writer.write(chat_template_json_string)
-                logger.info(f"chat template saved in {output_chat_template_file_legacy}")
-            elif self.chat_template is not None:
-                raise ValueError(
-                    "Multiple chat templates are not supported in the legacy format. "
-                    "Please save them as separate files using the `save_jinja_files` argument."
-                )
-
-        self.to_json_file(output_processor_file)
-        logger.info(f"processor saved in {output_processor_file}")
-
-        if push_to_hub:
-            self._upload_modified_files(
-                save_directory,
-                repo_id,
-                files_timestamps,
-                commit_message=commit_message,
-                token=kwargs.get("token"),
-            )
-
-        if set(processor_dict.keys()) == {"processor_class"}:
-            return []
-        return [output_processor_file]
 
     @property
     def default_chat_template(self):

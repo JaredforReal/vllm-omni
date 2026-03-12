@@ -4,11 +4,9 @@
 import enum
 import os
 import random
-from collections.abc import Callable
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from pydantic import model_validator
@@ -16,7 +14,17 @@ from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.quantization import (
+    DiffusionQuantizationConfig,
+    get_diffusion_quant_config,
+)
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.quantization import DiffusionQuantizationConfig
+
+# Import after TYPE_CHECKING to avoid circular imports at runtime
+# The actual import is deferred to __post_init__ to avoid import order issues
 
 logger = init_logger(__name__)
 
@@ -35,6 +43,9 @@ class DiffusionParallelConfig:
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
 
+    enable_expert_parallel: bool = False
+    """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
+
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
 
@@ -47,6 +58,18 @@ class DiffusionParallelConfig:
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
+    vae_patch_parallel_size: int = 1
+    """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
+    use_hsdp: bool = False
+    """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
+
+    hsdp_shard_size: int = -1
+    """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
+
+    hsdp_replicate_size: int = 1
+    """Number of replica groups for HSDP. Each replica holds a full sharded copy."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -57,16 +80,27 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.cfg_parallel_size in [1, 2, 3], (
+            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
+        )
+        assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
         )
+
+        # Validate HSDP configuration
+        if self.use_hsdp:
+            assert self.hsdp_replicate_size > 0, "HSDP replicate size must be > 0"
+            assert self.hsdp_shard_size > 0, "HSDP shard size must be > 0 (should be set in __post_init__)"
         return self
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
-        self.world_size = (
+
+        # Calculate world_size from other parallelism dimensions
+        other_parallel_world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
             * self.tensor_parallel_size
@@ -74,6 +108,52 @@ class DiffusionParallelConfig:
             * self.ring_degree
             * self.cfg_parallel_size
         )
+
+        # Handle HSDP configuration
+        # HSDP can work in two modes:
+        # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
+        # 2. Combined: HSDP overlays on top of other parallelism
+        if self.use_hsdp:
+            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
+                raise ValueError(
+                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
+                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
+                    f"data_parallel_size={self.data_parallel_size}). "
+                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
+                )
+            if self.hsdp_shard_size == -1:
+                # Auto-calculate: use other_parallel_world_size as shard_size
+                if self.hsdp_replicate_size <= 0:
+                    raise ValueError("hsdp_replicate_size must be > 0")
+                if other_parallel_world_size == 1:
+                    raise ValueError(
+                        "Cannot auto-calculate hsdp_shard_size when other parallelism is all 1. "
+                        "Please specify hsdp_shard_size explicitly for standalone HSDP."
+                    )
+                if other_parallel_world_size % self.hsdp_replicate_size != 0:
+                    raise ValueError(
+                        f"Invalid HSDP configuration: replicate_size ({self.hsdp_replicate_size}) "
+                        f"must evenly divide world_size ({other_parallel_world_size}) when shard_size is -1."
+                    )
+                self.hsdp_shard_size = other_parallel_world_size // self.hsdp_replicate_size
+                self.world_size = other_parallel_world_size
+            else:
+                # Explicit shard_size: HSDP can work standalone or combined
+                hsdp_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
+                if other_parallel_world_size == 1:
+                    # Standalone HSDP: world_size is determined by HSDP
+                    self.world_size = hsdp_world_size
+                else:
+                    # Combined: HSDP must match other parallelism world_size
+                    if hsdp_world_size != other_parallel_world_size:
+                        raise ValueError(
+                            f"HSDP dimensions "
+                            f"({self.hsdp_replicate_size} × {self.hsdp_shard_size} = {hsdp_world_size}) "
+                            f"must equal world_size from other parallelism ({other_parallel_world_size})"
+                        )
+                    self.world_size = other_parallel_world_size
+        else:
+            self.world_size = other_parallel_world_size
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DiffusionParallelConfig":
@@ -260,6 +340,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    enable_cache_dit_summary: bool = False
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -271,29 +352,26 @@ class OmniDiffusionConfig:
 
     num_gpus: int | None = None
 
-    hsdp_replicate_dim: int = 1
-    hsdp_shard_dim: int = -1
     dist_timeout: int | None = None  # timeout for torch.distributed
 
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
-    lora_nickname: str = "default"  # for swapping adapters in the pipeline
-    # can restrict layers to adapt, e.g. ["q_proj"]
-    # Will adapt only q, k, v, o by default.
-    lora_target_modules: list[str] | None = None
+    lora_scale: float = 1.0
+    max_cpu_loras: int | None = None
 
     output_type: str = "pil"
 
     # CPU offload parameters
-    dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
-    pin_cpu_memory: bool = True
+    # When enabled, DiT and encoders swap GPU access (mutual exclusion):
+    # - Text encoders run on GPU while DiT is on CPU
+    # - DiT runs on GPU while encoders are on CPU
+    enable_cpu_offload: bool = False
+    # Layer-wise offloading (block-level offloading) parameters
+    enable_layerwise_offload: bool = False
+
+    pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
@@ -305,7 +383,14 @@ class OmniDiffusionConfig:
     skip_time_steps: int = 15
 
     # Compilation
-    enable_torch_compile: bool = False
+    enforce_eager: bool = False
+
+    # Parallel weight loading (for faster diffusion model startup)
+    enable_multithread_weight_load: bool = True
+    num_weight_load_threads: int = 4
+
+    # Enable sleep mode
+    enable_sleep_mode: bool = False
 
     disable_autocast: bool = False
 
@@ -319,6 +404,15 @@ class OmniDiffusionConfig:
     # Master port for distributed inference
     # TODO: do not hard code
     master_port: int | None = None
+
+    # Worker extension class for custom functionality
+    worker_extension_cls: str | None = None
+
+    # Custom pipeline arguments for custom pipelines
+    custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion model loading format
+    diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
 
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
@@ -353,8 +447,29 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
-    # Logging
     log_level: str = "info"
+
+    # Omni configuration (injected from stage config)
+    omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
+    # Model-specific function for collecting CFG KV caches (set at runtime)
+    cfg_kv_collect_func: Any | None = None
+
+    # Quantization settings
+    # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
+    quantization: str | None = None
+    quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
+
+    @property
+    def is_moe(self) -> bool:
+        num_experts = self.tf_model_config.get("num_experts", None)
+        if isinstance(num_experts, int):
+            return num_experts > 1
+
+        if isinstance(num_experts, (list, tuple)):
+            return any(isinstance(n, int) and n > 1 for n in num_experts)
+
+        return False
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
@@ -442,67 +557,66 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        # Convert quantization config (deferred import to avoid circular imports)
+        if self.quantization is not None or self.quantization_config is not None:
+            from vllm_omni.diffusion.quantization import (
+                DiffusionQuantizationConfig,
+            )
+
+            # Handle dict or DictConfig (from OmegaConf) - use Mapping for broader compatibility
+            if isinstance(self.quantization_config, Mapping):
+                # Convert DictConfig to dict if needed (OmegaConf compatibility)
+                config_dict = dict(self.quantization_config)
+                # Use get() instead of pop() to avoid mutating original dict
+                quant_method = config_dict.get("method", self.quantization)
+                # Filter out "method" key for kwargs
+                quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
+
+                # Validate conflicting methods
+                if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
+                    logger.warning(
+                        f"Conflicting quantization methods: quantization={self.quantization!r}, "
+                        f"quantization_config['method']={quant_method!r}. Using quantization_config['method']."
+                    )
+
+                self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
+            elif self.quantization_config is None and self.quantization is not None:
+                self.quantization_config = get_diffusion_quant_config(self.quantization)
+            elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
+                raise TypeError(
+                    f"quantization_config must be a DiffusionQuantizationConfig, dict, or None, "
+                    f"got {type(self.quantization_config)!r}"
+                )
+
+        if self.max_cpu_loras is None:
+            self.max_cpu_loras = 1
+        elif self.max_cpu_loras < 1:
+            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        # Backwards-compatibility: older callers may use a diffusion-specific
+        # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale"
+        # before constructing the dataclass to avoid TypeError on unknown fields.
+        if "static_lora_scale" in kwargs:
+            if "lora_scale" not in kwargs:
+                kwargs["lora_scale"] = kwargs["static_lora_scale"]
+            kwargs.pop("static_lora_scale", None)
+
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
         if "cache_backend" not in kwargs:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-        return cls(**kwargs)
 
+        # Filter kwargs to only include valid fields
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
-_current_omni_diffusion_config: OmniDiffusionConfig | None = None
-_current_prefix: str | None = None
-
-
-@contextmanager
-def set_current_omni_diffusion_config(
-    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
-):
-    """
-    Temporarily set the current vLLM-Omni config.
-    Used during model initialization.
-    We save the current vLLM-Omni config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the vLLM-Omni config to determine how to dispatch.
-    """
-    global _current_omni_diffusion_config, _current_prefix
-    old_omni_diffusion_config = _current_omni_diffusion_config
-    old_prefix = _current_prefix
-    # from vllm.compilation.counter import compilation_counter
-
-    # num_models_seen = compilation_counter.num_models_seen
-    try:
-        _current_omni_diffusion_config = omni_diffusion_config
-        _current_prefix = prefix
-        yield
-    except Exception:
-        raise
-    else:
-        if check_compile:
-            raise RuntimeError("Compilation is not yet supported for OmniDiffusion")
-    finally:
-        _current_omni_diffusion_config = old_omni_diffusion_config
-        _current_prefix = old_prefix
-        # Clear the compilation config cache when context changes
-        get_cached_compilation_config.cache_clear()
-
-
-@lru_cache(maxsize=1)
-def get_cached_compilation_config():
-    """Cache config to avoid repeated calls to get_current_omni_diffusion_config()"""
-    return get_current_omni_diffusion_config().compilation_config
-
-
-def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
-    if _current_omni_diffusion_config is None:
-        logger.warning("Current OmniDiffusionConfig is not set.")
-        return OmniDiffusionConfig()
-    return _current_omni_diffusion_config
+        return cls(**filtered_kwargs)
 
 
 @dataclass
@@ -518,6 +632,10 @@ class DiffusionOutput:
     error: str | None = None
 
     post_process_func: Callable[..., Any] | None = None
+
+    # Extra custom output data (e.g. latent trajectories, prompt embeds)
+    # passed through to OmniRequestOutput.custom_output
+    custom_output: dict[str, Any] = field(default_factory=dict)
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None

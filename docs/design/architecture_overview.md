@@ -64,13 +64,13 @@ According to analysis for current popular open-source models, most of them have 
 
 ## Key Components
 
-| Component | Description |
-|-----------|-------------|
-| **OmniRouter** | provide an intelligent router for Omni-modality requests dispatch |
-| **EntryPoints** | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni) and provide the OmniStage abstraction for different AR/DiT stages |
-| **AR** | adapted for omni-modality models while inheriting efficient features from vLLM, such as cache management |
-| **Diffusion** | natively implemented and optimized using acceleration components |
-| **OmniConnector** | supports fully disaggregation based on E/P/D/G (Encoding/Processing/Decoding/Generation) disaggregation across stages |
+| Component         | Description                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **OmniRouter**    | provide an intelligent router for Omni-modality requests dispatch                                                                        |
+| **EntryPoints**   | define the APIs for offline/online serving (APIServer, Omni/AsyncOmni) and provide the OmniStage abstraction for different AR/DiT stages |
+| **AR**            | adapted for omni-modality models while inheriting efficient features from vLLM, such as cache management                                 |
+| **Diffusion**     | natively implemented and optimized using acceleration components                                                                         |
+| **OmniConnector** | supports fully disaggregation based on E/P/D/G (Encoding/Processing/Decoding/Generation) disaggregation across stages                    |
 
 Disaggregated stages are managed through configuration, such as in the Qwen3-Omni example, where stages like Thinker, Talker, and Code2wav are defined as separate OmniStage instances with specific resources and input/output type.
 
@@ -91,6 +91,13 @@ The framework achieves high performance through several optimization techniques:
     * **Attention:** Provides an interface for third-party integration (e.g., FA3, SAGE, MindIE-SD).
     * **Quantization:** Supports various quantization implementations including FP8 and AWQ.
     * **FusedOps:** Allows for custom and third-party integration.
+
+### Classifier-Free Guidance (CFG) Companion Flow
+
+vLLM-Omni natively models Classifier-Free Guidance (CFG) across disaggregated multi-stage setups via a "companion request" paradigm, eliminating redundant textual/multimodal context computation boundaries:
+1. **Prompt Expansion:** In the initial autoregressive (AR) stage, a customized `prompt_expand_func` hook intercepts incoming generation prompts and pairs them directly with negative companion prompts (e.g., a default negative prompt) on the fly, tagging the secondary prompt with a specific internal role (`cfg_text`).
+2. **Synchronized KV Cache Transfer:** The AR stage evaluates both the primary and companion sequence batches concurrently. The `OmniConnector` captures these specific structural dependencies and reliably passes the positive and negative outcome KV caches seamlessly across stage boundaries via shared memory or network protocols.
+3. **KV Cache Collection & Injection:** Upon reaching the downstream Diffusion (DiT) Engine, an assigned `cfg_kv_collect_func` automatically intercepts the mapped companion caches (`cfg_text_past_key_values`). These auxiliary dependencies are natively gathered and seamlessly bound to the primary generation sequence variables, enabling the DiT Engine to cleanly implement cross-attention CFG guidance over accurate conditioning and unconditioning structures in parallel.
 
 ### Flexibility and Usability
 
@@ -192,4 +199,4 @@ curl -sS -X POST http://localhost:8091/v1/chat/completions \
 }
 ```
 
-For more usages, please refer to [examples](../user_guide/examples/).
+For more usages, please refer to [examples](https://github.com/vllm-project/vllm-omni/tree/main/examples).

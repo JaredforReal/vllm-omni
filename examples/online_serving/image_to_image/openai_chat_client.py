@@ -76,6 +76,10 @@ def edit_image(
 
     # Build extra_body with generation parameters
     extra_body = {}
+    if height is not None:
+        extra_body["height"] = height
+    if width is not None:
+        extra_body["width"] = width
     if steps is not None:
         extra_body["num_inference_steps"] = steps
     if guidance_scale is not None:
@@ -127,7 +131,7 @@ def main():
     parser.add_argument("--width", type=int, default=1024, help="Output image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
     parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale")
-    parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
     args = parser.parse_args()

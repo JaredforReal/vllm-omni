@@ -1,13 +1,18 @@
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
+from tqdm import tqdm
 
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
 from vllm.entrypoints.llm import LLM
+from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
@@ -16,9 +21,10 @@ from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connec
 
 # Internal imports (our code)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.engine.input_processor import OmniInputProcessor, reinject_omni_fields
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
+    filter_dataclass_kwargs,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -78,7 +84,7 @@ class OmniLLM(LLM):
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
-        self._enable_stats: bool = bool(log_stats)
+        self.log_stats: bool = bool(log_stats)
 
         # Load stage configurations
         if stage_configs_path is None:
@@ -118,6 +124,9 @@ class OmniLLM(LLM):
                 )
                 raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
 
+        # Extract omni_kv_config from kwargs if present (injected by Omni)
+        omni_kv_config = kwargs.pop("omni_kv_config", None)
+
         if compilation_config is not None:
             if isinstance(compilation_config, int):
                 compilation_config_instance = CompilationConfig(level=compilation_config)
@@ -144,7 +153,8 @@ class OmniLLM(LLM):
             model=model,
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
-            **kwargs,
+            omni_kv_config=omni_kv_config,
+            **filter_dataclass_kwargs(OmniEngineArgs, kwargs),
         )
 
         # Create the Engine (autoselects V0 vs V1)
@@ -154,9 +164,7 @@ class OmniLLM(LLM):
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.input_processor = OmniInputProcessor(
-            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
-        )
+        self.llm_engine.input_processor = OmniInputProcessor(vllm_config=self.llm_engine.vllm_config)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -168,11 +176,49 @@ class OmniLLM(LLM):
 
         self.supported_tasks = supported_tasks
 
+        # Keep parity with vLLM's LLM initialization fields so inherited
+        # generate/chat preprocessing paths work as expected.
+        self.renderer = self.llm_engine.renderer
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
+
+        # Parity with upstream LLM for pooling/classify entrypoints
+        chat_template = kwargs.get("chat_template", None)
+        from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
+        from vllm.entrypoints.pooling.io_processor_factories import init_pooling_io_processors
+
+        self.chat_template = load_chat_template(chat_template)
+        self.chat_template_config = ChatTemplateConfig(chat_template=self.chat_template)
+        self.init_pooling_io_processors = init_pooling_io_processors(
+            supported_tasks=supported_tasks,
+            model_config=self.model_config,
+            renderer=self.renderer,
+            chat_template_config=self.chat_template_config,
+        )
+
+    # ------------------------------------------------------------------
+    # Override upstream _preprocess_cmpl so that omni-specific fields
+    # (additional_information, prompt_embeds, …) survive the renderer's
+    # process_for_engine step which only copies standard vLLM keys.
+    # ------------------------------------------------------------------
+
+    def _preprocess_cmpl(
+        self,
+        prompts: Sequence[PromptType],
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> Sequence[ProcessorInputs]:
+        renderer = self.renderer
+        model_config = self.model_config
+
+        parsed_prompts = [parse_model_prompt(model_config, prompt) for prompt in prompts]
+        tok_params = renderer.default_cmpl_tok_params.with_kwargs(**(tokenization_kwargs or {}))
+        results = renderer.render_cmpl(parsed_prompts, tok_params)
+
+        reinject_omni_fields(results, parsed_prompts)
+        return results
 
     def close(self) -> None:
         """Close resources.
@@ -190,3 +236,49 @@ class OmniLLM(LLM):
             self.close()
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
+
+    def _run_engine(
+        self, output_type=None, *, use_tqdm: bool | Callable[..., tqdm] = True
+    ) -> list[RequestOutput | PoolingRequestOutput]:
+        # Initialize tqdm.
+        if use_tqdm:
+            num_requests = self.llm_engine.get_num_unfinished_requests()
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(
+                total=num_requests,
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"),
+            )
+
+        # Run the engine.
+        outputs: list[RequestOutput | PoolingRequestOutput] = []
+        total_in_toks = 0
+        total_out_toks = 0
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                if output.finished:
+                    outputs.append(output)
+                    if use_tqdm:
+                        if isinstance(output, RequestOutput):
+                            # Calculate tokens only for RequestOutput
+                            n = len(output.outputs)
+                            assert output.prompt_token_ids is not None
+                            total_in_toks += len(output.prompt_token_ids) * n
+                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            total_out_toks += sum(len(stp.token_ids) for stp in output.outputs)
+                            out_spd = total_out_toks / pbar.format_dict["elapsed"]
+                            pbar.postfix = f"est. speed input: {in_spd:.2f} toks/s, output: {out_spd:.2f} toks/s"
+                            pbar.update(n)
+                        else:
+                            pbar.update(1)
+                        if pbar.n == num_requests:
+                            pbar.refresh()
+
+        if use_tqdm:
+            pbar.close()
+        # Sort the outputs by the int part of request ID which is in format of 'int-uuid'.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))

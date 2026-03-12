@@ -10,16 +10,16 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FA3, HAS_FLASH_ATTN
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
     # ParallelAttentionStrategy, # Not used in type hint below currently
 )
+from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
 # from vllm_omni.diffusion.attention.backends.ring_selector import AttnType # Already imported above
-from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -110,17 +110,20 @@ class RingParallelAttention:
         backend_pref = self.attn_backend_pref
         if backend_pref is None:
             try:
-                config = get_current_omni_diffusion_config()
+                config = get_forward_context().omni_diffusion_config
                 # config might not have attention_backend attribute if not updated
                 backend_pref = getattr(config, "attention_backend", None)
             except Exception:
                 backend_pref = None
 
-        # Fallback for FP32 or if Flash Attention is not available
-        if query.dtype == torch.float32 or not HAS_FLASH_ATTN:
-            if not HAS_FLASH_ATTN and backend_pref != "sdpa":
+        # Determine attention type with fallback chain: FA3 -> FA2 -> SDPA
+        # FP32 is not supported by Flash Attention, force SDPA
+        if query.dtype == torch.float32:
+            backend_pref = "sdpa"
+        elif not HAS_FA3 and not HAS_FLASH_ATTN:
+            if backend_pref != "sdpa":
                 logger = init_logger(__name__)
-                logger.warning("Flash Attention is not available! Force enabling SDPA.")
+                logger.warning_once("Flash Attention (FA2/FA3) is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
 
         # Extract joint tensors
@@ -150,6 +153,9 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
+        # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
+        attn_type = AttnType.FA3 if HAS_FA3 else AttnType.FA
+
         return ring_flash_attn_func(
             query,
             key,
@@ -161,9 +167,8 @@ class RingParallelAttention:
             softcap=0.0,
             alibi_slopes=None,
             deterministic=False,
-            # return_attn_probs=False, # Removed as it might not be supported in signature
             group=self._sp_group.ring_group,
-            attn_type=AttnType.FA,
+            attn_type=attn_type,
             joint_tensor_key=joint_key,
             joint_tensor_value=joint_value,
             joint_strategy=joint_strategy,

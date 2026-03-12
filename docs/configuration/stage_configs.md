@@ -40,7 +40,7 @@ stage_args:
     engine_args: # Engine arguments for a certain engine
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration # The model implementation registered in model_executor/models/registry.py
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker # The specific worker used
+      worker_type: ar # The specific worker used
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler # The specific scehduler used
       gpu_memory_utilization: 0.8 # The gpu memory allocation for the stage within a single chip
       enforce_eager: true  # Now we only support eager mode
@@ -66,7 +66,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true
@@ -92,7 +92,7 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true
@@ -134,6 +134,14 @@ Each stage in the `stage_args` list contains the following configuration options
 ### `stage_id`
 
 A unique identifier for each stage in the multi-stage pipeline. Stages are numbered sequentially starting from 0, and this ID is used to reference stages in inter-stage dependencies (e.g., `engine_input_source`).
+
+### `prompt_expand_func` (Optional)
+
+A custom Python function hook for the LLM stage (Stage 0) that expands a single incoming prompt object into multiple prompts. This is primarily used for multi-modal Classifier-Free Guidance (CFG), where it generates the necessary companion requests (like a negative text prompt) and tags them with internal roles (e.g., `cfg_text`). This ensures the upstream LLM generates the needed contextual hidden states for both the conditional and unconditional generations simultaneously.
+
+### `cfg_kv_collect_func` (Optional)
+
+A custom Python function hook for downstream diffusion stages (Stage 1+) to collect, map, and process the KV caches transferred from the companion requests fired by `prompt_expand_func`. It aggregates the hidden condition states cleanly (e.g., binding them as `cfg_text_past_key_values` and `cfg_text_kv_metadata`), allowing the diffusion runtime to perform CFG smoothly without redundantly evaluating text paths on the DiT workers.
 
 ### `runtime`
 
@@ -273,3 +281,15 @@ Default: `True`
 Penalty applied to tokens that have already appeared in the generated sequence. Values greater than 1.0 discourage repetition, while values less than 1.0 encourage it. A value of 1.0 applies no penalty.
 
 Default: `1.1`
+
+### `tts_args` (TTS stages only)
+
+Configuration for Text-to-Speech specific parameters. This section is only applicable to TTS model stages (e.g., `qwen3_tts`).
+
+#### `tts_args.max_instructions_length`
+
+Maximum character length for voice style/emotion instructions. Instructions exceeding this limit will be rejected with a validation error.
+
+Default: `500`
+
+This value can be overridden at runtime using the `--tts-max-instructions-length` CLI parameter when starting the server.

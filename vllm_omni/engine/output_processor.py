@@ -1,17 +1,18 @@
-from ast import Dict
-from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-from vllm.v1.engine.detokenizer import IncrementalDetokenizer
-from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
-from vllm.v1.engine.output_processor import OutputProcessorOutput, RequestOutputCollector, RequestState
+from vllm.v1.engine.output_processor import (
+    OutputProcessorOutput,
+    RequestOutputCollector,
+    RequestState,
+)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
@@ -34,67 +35,9 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Omni-specific: multimodal output accumulation
         self.mm_type: str | None = None
-        self.mm_accumulated: Dict[str, Any] | None = None
-
-    @classmethod
-    def from_new_request(
-        cls,
-        tokenizer: TokenizerLike,
-        request: EngineCoreRequest,
-        prompt: str | None,
-        parent_req: ParentRequest | None,
-        request_index: int,
-        queue: Any | None,
-        log_stats: bool,
-        stream_interval: int,
-    ) -> "OmniRequestState":
-        if sampling_params := request.sampling_params:
-            if not sampling_params.detokenize:
-                tokenizer = None
-            output_kind = sampling_params.output_kind
-            logprobs_processor = LogprobsProcessor.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
-            detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
-            max_tokens_param = sampling_params.max_tokens
-            top_p = sampling_params.top_p
-            n = sampling_params.n
-            temperature = sampling_params.temperature
-        else:
-            logprobs_processor = None
-            detokenizer = None
-            max_tokens_param = None
-            top_p = None
-            n = None
-            temperature = None
-            assert request.pooling_params is not None
-            output_kind = request.pooling_params.output_kind
-
-        return cls(
-            request_id=request.request_id,
-            parent_req=parent_req,
-            request_index=request_index,
-            lora_name=(request.lora_request.name if request.lora_request is not None else None),
-            output_kind=output_kind,
-            prompt=prompt,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt_embeds=request.prompt_embeds,
-            logprobs_processor=logprobs_processor,
-            detokenizer=detokenizer,
-            max_tokens_param=max_tokens_param,
-            top_p=top_p,
-            n=n,
-            temperature=temperature,
-            arrival_time=request.arrival_time,
-            queue=queue,
-            log_stats=log_stats,
-            stream_interval=stream_interval,
-        )
+        self.mm_accumulated: dict[str, Any] | None = None
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
@@ -113,12 +56,14 @@ class OmniRequestState(RequestState):
                 return x
 
             if isinstance(payload, dict):
-                incoming: Dict[str, Any] = {}
+                incoming: dict[str, Any] = {}
                 target_key = self.mm_type or "hidden"
 
-                # Iterate directly without unnecessary dict copy
                 for k, v in payload.items():
-                    # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
+                    # Normalize producer keys to the modality name.
+                    # AR runners produce {"hidden": ...} and generation
+                    # runners produce {"model_outputs": ...}; remap both
+                    # to the semantic modality key (e.g. "audio", "latent").
                     if k == "model_outputs":
                         k = target_key
                     elif k == "hidden" and target_key != "hidden":
@@ -172,9 +117,18 @@ class OmniRequestState(RequestState):
             for k, v in self.mm_accumulated.items():
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
-                        self.mm_accumulated[k] = torch.cat(v, dim=0)
+                        if k == "audio":
+                            # When the audio tensor shape is inconsistent, torch.cat will fail.
+                            # We need to use torch.cat in -1 dimension.
+                            continue
+                        elif k == "sr":
+                            # Sample rate is a constant scalar, keep last value.
+                            self.mm_accumulated[k] = v[-1]
+                        else:
+                            self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
                         # Keep last tensor on failure
+                        logger.warning(f"Error concatenating tensor for key {k}; keeping last tensor")
                         self.mm_accumulated[k] = v[-1]
                 elif isinstance(v, dict):
                     for sk, sv in v.items():
@@ -195,6 +149,7 @@ class OmniRequestState(RequestState):
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        routed_experts: np.ndarray | None = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -213,11 +168,26 @@ class OmniRequestState(RequestState):
             OmniRequestOutput or PoolingRequestOutput if output should be
             emitted (based on finish status and output kind), None otherwise
         """
+        # Pooling-only requests should follow base behavior.
+        if self.detokenizer is None and pooling_output is not None:
+            return super().make_request_output(
+                new_token_ids,
+                pooling_output,
+                finish_reason,
+                stop_reason,
+                kv_transfer_params,
+                routed_experts,
+            )
+
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
         if not finished and final_only:
             return None
+
+        # Consolidate accumulated tensors when finishing.
+        if finished:
+            self._consolidate_multimodal_tensors()
 
         if self.stream_interval > 1:
             assert self.detokenizer is not None
@@ -229,7 +199,7 @@ class OmniRequestState(RequestState):
             if not (
                 finished
                 or self.sent_tokens_offset == 0
-                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
+                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset >= self.stream_interval
             ):
                 return None
 
@@ -237,28 +207,30 @@ class OmniRequestState(RequestState):
                 # Send tokens from the offset in DELTA mode, otherwise all
                 # tokens are sent.
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
-                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
+                self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
-        request_id = self.request_id
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        external_req_id = self.external_req_id
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
         else:
-            request_id, outputs, finished = self.parent_req.get_outputs(request_id, output)
+            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
             if not outputs:
                 return None
+            external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(request_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
 
     def _new_completion_output(
         self,
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        routed_experts: np.ndarray | None = None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
         try:
             if self.mm_accumulated is not None:
                 # Attach accumulated multimodal dict on the completion output
@@ -276,22 +248,26 @@ class OmniRequestState(RequestState):
 
 
 class MultimodalOutputProcessor(VLLMOutputProcessor):
-    """Handles multimodal output processing by normalizing EngineCoreOutput
-    before delegating to the base vLLM OutputProcessor.
+    """Handles multimodal output processing by capturing pooling_output
+    from EngineCoreOutput and accumulating it as multimodal tensors,
+    before delegating to the base vLLM OutputProcessor for text handling.
 
-    Strategy:
-    - Route by EngineCoreOutput.output_type when present
-      ("image", "text+image", "latents", "text").
-    - Fallback to pooling/text heuristics when output_type is absent.
-    - Mutate EngineCoreOutput in-place to ensure vLLM's base processor can
-      produce the correct RequestOutput/PoolingRequestOutput.
-    - Allow custom per-modality handlers via register_handler().
+    The actual data flow is:
+    1. For each EngineCoreOutput with pooling_output and a detokenizer:
+       - Capture pooling_output into OmniRequestState.add_multimodal_tensor()
+       - Clear eco.pooling_output to force text path in base processor
+    2. Base vLLM OutputProcessor handles text detokenization
+    3. On finish, _consolidate_multimodal_tensors() concatenates accumulated tensors
+    4. _new_completion_output() attaches mm_accumulated to CompletionOutput
     """
 
     def __init__(
         self,
-        tokenizer: TokenizerLike,
+        tokenizer: TokenizerLike | None,
+        *,
         log_stats: bool,
+        stream_interval: int = 1,
+        tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
@@ -299,28 +275,18 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         Args:
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
+            stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type specification
-                (e.g., "image", "audio", "latents"). Used to route outputs
-                to appropriate processors. If None, output type is inferred.
+                (e.g., "image", "audio", "latent"). Used to tag multimodal
+                outputs with the correct modality key.
         """
-        super().__init__(tokenizer=tokenizer, log_stats=log_stats)
-        self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
-        self._reqid_to_mm_type: dict[str, str] = {}
-        self.request_states: dict[str, OmniRequestState] = {}
+        super().__init__(
+            tokenizer=tokenizer,
+            log_stats=log_stats,
+            stream_interval=stream_interval,
+            tracing_enabled=tracing_enabled,
+        )
         self.engine_core_output_type = engine_core_output_type
-
-    def register_handler(self, modality: str, handler: Callable[[EngineCoreOutput], None]) -> None:
-        """Register a custom handler for a specific modality.
-
-        Allows custom processing logic for specific output modalities.
-        The handler is called before default processing for outputs
-        matching the specified modality.
-
-        Args:
-            modality: Modality name (e.g., "image", "audio", "latents")
-            handler: Callable that takes an EngineCoreOutput and processes it
-        """
-        self.output_handlers[modality.lower()] = handler
 
     def add_request(
         self,
@@ -346,8 +312,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             ValueError: If the request ID is already registered
         """
         request_id = request.request_id
-        if request_id in self.request_states:
-            raise ValueError(f"Request id {request_id} already running.")
+        req_state = self.request_states.get(request_id)
+        if req_state is not None:
+            self._update_streaming_request_state(req_state, request, prompt)
+            return
 
         req_state = OmniRequestState.from_new_request(
             tokenizer=self.tokenizer,
@@ -362,6 +330,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
+        self.external_req_ids[req_state.external_req_id].append(request_id)
 
     def process_outputs(
         self,
@@ -369,221 +338,18 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
-        """Process engine core outputs into request outputs.
-
-        Converts EngineCoreOutput objects into RequestOutput objects,
-        handling multimodal outputs by routing them through appropriate
-        processors and accumulating tensors in request states.
-
-        Args:
-            engine_core_outputs: List of engine core outputs to process
-            engine_core_timestamp: Optional timestamp for the outputs
-            iteration_stats: Optional iteration statistics
-
-        Returns:
-            OutputProcessorOutput containing processed request outputs
-            and list of request IDs to abort
-        """
-        self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
-            mm_type = (self.engine_core_output_type or "").lower()
-            if mm_type:
-                self._reqid_to_mm_type[eco.request_id] = mm_type
-            self._route_and_normalize(eco)
-
-        # Build RequestOutputs without delegating to base, so we can keep ids
-        request_outputs: list[Any] = []
-        reqs_to_abort: list[str] = []
-        for eco in engine_core_outputs:
-            req_id = eco.request_id
-            req_state = self.request_states.get(req_id)
-            if req_state is None:
+            req_state = self.request_states.get(eco.request_id)
+            if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-
-            # 1) Stats
-            self._update_stats_from_output(req_state, eco, engine_core_timestamp, iteration_stats)
-
-            new_token_ids = eco.new_token_ids
-            pooling_output = eco.pooling_output
-            finish_reason = eco.finish_reason
-            stop_reason = eco.stop_reason
-            kv_transfer_params = eco.kv_transfer_params
-            req_state.num_cached_tokens = eco.num_cached_tokens
-            req_state.is_prefilling = False
-
-            # 2) Detokenize and logprobs when text path
-            assert req_state.detokenizer is not None
-            assert req_state.logprobs_processor is not None
-            stop_string = req_state.detokenizer.update(new_token_ids, finish_reason == FinishReason.STOP)
-            if stop_string:
-                finish_reason = FinishReason.STOP
-                stop_reason = stop_string
-            req_state.logprobs_processor.update_from_output(eco)
-
-            # 2.5) Accumulate multimodal tensors in RequestState
-            try:
+            if eco.pooling_output is not None and req_state.detokenizer is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
-                if pooling_output is not None and isinstance(req_state, OmniRequestState):
-                    req_state.add_multimodal_tensor(pooling_output, mm_type)
-            except Exception:
-                logger.debug(
-                    "Failed to accumulate multimodal tensor for request %s",
-                    req_id,
-                    exc_info=True,
-                )
+                req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                # Force text path in base processor for multimodal outputs.
+                eco.pooling_output = None
 
-            # 3) Create RequestOutput objects, forcing combined mode to keep ids
-            pooling_for_make = pooling_output
-            if pooling_output is not None and new_token_ids:
-                # Do not consume pooling path now; keep ids and attach mm later
-                pooling_for_make = None
-
-            # Consolidate any accumulated tensor lists before creating output
-            if isinstance(req_state, OmniRequestState) and finish_reason is not None:
-                req_state._consolidate_multimodal_tensors()
-
-            ro = req_state.make_request_output(
-                new_token_ids,
-                pooling_for_make,
-                finish_reason,
-                stop_reason,
-                kv_transfer_params,
-            )
-            if ro:
-                # Attach accumulated multimodal payload if any
-                try:
-                    if isinstance(req_state, OmniRequestState) and req_state.mm_accumulated is not None:
-                        if not hasattr(ro, "multimodal_output"):
-                            setattr(ro, "multimodal_output", {})
-                        ro.multimodal_output = req_state.mm_accumulated
-                except Exception:
-                    logger.exception("Error attaching multimodal payload in process_outputs")
-                if req_state.queue is not None:
-                    req_state.queue.put(ro)
-                else:
-                    request_outputs.append(ro)
-
-            # 4) Free completed
-            if finish_reason is not None:
-                self.request_states.pop(req_id)
-                parent_req = req_state.parent_req
-                if parent_req and not parent_req.child_requests:
-                    self.parent_requests.pop(parent_req.request_id, None)
-                if not self.request_states:
-                    self._requests_drained.set()
-                if not eco.finished:
-                    reqs_to_abort.append(req_id)
-                self._update_stats_from_finished(req_state, finish_reason, iteration_stats)
-                if self.tracer:
-                    self.do_tracing(eco, req_state, iteration_stats)
-                # Cleanup per-request mm state
-                if isinstance(req_state, OmniRequestState):
-                    req_state.mm_accumulated = None
-                    req_state.mm_type = None
-
-        return OutputProcessorOutput(
-            request_outputs=request_outputs,
-            reqs_to_abort=reqs_to_abort,
+        return super().process_outputs(
+            engine_core_outputs,
+            engine_core_timestamp=engine_core_timestamp,
+            iteration_stats=iteration_stats,
         )
-
-    # ---- routing helpers ----
-    def _route_and_normalize(self, eco: EngineCoreOutput) -> None:
-        output_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
-
-        # Custom handler first (if registered)
-        if output_type in self.output_handlers:
-            try:
-                self.output_handlers[output_type](eco)
-                # Fall through to default fixups in case the handler left gaps
-            except Exception:
-                logger.exception("Error in custom output handler for %s", output_type)
-
-        if output_type == "image":
-            self._process_image_output(eco)
-        elif output_type in ("text+image", "text,image", "image+text"):
-            self._process_text_image_output(eco)
-        elif output_type in ("latents", "latent"):
-            self._process_latents_output(eco)
-        elif output_type in ("audio", "speech"):
-            self._process_audio_output(eco)
-        elif output_type == "text":
-            self._process_text_output(eco)
-        else:
-            # Fallback heuristic
-            if eco.pooling_output is not None:
-                self._process_pooling_output(eco)
-            else:
-                self._process_text_output(eco)
-
-    # ---- modality processors ----
-    def _process_image_output(self, eco: EngineCoreOutput) -> None:
-        """Ensure image tensors are surfaced via pooling_output for vLLM."""
-        if eco.pooling_output is None:
-            tensor = self._extract_from_multimodal_outputs(eco, keys=("image", "images", "pixel_values", "pixels"))
-            if tensor is not None:
-                eco.pooling_output = tensor
-
-    def _process_text_image_output(self, eco: EngineCoreOutput) -> None:
-        """Allow text+image outputs. Text path stays as new_token_ids;
-        image/latents route via pooling_output."""
-        # Preserve text tokens as-is; ensure pooling_output carries image/latents
-        if eco.pooling_output is None:
-            tensor = self._extract_from_multimodal_outputs(
-                eco,
-                keys=(
-                    "image",
-                    "images",
-                    "pixel_values",
-                    "pixels",
-                    "latent",
-                    "latents",
-                    "z",
-                ),
-            )
-            if tensor is not None:
-                eco.pooling_output = tensor
-
-    def _process_latents_output(self, eco: EngineCoreOutput) -> None:
-        """Ensure latent tensors are surfaced via pooling_output."""
-        if eco.pooling_output is None:
-            tensor = self._extract_from_multimodal_outputs(eco, keys=("latent", "latents", "z", "posterior"))
-            if tensor is not None:
-                eco.pooling_output = tensor
-
-    def _process_audio_output(self, eco: EngineCoreOutput) -> None:
-        """Ensure audio tensors are surfaced via pooling_output."""
-        if eco.pooling_output is None:
-            tensor = self._extract_from_multimodal_outputs(
-                eco, keys=("audio", "audios", "wav", "waveform", "audio_pcm", "pcm")
-            )
-            if tensor is not None:
-                eco.pooling_output = tensor
-
-    def _process_text_output(self, eco: EngineCoreOutput) -> None:
-        """No-op; base processor will detokenize new_token_ids → text."""
-        return
-
-    def _process_pooling_output(self, eco: EngineCoreOutput) -> None:
-        """Optional sanity checks for pooling tensor."""
-        if eco.pooling_output is None:
-            return
-        if not isinstance(eco.pooling_output, torch.Tensor):
-            # Best-effort: convert to tensor if it's a list/ndarray-like
-            try:
-                eco.pooling_output = torch.as_tensor(eco.pooling_output)
-            except Exception:
-                pass
-
-    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> torch.Tensor | None:
-        mm = getattr(eco, "multimodal_outputs", None)
-        if not isinstance(mm, dict):
-            return None
-        for k in keys:
-            v = mm.get(k)
-            if isinstance(v, torch.Tensor):
-                return v
-        # Try the first tensor in the dict as a fallback
-        for v in mm.values():
-            if isinstance(v, torch.Tensor):
-                return v
-        return None

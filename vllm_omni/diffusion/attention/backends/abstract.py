@@ -7,11 +7,17 @@ from typing import Generic, TypeVar
 
 import torch
 
+from vllm_omni.platforms import current_omni_platform
+
 
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
+
+    @classmethod
+    def supports_attention_mask(cls) -> bool:
+        return False
 
     @staticmethod
     @abstractmethod
@@ -48,6 +54,8 @@ class AttentionBackend(ABC):
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
+    joint_attn_mask: torch.Tensor | None = None
+    # a joint mask for the joint query, key, and value, depends the joint_strategy
     joint_query: torch.Tensor | None = None
     # a replicated tensor among processes appended to the front or rear of query, depends the joint_strategy
     joint_key: torch.Tensor | None = None
@@ -75,12 +83,58 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> None:
         raise NotImplementedError
 
-    @abstractmethod
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: T,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        """Dispatch to platform-specific forward implementation."""
+        if current_omni_platform.is_rocm():
+            return self.forward_hip(query, key, value, attn_metadata)
+        elif current_omni_platform.is_cuda():
+            return self.forward_cuda(query, key, value, attn_metadata)
+        elif current_omni_platform.is_npu():
+            return self.forward_npu(query, key, value, attn_metadata)
+        elif current_omni_platform.is_xpu():
+            return self.forward_xpu(query, key, value, attn_metadata)
+        else:
+            raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def forward_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward_hip(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None = None,
+    ) -> torch.Tensor:
+        # By default, HIP ops are compatible with CUDA ops.
+        return self.forward_cuda(query, key, value, attn_metadata)

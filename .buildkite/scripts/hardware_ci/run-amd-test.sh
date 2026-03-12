@@ -66,6 +66,14 @@ done
 echo "--- Pulling container"
 image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
+
+# Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
+sudo apt-get update && sudo apt-get install -y awscli
+# Use safe docker login helper to prevent race conditions
+source "$(dirname "${BASH_SOURCE[0]}")/../docker_login_ecr_public.sh"
+safe_docker_login_ecr_public
+# Pull the container from ECR Public Gallery
+
 docker pull "${image_name}"
 
 remove_docker_container() {
@@ -108,6 +116,9 @@ if [[ $commands == *"--shard-id="* ]]; then
         --shm-size=16gb \
         --group-add "$render_gid" \
         --rm \
+        -e MIOPEN_DEBUG_CONV_DIRECT=0 \
+        -e MIOPEN_DEBUG_CONV_GEMM=0 \
+        -e VLLM_ROCM_USE_AITER=1 \
         -e HIP_VISIBLE_DEVICES="${GPU}" \
         -e HF_TOKEN \
         -e AWS_ACCESS_KEY_ID \
@@ -140,6 +151,9 @@ else
           --shm-size=16gb \
           --group-add "$render_gid" \
           --rm \
+          -e MIOPEN_DEBUG_CONV_DIRECT=0 \
+          -e MIOPEN_DEBUG_CONV_GEMM=0 \
+          -e VLLM_ROCM_USE_AITER=1 \
           -e HF_TOKEN \
           -e AWS_ACCESS_KEY_ID \
           -e AWS_SECRET_ACCESS_KEY \

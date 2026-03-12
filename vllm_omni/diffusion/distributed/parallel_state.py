@@ -35,20 +35,15 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
 )
-
-if envs._is_npu():
-    from torch.npu import device_count, set_device
-elif envs._is_musa():
-    from torch_musa.core.device import device_count, set_device
-else:
-    from torch.cuda import device_count, set_device
-
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 
@@ -58,13 +53,13 @@ logger = init_logger(__name__)
 
 
 _WORLD: GroupCoordinator | None = None
-# get _TP from vllm.distributed.parallel_state
+# get _TP&_EP from vllm.distributed.parallel_state
 _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
-_VAE: GroupCoordinator | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -183,7 +178,8 @@ class RankGenerator:
         pp: int,
         cfg: int,
         dp: int,
-        order: str,
+        fs: int = 1,
+        order: str = "tp-sp-pp-cfg-dp",
         rank_offset: int = 0,
     ) -> None:
         self.tp = tp
@@ -191,8 +187,10 @@ class RankGenerator:
         self.pp = pp
         self.cfg = cfg
         self.dp = dp
+        self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
+        self.ep = tp * sp * cfg * dp  # EP level exclude PP
 
         self.name_to_size = {
             "tp": self.tp,
@@ -200,14 +198,19 @@ class RankGenerator:
             "pp": self.pp,
             "cfg": self.cfg,
             "dp": self.dp,
+            "fs": self.fs,
         }
         order = order.lower()
 
         for name in self.name_to_size.keys():
+            # Skip 'fs' validation - it's handled separately with independent_ranks=True
+            # and doesn't participate in the main orthogonal rank generation
+            if name == "fs":
+                continue
             if name not in order and self.name_to_size[name] != 1:
                 raise RuntimeError(
                     f"The size of ({name}) is ({self.name_to_size[name]}), "
-                    f"but you haven't specified the order ({self.order})."
+                    f"but you haven't specified the order ({order})."
                 )
             elif name not in order:
                 order = order + "-" + name
@@ -226,7 +229,7 @@ class RankGenerator:
             mask[ordered_token.index(t)] = True
         return mask
 
-    def get_ranks(self, token):
+    def get_ranks(self, token, independent_ranks: bool = False):
         """Get rank group by input token.
 
         Arguments:
@@ -235,7 +238,30 @@ class RankGenerator:
                 to obtain multiple parallel types, we can use a hyphen
                 '-' to separate them. For example, if we want to obtain
                 the TP_DP group, the token should be 'tp-dp'.
+            independent_ranks (bool):
+                If True, generate independent rank groups that divide the world
+                into groups of the specified size. Used for FS (fully shard) groups
+                which operate independently from the main parallelism hierarchy.
         """
+        if independent_ranks and token == "fs":
+            # FS groups divide world into groups of size fs
+            # e.g., world_size=8, fs=4 -> [[0,1,2,3], [4,5,6,7]]
+            ranks = []
+            num_groups = self.world_size // self.fs
+            for i in range(num_groups):
+                group = list(range(i * self.fs + self.rank_offset, (i + 1) * self.fs + self.rank_offset))
+                ranks.append(group)
+            return ranks
+
+        if token == "ep":
+            ranks = []
+            num_pp_stages = self.pp
+            for i in range(num_pp_stages):
+                start = i * self.ep + self.rank_offset
+                end = start + self.ep
+                ranks.append(list(range(start, end)))
+            return ranks
+
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
@@ -341,6 +367,22 @@ def get_data_parallel_rank():
     return get_dp_group().rank_in_group
 
 
+# FS (Fully Shard / HSDP shard dimension)
+def get_fs_group() -> GroupCoordinator:
+    assert _FS is not None, "fully shard group is not initialized"
+    return _FS
+
+
+def get_fully_shard_world_size():
+    """Return world size for the fully shard group."""
+    return get_fs_group().world_size
+
+
+def get_fully_shard_rank():
+    """Return my rank for the fully shard group."""
+    return get_fs_group().rank_in_group
+
+
 def is_dp_last_group():
     """Return True if in the last data parallel group, False otherwise."""
     return (
@@ -351,7 +393,7 @@ def is_dp_last_group():
 
 
 def get_dit_world_size():
-    """Return world size for the DiT model (excluding VAE)."""
+    """Return world size for the DiT model."""
     return (
         get_data_parallel_world_size()
         * get_classifier_free_guidance_world_size()
@@ -359,22 +401,6 @@ def get_dit_world_size():
         * get_pipeline_parallel_world_size()
         * get_tensor_model_parallel_world_size()
     )
-
-
-# Add VAE getter functions
-def get_vae_parallel_group() -> GroupCoordinator:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
-
-
-def get_vae_parallel_world_size():
-    """Return world size for the VAE parallel group."""
-    return get_vae_parallel_group().world_size
-
-
-def get_vae_parallel_rank():
-    """Return my rank for the VAE parallel group."""
-    return get_vae_parallel_group().rank_in_group
 
 
 # * SET
@@ -396,7 +422,7 @@ def init_distributed_environment(
     backend: str | None = None,
 ):
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = current_omni_platform.dist_backend
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
@@ -416,7 +442,8 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
         )
-        set_device(torch.distributed.get_rank() % device_count())
+        device_id = torch.distributed.get_rank() % current_omni_platform.get_device_count()
+        current_omni_platform.set_device(current_omni_platform.get_torch_device(device_id))
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -459,8 +486,10 @@ def init_model_parallel_group(
         "data",
         "pipeline",
         "tensor",
+        "expert",
         "sequence",
         "classifier_free_guidance",
+        "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -496,23 +525,51 @@ def get_dit_group():
     return _DIT
 
 
-def init_vae_group(
-    dit_parallel_size: int,
-    vae_parallel_size: int,
-    backend: str,
-):
-    # Initialize VAE group first
-    global _VAE
-    assert _VAE is None, "VAE parallel group is already initialized"
-    vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
-
-
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
-def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use_ulysses_low=True):
+def set_seq_parallel_pg(
+    sp_ulysses_degree: int,
+    sp_ring_degree: int,
+    rank: int,
+    world_size: int,
+    use_ulysses_low: bool = True,
+    sp_group_ranks: list[list[int]] | None = None,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """
-    sp_ulysses_degree x sp_ring_degree = seq_parallel_size
-    (ulysses_degree, dp_size)
+    Initialize sequence-parallel Ulysses and Ring process groups.
+
+    This builds sequence-parallel (SP) subgroups inside each data-parallel (DP)
+    slice. The SP group size is sp_ulysses_degree * sp_ring_degree, and
+    world_size must be divisible by that size.
+
+    Args:
+        sp_ulysses_degree: Size of each Ulysses subgroup.
+        sp_ring_degree: Size of each Ring subgroup.
+        rank: Global rank of the current process.
+        world_size: Total number of processes.
+        use_ulysses_low: If True, Ulysses groups are contiguous chunks and Ring
+            groups are strided within each SP group. If False, the opposite.
+        sp_group_ranks: Optional explicit SP groups. Each entry must be a list
+            of length sp_ulysses_degree * sp_ring_degree. When provided, groups
+            are built from these ranks instead of auto-generated contiguous
+            ranges.
+
+    Returns:
+        ulyssess_pg (torch.distributed.ProcessGroup): The Ulysses process group
+            for this rank.
+        ring_pg (torch.distributed.ProcessGroup): The Ring process group for
+            this rank.
+
+    Raises:
+        ValueError: If sp_group_ranks length does not match world_size or any
+            entry has the wrong size.
+        AssertionError: If world_size is not divisible by sp_size.
+
+    Behavior:
+        - If sp_group_ranks is provided, groups are built per entry and each
+          entry is further split into Ulysses/Ring groups according to
+          use_ulysses_low.
+        - If sp_group_ranks is None, groups are auto-generated within each DP
+          slice using offsets of size sp_size.
     """
     sp_size = sp_ring_degree * sp_ulysses_degree
     dp_size = world_size // sp_size
@@ -522,40 +579,96 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
     num_ulysses_pgs = sp_ring_degree  # world_size // sp_ulysses_degree
     num_ring_pgs = sp_ulysses_degree  # world_size // sp_ring_degree
 
-    if use_ulysses_low:
-        for dp_rank in range(dp_size):
-            offset = dp_rank * sp_size
-            for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(
-                    range(
-                        i * sp_ulysses_degree + offset,
-                        (i + 1) * sp_ulysses_degree + offset,
-                    )
-                )
-                group = torch.distributed.new_group(ulysses_ranks)
-                if rank in ulysses_ranks:
-                    ulyssess_pg = group
-
-            for i in range(num_ring_pgs):
-                ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
-                group = torch.distributed.new_group(ring_ranks)
-                if rank in ring_ranks:
-                    ring_pg = group
-
+    if sp_group_ranks is not None:
+        if len(sp_group_ranks) * sp_size != world_size:
+            raise ValueError(
+                f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}, "
+                f"but got {len(sp_group_ranks)} groups."
+            )
+        logger.info(
+            "Building SP subgroups from explicit sp_group_ranks "
+            f"(sp_size={sp_size}, ulysses={sp_ulysses_degree}, ring={sp_ring_degree}, "
+            f"use_ulysses_low={use_ulysses_low})."
+        )
+        local_sp_group = None
+        local_ulysses = None
+        local_ring = None
+        for group_ranks in sp_group_ranks:
+            if len(group_ranks) != sp_size:
+                raise ValueError(f"Invalid sp_group_ranks entry: expected size {sp_size}, got {len(group_ranks)}.")
+            if rank in group_ranks:
+                local_sp_group = list(group_ranks)
+            if use_ulysses_low:
+                # Ulysses groups are contiguous chunks; Ring groups are strided.
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
+                        local_ulysses = list(ulysses_ranks)
+                for i in range(num_ring_pgs):
+                    ring_ranks = group_ranks[i::num_ring_pgs]
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+                        local_ring = list(ring_ranks)
+            else:
+                # Ring groups are contiguous chunks; Ulysses groups are strided.
+                for i in range(num_ring_pgs):
+                    ring_ranks = group_ranks[i * sp_ring_degree : (i + 1) * sp_ring_degree]
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+                        local_ring = list(ring_ranks)
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = group_ranks[i::num_ulysses_pgs]
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
+                        local_ulysses = list(ulysses_ranks)
+        if local_sp_group is not None:
+            logger.info(
+                "SP group details for rank %d: sp_group=%s, ulysses_group=%s, ring_group=%s",
+                rank,
+                local_sp_group,
+                local_ulysses,
+                local_ring,
+            )
     else:
-        for dp_rank in range(dp_size):
-            offset = dp_rank * sp_size
-            for i in range(num_ring_pgs):
-                ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
-                group = torch.distributed.new_group(ring_ranks)
-                if rank in ring_ranks:
-                    ring_pg = group
+        if use_ulysses_low:
+            for dp_rank in range(dp_size):
+                offset = dp_rank * sp_size
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = list(
+                        range(
+                            i * sp_ulysses_degree + offset,
+                            (i + 1) * sp_ulysses_degree + offset,
+                        )
+                    )
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
 
-            for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
-                group = torch.distributed.new_group(ulysses_ranks)
-                if rank in ulysses_ranks:
-                    ulyssess_pg = group
+                for i in range(num_ring_pgs):
+                    ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+
+        else:
+            for dp_rank in range(dp_size):
+                offset = dp_rank * sp_size
+                for i in range(num_ring_pgs):
+                    ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
 
     return ulyssess_pg, ring_pg
 
@@ -568,11 +681,13 @@ def initialize_model_parallel(
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
-    vae_parallel_size: int = 0,
+    fully_shard_degree: int = 1,
+    hsdp_replicate_size: int = 1,
+    enable_expert_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = current_omni_platform.dist_backend
     """
     Initialize model parallel groups.
 
@@ -585,6 +700,7 @@ def initialize_model_parallel(
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
+        fully_shard_degree: number of GPUs used for fully sharded data parallelism (HSDP shard dimension).
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
@@ -632,12 +748,20 @@ def initialize_model_parallel(
 
     # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
     # the pipefusion is not ready for npu yet
-    if envs._is_npu():
+    if current_omni_platform.is_npu():
         assert pipeline_parallel_size == 1, "Current pipefusion is not ready for NPU"
 
     dit_parallel_size = (
         data_parallel_size * cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     )
+
+    # Check for standalone HSDP: all non-HSDP parallelism dimensions are 1
+    is_standalone_hsdp = dit_parallel_size == 1 and fully_shard_degree > 1
+
+    # For standalone HSDP: use (fully_shard_degree * hsdp_replicate_size) as dit_parallel_size
+    # This ensures orthogonal rank generation works correctly for all HSDP workers
+    if is_standalone_hsdp:
+        dit_parallel_size = fully_shard_degree * hsdp_replicate_size
 
     if world_size < dit_parallel_size:
         raise RuntimeError(
@@ -650,14 +774,20 @@ def initialize_model_parallel(
             f"data_parallel_size ({data_parallel_size})"
         )
 
+    # For standalone HSDP, use (fully_shard_degree * hsdp_replicate_size) as data_parallel_size
+    # so that RankGenerator.world_size matches the actual number of workers
+    effective_dp_size = (fully_shard_degree * hsdp_replicate_size) if is_standalone_hsdp else data_parallel_size
+
     rank_generator: RankGenerator = RankGenerator(
         tensor_parallel_size,
         sequence_parallel_size,
         pipeline_parallel_size,
         cfg_parallel_size,
-        data_parallel_size,
-        "tp-sp-pp-cfg-dp",
+        effective_dp_size,
+        fs=fully_shard_degree,
+        order="tp-sp-pp-cfg-dp",
     )
+    sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(
@@ -666,6 +796,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
     )
+    vllm_parallel_state._DP = _DP
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -683,6 +814,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="pipeline",
     )
+    vllm_parallel_state._PP = _PP
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
@@ -691,9 +823,10 @@ def initialize_model_parallel(
         sp_ring_degree=ring_degree,
         rank=get_world_group().rank_in_group,
         world_size=dit_parallel_size,
+        sp_group_ranks=sp_group_ranks,
     )
     _SP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("sp"),
+        group_ranks=sp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="sequence",
@@ -708,8 +841,28 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
-    if vae_parallel_size > 0:
-        init_vae_group(dit_parallel_size, vae_parallel_size, backend)
+
+    global _FS
+    assert _FS is None, "fully shard group is already initialized"
+    _FS = init_model_parallel_group(
+        group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="fully_shard",
+    )
+
+    if enable_expert_parallel:
+        od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
+        if od_config and od_config.is_moe:
+            vllm_parallel_state._EP = init_model_parallel_group(
+                group_ranks=rank_generator.get_ranks("ep"),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="expert",
+            )
+        else:
+            raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
+
     init_dit_group(dit_parallel_size, backend)
 
 
@@ -734,15 +887,19 @@ def destroy_model_parallel():
         vllm_parallel_state._TP.destroy()
     vllm_parallel_state._TP = None
 
+    if vllm_parallel_state._EP:
+        vllm_parallel_state._EP.destroy()
+    vllm_parallel_state._EP = None
+
     global _PP
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _VAE
-    if _VAE:
-        _VAE.destroy()
-    _VAE = None
+    global _FS
+    if _FS:
+        _FS.destroy()
+    _FS = None
 
 
 def destroy_distributed_environment():

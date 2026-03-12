@@ -12,6 +12,9 @@ For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPl
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 ```
 
+!!! note
+    If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
+
 ### Multi-Image Edit (Qwen-Image-Edit-2509)
 
 ```bash
@@ -43,24 +46,27 @@ bash run_curl_image_edit.sh input.png "Convert this image to watercolor style"
 
 # Or execute directly
 IMG_B64=$(base64 -w0 input.png)
-curl -s http://localhost:8092/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"messages\": [{
-      \"role\": \"user\",
-      \"content\": [
-        {\"type\": \"text\", \"text\": \"Convert this image to watercolor style\"},
-        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,\$IMG_B64\"}}
-      ]
-    }],
-    \"extra_body\": {
-      \"height\": 1024,
-      \"width\": 1024,
-      \"num_inference_steps\": 50,
-      \"guidance_scale\": 7.5,
-      \"seed\": 42
-    }
-  }" | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
+
+cat <<EOF > request.json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Convert this image to watercolor style"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,$IMG_B64"}}
+    ]
+  }],
+  "extra_body": {
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "guidance_scale": 1,
+    "seed": 42
+  }
+}
+EOF
+
+curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: application/json"   -d @request.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
 
 ### Method 2: Using Python Client

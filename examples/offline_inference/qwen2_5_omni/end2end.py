@@ -6,6 +6,7 @@ with the correct prompt format on Qwen2.5-Omni
 """
 
 import os
+import time
 from typing import NamedTuple
 
 import librosa
@@ -277,9 +278,9 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
 
 
 query_map = {
-    "mixed_modalities": get_mixed_modalities_query,
+    "use_mixed_modalities": get_mixed_modalities_query,
     "use_audio_in_video": get_use_audio_in_video_query,
-    "multi_audios": get_multi_audios_query,
+    "use_multi_audios": get_multi_audios_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
     "use_audio": get_audio_query,
@@ -321,7 +322,7 @@ def main(args):
         query_result = query_func()
     omni_llm = Omni(
         model=model_name,
-        log_stats=args.enable_stats,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
@@ -376,11 +377,17 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    omni_generator = omni_llm.generate(prompts, sampling_params_list)
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    if profiler_enabled:
+        omni_llm.start_profile(stages=[0])
+    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
+
+    total_requests = len(prompts)
+    processed_count = 0
     for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
@@ -403,10 +410,22 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+
+        processed_count += len(stage_outputs.request_output)
+        if profiler_enabled and processed_count >= total_requests:
+            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            # Stop the profiler while workers are still alive
+            omni_llm.stop_profile()
+
+            print("[Info] Waiting 30s for workers to write massive trace files to disk...")
+            time.sleep(30)
+            print("[Info] Trace export wait finished.")
+
+    omni_llm.close()
 
 
 def parse_args():
@@ -415,12 +434,12 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="mixed_modalities",
+        default="use_mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )
     parser.add_argument(
-        "--enable-stats",
+        "--log-stats",
         action="store_true",
         default=False,
         help="Enable writing detailed statistics (default: disabled)",
@@ -513,6 +532,12 @@ def parse_args():
         type=str,
         default=None,
         help="Modalities to use for the prompts.",
+    )
+    parser.add_argument(
+        "--py-generator",
+        action="store_true",
+        default=False,
+        help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     return parser.parse_args()
 

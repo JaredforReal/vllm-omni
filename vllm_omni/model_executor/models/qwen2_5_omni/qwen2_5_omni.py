@@ -17,11 +17,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.models.vision import (
+    get_llm_pos_ids_for_vision,
+)
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -34,9 +35,12 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+    Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
-from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -101,6 +105,13 @@ class Qwen2_5OmniForConditionalGeneration(
             self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.token2wav = None
+            # set suppress start id according to token2wav
+            t2w_token_end_id = getattr(
+                getattr(getattr(config, "token2wav_config", None), "dit_config", None), "num_embeds", None
+            )
+            if t2w_token_end_id:
+                self.model.set_suppress_start_id(t2w_token_end_id + 1)
+            self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
             self.thinker = None
@@ -119,6 +130,7 @@ class Qwen2_5OmniForConditionalGeneration(
             self._token2wav_conds: dict[str, torch.Tensor] = {}
             self._token2wav_ref_mels: dict[str, torch.Tensor] = {}
             self.model = self.token2wav
+            self.requires_raw_input_tokens = True
         else:
             raise ValueError("Invalid model stage")
 
@@ -239,17 +251,30 @@ class Qwen2_5OmniForConditionalGeneration(
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
 
-            if is_npu():
+            if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
-                thinker_positions = positions[0] if positions.ndim > 1 else positions
+                # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+                if positions.ndim == 2 and positions.shape[0] == 3:
+                    thinker_positions = positions  # MRoPE positions, keep as is
+                else:
+                    thinker_positions = positions[0] if positions.ndim > 1 else positions
                 thinker_inputs_embeds = (
                     inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
                 )
             else:
-                thinker_input_ids = input_ids
-                thinker_positions = positions[0]
-                thinker_inputs_embeds = inputs_embeds
+                # Squeeze back if we added batch dim earlier
+                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+                if positions.ndim == 2 and positions.shape[0] == 3:
+                    thinker_positions = positions  # MRoPE positions, keep as is
+                elif added_batch_dim:
+                    thinker_positions = positions[0]
+                else:
+                    thinker_positions = positions
+                thinker_inputs_embeds = (
+                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                )
 
             # Run thinker
             thinker_output = self.thinker(
@@ -282,10 +307,16 @@ class Qwen2_5OmniForConditionalGeneration(
             if not hasattr(self, "voice_type"):
                 self.voice_type = voice_type
 
+            # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+            if positions.ndim == 2 and positions.shape[0] == 3:
+                talker_positions = positions  # MRoPE positions, keep as is
+            else:
+                talker_positions = positions[0]
+
             with torch.inference_mode():
                 talker_hidden = self.talker(
                     input_ids=input_ids,
-                    positions=positions[0],
+                    positions=talker_positions,
                     inputs_embeds=inputs_embeds,
                 )
 
@@ -597,7 +628,7 @@ class Qwen2_5OmniForConditionalGeneration(
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
-        if voice_type not in self.embed_text_spk_tokens:
+        if not hasattr(self, "embed_text_spk_tokens") or voice_type not in self.embed_text_spk_tokens:
             return self.embed_text_bos_token
         return self.embed_text_spk_tokens[voice_type]
 
@@ -765,7 +796,7 @@ class Qwen2_5OmniForConditionalGeneration(
         )  # for decode
         return output_token_ids, processed_output_token_embeds
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states

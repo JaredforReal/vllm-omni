@@ -41,7 +41,7 @@ class SinusoidsPositionEmbedding(nn.Module):
         return self.positional_embedding[:seqlen, :]
 
 
-class FunAudioChatAudioAttention(nn.Module):
+class FunAudioChatAudioEncoderAttention(nn.Module):
     """Multi-headed attention for audio encoder.
 
     This implements attention similar to Whisper's audio encoder attention.
@@ -81,37 +81,55 @@ class FunAudioChatAudioAttention(nn.Module):
         Args:
             hidden_states: [total_seq_len, embed_dim] - packed sequence
             cu_seqlens: Cumulative sequence lengths for variable-length batching
-            attention_mask: Optional attention mask
+            attention_mask: Block-diagonal float mask for SDPA fallback
         """
-        seq_length, _ = hidden_states.size()
+        seq_length = hidden_states.shape[0]
+        dropout_p = self.dropout if self.training else 0.0
 
-        # Project to Q, K, V
-        query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
-        key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
-        value_states = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        # Project: [seq_len, embed_dim] → [seq_len, num_heads, head_dim]
+        q = self.q_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
 
-        # Reshape for attention: [batch, num_heads, seq_len, head_dim]
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
+        # Path 1: flash_attn varlen — handles packed variable-length sequences
+        # natively without a block-diagonal mask, O(N) memory per sequence.
+        if cu_seqlens is not None:
+            try:
+                from flash_attn import flash_attn_varlen_func
 
-        # Compute attention weights
-        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+                attn_out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=dropout_p,
+                    causal=False,
+                )  # [seq_len, num_heads, head_dim]
+                return self.out_proj(attn_out.reshape(seq_length, -1).contiguous())
+            except ImportError:
+                pass
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        # Reshape output: [1, num_heads, seq_len, head_dim] -> [seq_len, num_heads * head_dim]
-        # Must transpose to [1, seq_len, num_heads, head_dim] first for correct interleaving
-        attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
-        attn_output = self.out_proj(attn_output)
-
-        return attn_output
+        # Path 2: SDPA — PyTorch fused kernel, may internally dispatch to
+        # Flash Attention when conditions are met.
+        # Reshape to [1, num_heads, seq_len, head_dim]
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            dropout_p=dropout_p,
+            scale=self.scaling,
+        )
+        # [1, num_heads, seq_len, head_dim] → [seq_len, embed_dim]
+        attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(seq_length, -1).contiguous()
+        return self.out_proj(attn_out)
 
 
 class FunAudioChatAudioEncoderLayer(nn.Module):
@@ -134,7 +152,7 @@ class FunAudioChatAudioEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
 
-        self.self_attn = FunAudioChatAudioAttention(
+        self.self_attn = FunAudioChatAudioEncoderAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             attention_dropout=attention_dropout,
@@ -201,7 +219,7 @@ class FunAudioChatAudioEncoder(nn.Module):
     - encoder_layers: 32
     - encoder_attention_heads: 20
     - encoder_ffn_dim: 5120
-    - output_dim: 3584 (matches LLM hidden_size)
+    - output_dim: 4096
     - n_window: 100 (chunking window)
     - max_source_positions: 1500
     """
@@ -215,7 +233,7 @@ class FunAudioChatAudioEncoder(nn.Module):
         self.encoder_layers = getattr(config, "encoder_layers", 32)
         self.encoder_attention_heads = getattr(config, "encoder_attention_heads", 20)
         self.encoder_ffn_dim = getattr(config, "encoder_ffn_dim", 5120)
-        self.output_dim = getattr(config, "output_dim", 3584)
+        self.output_dim = getattr(config, "output_dim", 4096)
         self.n_window = getattr(config, "n_window", 100)
         self.max_source_positions = getattr(config, "max_source_positions", 1500)
         self.dropout = getattr(config, "dropout", 0.0)
@@ -340,7 +358,12 @@ class FunAudioChatAudioEncoder(nn.Module):
         """
         device = input_features.device
 
-        # Handle packed vs batched input
+        # Handle packed vs batched input:
+        # - Packed [num_mel_bins, total_frames]: all audios concatenated along
+        #   the time axis; feature_lens marks each boundary. Zero padding waste,
+        #   natural fit for cu_seqlens-based flash_attn_varlen_func.
+        # - Batched [batch, num_mel_bins, max_frames]: conventional padded format;
+        #   simpler but wastes memory proportional to the amount of padding.
         if input_features.ndim == 2:
             # Packed input: [num_mel_bins, total_frames]
             if feature_lens is None:

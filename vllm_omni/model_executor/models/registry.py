@@ -145,6 +145,17 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## fish_speech (Fish Speech S2 Pro)
+    "FishSpeechSlowARForConditionalGeneration": (
+        "fish_speech",
+        "fish_speech_slow_ar",
+        "FishSpeechSlowARForConditionalGeneration",
+    ),
+    "FishSpeechDACDecoder": (
+        "fish_speech",
+        "fish_speech_dac_decoder",
+        "FishSpeechDACDecoder",
+    ),
 }
 
 

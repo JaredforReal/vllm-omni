@@ -259,7 +259,10 @@ class OmniInputProcessor(InputProcessor):
         elif raw_info is not None:
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
-                if isinstance(value, torch.Tensor):
+                if value is None:
+                    # Preserve key with explicit None payload.
+                    entry = AdditionalInformationEntry()
+                elif isinstance(value, torch.Tensor):
                     v_cpu = value.detach().to("cpu").contiguous()
                     dtype_str = self._dtype_to_name(v_cpu.dtype)
                     # numpy doesn't support bfloat16, convert to float32 for serialization
@@ -272,8 +275,19 @@ class OmniInputProcessor(InputProcessor):
                         tensor_shape=[int(x) for x in list(v_cpu.shape)],
                         tensor_dtype=dtype_str,
                     )
-                elif isinstance(value, list):
-                    entry = AdditionalInformationEntry(list_data=value)
+                elif isinstance(value, np.ndarray):
+                    v_np = np.ascontiguousarray(value)
+                    dtype_str = str(v_np.dtype)
+                    if dtype_str == "bfloat16":
+                        v_np = v_np.astype(np.float32, copy=False)
+                        dtype_str = "float32"
+                    entry = AdditionalInformationEntry(
+                        tensor_data=v_np.tobytes(),
+                        tensor_shape=[int(x) for x in list(v_np.shape)],
+                        tensor_dtype=dtype_str,
+                    )
+                elif isinstance(value, (list, tuple)):
+                    entry = AdditionalInformationEntry(list_data=list(value))
                 else:
                     raise ValueError(
                         "additional_information values must be Tensor, numpy.ndarray, "

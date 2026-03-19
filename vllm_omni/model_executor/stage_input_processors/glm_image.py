@@ -69,13 +69,6 @@ def _parse_generated_tokens(
 
     actual_tokens = len(token_tensor)
 
-    logger.debug(
-        f"[_parse_generated_tokens] height={height}, width={width}, "
-        f"token_h={token_h}, token_w={token_w}, "
-        f"large_image_tokens={large_image_tokens}, small_image_tokens={small_image_tokens}, "
-        f"actual_tokens={actual_tokens}"
-    )
-
     if is_i2i:
         # Image-to-image mode: check if AR generated small+large tokens (like t2i) or just large tokens
         # Some AR models output small+large even in i2i mode
@@ -226,7 +219,6 @@ def ar2diffusion(
             # Fallback: also check output (CompletionOutput) in case of different vLLM versions
             if hasattr(output, "multimodal_output") and output.multimodal_output:
                 mm_output = output.multimodal_output
-                logger.debug(f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)")
                 if isinstance(mm_output, dict):
                     raw_prior_image_ids = mm_output.get("prior_token_image_ids")
                     if raw_prior_image_ids is not None:

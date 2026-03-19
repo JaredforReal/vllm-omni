@@ -343,7 +343,7 @@ class FunAudioChatProcessor(ProcessorMixin):
         return self.tokenizer.decode(*args, **kwargs)
 
     @classmethod
-    def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, processor_dict=None, **kwargs):
         """
         Load subcomponents (feature_extractor, speech_tokenizer, tokenizer)
         from the pretrained model directory.
@@ -351,6 +351,7 @@ class FunAudioChatProcessor(ProcessorMixin):
         The speech_tokenizer is stored in a subfolder named 'speech_tokenizer',
         so we pass subfolder= to from_pretrained for that attribute.
         """
+        processor_dict = processor_dict if processor_dict is not None else {}
         args = []
         for attribute_name in cls.attributes:
             class_name = getattr(cls, f"{attribute_name}_class")

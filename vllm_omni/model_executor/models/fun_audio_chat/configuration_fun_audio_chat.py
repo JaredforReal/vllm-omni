@@ -98,7 +98,6 @@ class FunAudioChatConfig(PretrainedConfig):
         hidden_size: int | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         self.audio_token_index = audio_token_index
         self.ignore_index = ignore_index
 
@@ -109,6 +108,8 @@ class FunAudioChatConfig(PretrainedConfig):
 
         self.text_config = text_config
         self.audio_config = audio_config
+
+        super().__init__(**kwargs)
 
     def get_text_config(self, **kwargs) -> Qwen3Config:
         """Return the text config for compatibility with vLLM."""

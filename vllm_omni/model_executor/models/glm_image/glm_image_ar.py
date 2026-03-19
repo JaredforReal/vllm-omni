@@ -25,6 +25,7 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,7 +93,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -1084,6 +1084,7 @@ class GlmImageVisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # hidden_states: [seq_len, hidden_size] (no batch dim)
         seq_len = hidden_states.shape[0]
@@ -1106,6 +1107,7 @@ class GlmImageVisionAttention(nn.Module):
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
 
         # Reshape back: [1, seq, heads, head_dim] -> [seq, hidden]
@@ -1301,6 +1303,7 @@ class GlmImageVisionBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention
         residual = hidden_states
@@ -1309,6 +1312,7 @@ class GlmImageVisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
         hidden_states = residual + hidden_states
 
@@ -1346,6 +1350,8 @@ class GlmImageVisionModel(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.patch_size = config.patch_size
         self.spatial_merge_size = config.spatial_merge_size
+        use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data" if multimodal_config else False
+        self.tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
 
         # Patch embedding
         self.patch_embed = GlmImageVisionPatchEmbed(config)
@@ -1424,19 +1430,6 @@ class GlmImageVisionModel(nn.Module):
 
         return torch.cat(pos_ids, dim=0)
 
-    def compute_attn_mask_seqlen(
-        self,
-        cu_seqlens: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Compute max sequence length for flash attention."""
-        if (
-            self.attn_backend == AttentionBackendEnum.FLASH_ATTN
-            or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
-        ):
-            # Return as 1D tensor for vLLM 0.14.0+ API compatibility
-            return (cu_seqlens[1:] - cu_seqlens[:-1]).max().unsqueeze(0)
-        return None
-
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -1459,15 +1452,37 @@ class GlmImageVisionModel(nn.Module):
         # Compute position IDs
         position_ids = self.compute_position_ids(grid_thw)
 
-        # Compute cumulative sequence lengths for attention
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0, dtype=torch.int32
+        # Compute cumulative sequence lengths for attention.
+        # Use backend-aware MMEncoderAttention helpers so TP mode can adapt
+        # cu_seqlens layout as needed by the selected attention backend.
+        grid_thw_np = grid_thw.detach().cpu().numpy().astype(np.int32)
+        base_cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
+            axis=0,
+            dtype=np.int32,
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        cu_seqlens = cu_seqlens.to(self.device)
+        base_cu_seqlens_np = np.concatenate([np.zeros(1, dtype=np.int32), base_cu_seqlens_np])
 
-        # Get sequence lengths for position embedding
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        sequence_lengths = MMEncoderAttention.maybe_compute_sequence_lengths(self.attn_backend, base_cu_seqlens_np)
+        if sequence_lengths is not None:
+            sequence_lengths = torch.from_numpy(sequence_lengths).to(self.device, non_blocking=True)
+
+        max_seqlen = torch.tensor(
+            MMEncoderAttention.compute_max_seqlen(self.attn_backend, base_cu_seqlens_np),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        attn_cu_seqlens_np = MMEncoderAttention.maybe_recompute_cu_seqlens(
+            self.attn_backend,
+            base_cu_seqlens_np,
+            self.hidden_size,
+            self.tp_size,
+        )
+        cu_seqlens = torch.from_numpy(attn_cu_seqlens_np).to(self.device, non_blocking=True)
+
+        # Get sequence lengths for position embedding from the original per-item
+        # cu_seqlens values (before backend-specific recompute).
+        seqlens = np.diff(base_cu_seqlens_np).tolist()
 
         # Add position embeddings
         hidden_states = self.embeddings(
@@ -1478,15 +1493,13 @@ class GlmImageVisionModel(nn.Module):
             position_ids[:, 1].to(hidden_states.device),
         )
 
-        # Compute max seqlen for flash attention
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-
         # Transformer blocks
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
             )
 
         return hidden_states

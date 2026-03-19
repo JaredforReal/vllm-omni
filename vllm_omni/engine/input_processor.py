@@ -275,7 +275,10 @@ class OmniInputProcessor(InputProcessor):
                 elif isinstance(value, list):
                     entry = AdditionalInformationEntry(list_data=value)
                 else:
-                    raise ValueError("additional_information values must be Tensor or list")
+                    raise ValueError(
+                        "additional_information values must be Tensor, numpy.ndarray, "
+                        f"list/tuple, or None. key={key!r}, type={type(value).__name__}"
+                    )
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(entries=entries)
 

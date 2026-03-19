@@ -110,7 +110,7 @@ class FunAudioChatConfig(PretrainedConfig):
         self.text_config = text_config
         self.audio_config = audio_config
 
-    def get_text_config(self) -> Qwen3Config:
+    def get_text_config(self, **kwargs) -> Qwen3Config:
         """Return the text config for compatibility with vLLM."""
         return self.text_config
 

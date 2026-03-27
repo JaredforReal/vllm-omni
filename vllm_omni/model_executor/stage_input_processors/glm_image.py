@@ -189,7 +189,7 @@ def ar2diffusion(
 
         mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
 
-        def _coerce_dim(v: Any, default: int = 1024) -> int:
+        def _coerce_dim(v: Any, default: int) -> int:
             try:
                 iv = int(v)
                 return iv if iv > 0 else default
@@ -200,11 +200,11 @@ def ar2diffusion(
         # then fall back to top-level fields for backward compatibility.
         height = _coerce_dim(
             mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("height")),
+            _coerce_dim(original_prompt.get("height"), 1024),
         )
         width = _coerce_dim(
             mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("width")),
+            _coerce_dim(original_prompt.get("width"), 1024),
         )
         logger.info(
             "[ar2diffusion] Request %s: resolved target size height=%s, width=%s "

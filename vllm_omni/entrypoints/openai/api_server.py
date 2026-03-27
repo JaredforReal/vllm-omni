@@ -1299,6 +1299,18 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
+
+        # Keep AR stage target grid in sync with requested output size.
+        # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
+        if width is not None and height is not None:
+            prompt["mm_processor_kwargs"] = {
+                "target_h": height,
+                "target_w": width,
+            }
+            # Backward-compatible fallback for processors reading top-level fields.
+            prompt["height"] = height
+            prompt["width"] = width
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1505,6 +1517,18 @@ async def edit_images(
                     )
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
+
+        # Keep AR stage target grid in sync with requested output size.
+        # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
+        if width is not None and height is not None:
+            prompt["mm_processor_kwargs"] = {
+                "target_h": height,
+                "target_w": width,
+            }
+            # Backward-compatible fallback for processors reading top-level fields.
+            prompt["height"] = height
+            prompt["width"] = width
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 

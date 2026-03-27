@@ -56,8 +56,16 @@ def _parse_generated_tokens(
     large_image_tokens = token_h * token_w
 
     # Calculate small preview image dimensions (used in text-to-image)
-    small_token_h = token_h // 2
-    small_token_w = token_w // 2
+    # Keep this consistent with GlmImageProcessor._build_prompt_with_target_shape:
+    #   prev_token_h = int(sqrt(token_h/token_w) * (factor // 2))
+    #   prev_token_w = int(sqrt(token_w/token_h) * (factor // 2))
+    # NOTE: This is NOT token_h//2, token_w//2. For square images it is fixed
+    # to 16x16 when factor=32, including 512x512 requests.
+    import math
+
+    ratio = token_h / token_w if token_w > 0 else 1.0
+    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
     small_image_tokens = small_token_h * small_token_w
 
     token_tensor = torch.tensor(token_ids, dtype=torch.long)
@@ -101,13 +109,13 @@ def _parse_generated_tokens(
         actual_h, actual_w = token_h, token_w
     else:
         # Insufficient tokens - try to infer the actual grid size
-        import math
 
         for scale in [1, 2, 4]:
             test_h = token_h // scale
             test_w = token_w // scale
-            test_small_h = test_h // 2
-            test_small_w = test_w // 2
+            test_ratio = test_h / test_w if test_w > 0 else 1.0
+            test_small_h = max(1, int(math.sqrt(test_ratio) * (factor // 2)))
+            test_small_w = max(1, int(math.sqrt(1 / test_ratio) * (factor // 2)))
             test_large = test_h * test_w
             test_small = test_small_h * test_small_w
 
@@ -181,34 +189,10 @@ def ar2diffusion(
 
         mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
 
-        def _coerce_dim(v: Any, default: int = 1024) -> int:
-            try:
-                iv = int(v)
-                return iv if iv > 0 else default
-            except (TypeError, ValueError):
-                return default
-
         # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
         # then fall back to top-level fields for backward compatibility.
-        height = _coerce_dim(
-            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("height")),
-        )
-        width = _coerce_dim(
-            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-            _coerce_dim(original_prompt.get("width")),
-        )
-        logger.info(
-            "[ar2diffusion] Request %s: resolved target size height=%s, width=%s "
-            "(mm_target_h=%s, mm_target_w=%s, prompt_height=%s, prompt_width=%s)",
-            i,
-            height,
-            width,
-            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-            original_prompt.get("height"),
-            original_prompt.get("width"),
-        )
+        height = mm_processor_kwargs.get("target_h")
+        width = mm_processor_kwargs.get("target_w")
         text_prompt = original_prompt.get("prompt", "")
 
         # Detect i2i mode first by checking if multimodal_output contains prior_token_image_ids

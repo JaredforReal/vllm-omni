@@ -189,10 +189,34 @@ def ar2diffusion(
 
         mm_processor_kwargs = original_prompt.get("mm_processor_kwargs")
 
+        def _coerce_dim(v: Any, default: int = 1024) -> int:
+            try:
+                iv = int(v)
+                return iv if iv > 0 else default
+            except (TypeError, ValueError):
+                return default
+
         # Prefer GLM-Image target size from mm_processor_kwargs (set by serving layer),
         # then fall back to top-level fields for backward compatibility.
-        height = mm_processor_kwargs.get("target_h")
-        width = mm_processor_kwargs.get("target_w")
+        height = _coerce_dim(
+            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
+            _coerce_dim(original_prompt.get("height")),
+        )
+        width = _coerce_dim(
+            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
+            _coerce_dim(original_prompt.get("width")),
+        )
+        logger.info(
+            "[ar2diffusion] Request %s: resolved target size height=%s, width=%s "
+            "(mm_target_h=%s, mm_target_w=%s, prompt_height=%s, prompt_width=%s)",
+            i,
+            height,
+            width,
+            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
+            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
+            original_prompt.get("height"),
+            original_prompt.get("width"),
+        )
         text_prompt = original_prompt.get("prompt", "")
 
         # Detect i2i mode first by checking if multimodal_output contains prior_token_image_ids

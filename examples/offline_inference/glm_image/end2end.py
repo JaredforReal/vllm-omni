@@ -80,9 +80,12 @@ def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
     large_tokens = token_h * token_w
 
     # Small preview tokens (half resolution in each dimension)
-    small_h = token_h // 2
-    small_w = token_w // 2
-    small_tokens = small_h * small_w
+    import math
+
+    ratio = token_h / token_w if token_w > 0 else 1.0
+    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+    small_tokens = small_token_h * small_token_w
 
     # Total: small + large + EOS
     return small_tokens + large_tokens + 1
@@ -288,8 +291,7 @@ def main(args: argparse.Namespace) -> None:
     # Default args.max_tokens is 16384 (very large), so prefer calculated value
     effective_max_tokens = calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
 
-    if args.verbose:
-        print(f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})")
+    print(f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})")
 
     # IMPORTANT: GLM-Image AR model requires these exact sampling parameters
     # from generation_config.json for proper image token generation.

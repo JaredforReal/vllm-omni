@@ -690,7 +690,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         params = default_params.clone()
 
+        # Only apply fields explicitly provided by the user.
+        # ChatCompletionRequest defines some fields with non-None defaults
+        # (e.g. stop_token_ids=[], min_tokens=0). If we blindly copy those
+        # defaults, we accidentally overwrite stage YAML defaults.
+        explicit_fields: set[str] | None = None
+        model_fields_set = getattr(request, "model_fields_set", None)
+        if isinstance(model_fields_set, set):
+            explicit_fields = model_fields_set
+        else:
+            # Backward compatibility for pydantic v1-style APIs.
+            fields_set = getattr(request, "__fields_set__", None)
+            if isinstance(fields_set, set):
+                explicit_fields = fields_set
+
         for field_name in self._OPENAI_SAMPLING_FIELDS:
+            if explicit_fields is not None and field_name not in explicit_fields:
+                continue
             value = getattr(request, field_name, None)
             if value is not None:
                 setattr(params, field_name, value)

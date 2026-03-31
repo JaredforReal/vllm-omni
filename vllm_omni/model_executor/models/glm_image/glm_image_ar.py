@@ -608,10 +608,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
 
-        if num_images == 0:
+        if num_images == 0 and isinstance(prompt, str):
             # t2i mode or normal flow - use parent implementation
             return super()._apply_hf_processor_text_mm(
-                prompt=prompt,
+                prompt_text=prompt,
                 mm_items=mm_items,
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,

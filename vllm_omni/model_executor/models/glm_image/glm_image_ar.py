@@ -624,6 +624,12 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
             )
+            mm_processed_data = self._apply_hf_processor_mm_only(
+                mm_items=mm_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+            return prompt_ids, mm_processed_data, False
 
         # i2i mode with enable_hf_prompt_update=False (cache miss scenario)
         # We need to build prompt_ids with image placeholders

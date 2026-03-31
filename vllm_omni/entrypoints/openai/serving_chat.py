@@ -719,7 +719,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     computed_max = compute_max_tokens(int(height), int(width))
                     params.max_tokens = computed_max
-                    logger.debug(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
+                    logger.info(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
                 except (ImportError, ValueError, TypeError) as e:
                     logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
 

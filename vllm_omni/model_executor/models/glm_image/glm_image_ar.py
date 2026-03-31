@@ -353,12 +353,10 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Get target dimensions from mm_kwargs or use defaults
         target_h = mm_kwargs.get("target_h", 1024) if mm_kwargs else 1024
         target_w = mm_kwargs.get("target_w", 1024) if mm_kwargs else 1024
-        import traceback
 
         logger.info(
             f"_call_hf_processor: target dimensions for generation: {target_h}x{target_w}, mm_kwargs={mm_kwargs}"
         )
-        traceback.print_stack()
 
         if not mm_data or not mm_data.get("images"):
             # Text-to-image mode

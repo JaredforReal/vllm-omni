@@ -106,16 +106,20 @@ def _parse_generated_tokens(
 
     # Remove EOS token (16385) from the end if present
     eos_token_id = 16385
-    if len(token_ids) > 0 and token_ids[-1] == eos_token_id:
+    has_terminal_eos = len(token_ids) > 0 and token_ids[-1] == eos_token_id
+    if has_terminal_eos:
         token_tensor = token_tensor[:-1]
 
     actual_tokens = len(token_tensor)
+    likely_truncated = (not has_terminal_eos) and (len(token_ids) >= (small_image_tokens + large_image_tokens + 1))
 
     logger.info(
         f"[_parse_generated_tokens] height={height}, width={width}, "
         f"token_h={token_h}, token_w={token_w}, "
         f"large_image_tokens={large_image_tokens}, small_image_tokens={small_image_tokens}, "
-        f"actual_tokens={actual_tokens}"
+        f"raw_tokens={len(token_ids)}, actual_tokens={actual_tokens}, "
+        f"has_terminal_eos={has_terminal_eos}, likely_truncated={likely_truncated}, "
+        f"tail_tokens={token_ids[-8:] if len(token_ids) >= 8 else token_ids}"
     )
 
     if is_i2i:

@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only GLM-Image model compatible with HuggingFace weights."""
 
+import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal
@@ -589,6 +590,47 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         )
         return prompt_ids
 
+    def _build_generation_grids(self, hf_processor_mm_kwargs: Mapping[str, object]) -> torch.Tensor:
+        """Build generation grids for M-RoPE decode positions.
+
+        For GLM-Image generation, decode order is:
+        1) small preview grid
+        2) large target grid
+        3) EOS
+
+        We store grids as [large, small] to match HF processor behavior, and
+        decode logic consumes them in reverse order.
+        """
+
+        target_h = (
+            hf_processor_mm_kwargs.get("target_h") if isinstance(hf_processor_mm_kwargs.get("target_h"), int) else None
+        )
+        target_w = (
+            hf_processor_mm_kwargs.get("target_w") if isinstance(hf_processor_mm_kwargs.get("target_w"), int) else None
+        )
+        if target_h is None or target_w is None:
+            target_h = (
+                hf_processor_mm_kwargs.get("height") if isinstance(hf_processor_mm_kwargs.get("height"), int) else 1024
+            )
+            target_w = (
+                hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
+            )
+
+        factor = 32
+        target_h = (target_h // factor) * factor
+        target_w = (target_w // factor) * factor
+        token_h = target_h // factor
+        token_w = target_w // factor
+
+        ratio = token_h / token_w if token_w > 0 else 1.0
+        small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+        small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+
+        return torch.tensor(
+            [[1, token_h, token_w], [1, small_token_h, small_token_w]],
+            dtype=torch.long,
+        )
+
     def _apply_hf_processor_main(
         self,
         prompt: str | list[int],
@@ -629,6 +671,20 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
             )
+
+            # t2i has no source images, so mm features cannot provide image_grid_thw.
+            # Provide explicit generation grids for M-RoPE to avoid fallback token parsing
+            # (which can degrade high-resolution spatial positions, e.g. 1920x1920).
+            try:
+                mrope_grid_thw = self._build_generation_grids(hf_processor_mm_kwargs)
+                mm_processed_data["mrope_image_grid_thw"] = mrope_grid_thw
+                logger.info(
+                    "_apply_hf_processor_main t2i: mrope_image_grid_thw=%s",
+                    mrope_grid_thw.tolist(),
+                )
+            except Exception as e:
+                logger.warning("_apply_hf_processor_main t2i: failed to set mrope_image_grid_thw: %s", e)
+
             return prompt_ids, mm_processed_data, False
 
         # i2i mode with enable_hf_prompt_update=False (cache miss scenario)

@@ -690,7 +690,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         params = default_params.clone()
 
+        # Only apply fields explicitly provided by user, not protocol defaults.
+        # Pydantic v2 uses `model_fields_set`; keep v1 fallback for compatibility.
+        explicit_fields = getattr(request, "model_fields_set", None)
+        if explicit_fields is None:
+            explicit_fields = getattr(request, "__fields_set__", set())
+
         for field_name in self._OPENAI_SAMPLING_FIELDS:
+            if field_name not in explicit_fields:
+                continue
+
             value = getattr(request, field_name, None)
             if value is not None:
                 setattr(params, field_name, value)
@@ -728,6 +737,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 # For other stages, clone default params
                 sampling_params_list.append(default_params.clone())
+
+        # Log final sampling params for debugging
+        logger.info(
+            f"[SamplingParams] Stage {comprehension_idx} (comprehension): "
+            f"max_tokens={sampling_params_list[comprehension_idx].max_tokens}, "
+            f"stop_token_ids={sampling_params_list[comprehension_idx].stop_token_ids}, "
+            f"temperature={sampling_params_list[comprehension_idx].temperature}, "
+            f"explicit_fields_set={getattr(request, 'model_fields_set', getattr(request, '__fields_set__', set()))}"
+        )
 
         return sampling_params_list
 

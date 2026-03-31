@@ -681,6 +681,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
+        For GLM-Image AR stage, if max_tokens is not in YAML and user provides
+        height/width in extra_body, computes max_tokens dynamically.
+
         Args:
             default_params: Default SamplingParams from stage config YAML.
             request: The chat completion request containing user-provided values.
@@ -703,6 +706,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             value = getattr(request, field_name, None)
             if value is not None:
                 setattr(params, field_name, value)
+
+        # For GLM-Image: compute max_tokens from height/width if not provided by user or YAML
+        if params.max_tokens is None:
+            extra_body = getattr(request, "extra_body", {}) or {}
+            height = extra_body.get("height")
+            width = extra_body.get("width")
+
+            if height is not None and width is not None:
+                try:
+                    from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
+
+                    computed_max = compute_max_tokens(int(height), int(width))
+                    params.max_tokens = computed_max
+                    logger.debug(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
+                except (ImportError, ValueError, TypeError) as e:
+                    logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
 
         return params
 

@@ -13,6 +13,40 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = init_logger(__name__)
 
 
+def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
+    """
+    Compute max_new_tokens for GLM-Image AR generation.
+
+    GLM-Image generates tokens in this order for text-to-image:
+    1. Small preview image (half resolution in each dimension)
+    2. Large target image (full resolution)
+    3. EOS token
+
+    Args:
+        height: Target image height in pixels
+        width: Target image width in pixels
+        factor: Downsampling factor (32 for GLM-Image AR output)
+
+    Returns:
+        Total number of tokens to generate (small + large + EOS)
+    """
+    # Large image tokens (target resolution)
+    token_h = height // factor
+    token_w = width // factor
+    large_tokens = token_h * token_w
+
+    # Small preview tokens (half resolution in each dimension)
+    import math
+
+    ratio = token_h / token_w if token_w > 0 else 1.0
+    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+    small_tokens = small_token_h * small_token_w
+
+    # Total: small + large + EOS
+    return small_tokens + large_tokens + 1
+
+
 def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
     """Upsample token IDs by 2x using nearest neighbor interpolation.
 

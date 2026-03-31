@@ -580,6 +580,17 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             tensor_type="pt",
         )
 
+    def _apply_hf_processor_text_only(
+        self, prompt_text: str, hf_processor_mm_kwargs: Mapping[str, object], tokenization_kwargs: Mapping[str, object]
+    ) -> list[int]:
+        prompt_ids, _, _ = super()._apply_hf_processor_text_mm(
+            prompt_text=prompt_text,
+            mm_items=MultiModalDataItems({}),
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+        return prompt_ids
+
     def _apply_hf_processor_main(
         self,
         prompt: str | list[int],
@@ -610,9 +621,8 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         if num_images == 0 and isinstance(prompt, str):
             # t2i mode or normal flow - use parent implementation
-            return super()._apply_hf_processor_text_mm(
+            prompt_ids = self._apply_hf_processor_text_only(
                 prompt_text=prompt,
-                mm_items=mm_items,
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
             )
@@ -673,8 +683,9 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # Build prompt_ids with image placeholders
         # _apply_prompt_updates will replace each [image_token_id] with expanded tokens
+        hf_config = self.info.get_hf_config()
+        image_token_id = getattr(hf_config, "image_token_id", 167855)
         tokenizer = self.info.get_tokenizer()
-        image_token_id = tokenizer.convert_tokens_to_ids("<|image|>")
 
         if isinstance(prompt, str):
             # Match HF GlmImageProcessor behavior: append target grid tokens + BOS.

@@ -708,20 +708,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 setattr(params, field_name, value)
 
         # For GLM-Image: compute max_tokens from height/width if not provided by user or YAML
-        if params.max_tokens is None:
-            extra_body = getattr(request, "extra_body", {}) or {}
-            height = extra_body.get("height")
-            width = extra_body.get("width")
+        extra_body = getattr(request, "extra_body", {}) or {}
+        height = extra_body.get("height")
+        width = extra_body.get("width")
 
-            if height is not None and width is not None:
-                try:
-                    from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
+        if height is not None and width is not None:
+            try:
+                from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
-                    computed_max = compute_max_tokens(int(height), int(width))
-                    params.max_tokens = computed_max
-                    logger.info(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
-                except (ImportError, ValueError, TypeError) as e:
-                    logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
+                computed_max = compute_max_tokens(int(height), int(width))
+                params.max_tokens = computed_max
+                logger.info(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
+            except (ImportError, ValueError, TypeError) as e:
+                logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
 
         return params
 

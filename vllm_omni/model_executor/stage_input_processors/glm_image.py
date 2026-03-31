@@ -77,7 +77,7 @@ def _parse_generated_tokens(
 
     actual_tokens = len(token_tensor)
 
-    logger.debug(
+    logger.info(
         f"[_parse_generated_tokens] height={height}, width={width}, "
         f"token_h={token_h}, token_w={token_w}, "
         f"large_image_tokens={large_image_tokens}, small_image_tokens={small_image_tokens}, "

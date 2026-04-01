@@ -718,6 +718,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 computed_max = compute_max_tokens(int(height), int(width))
                 params.max_tokens = computed_max
+                # Keep target size in stage-0 sampling params so runner/model can
+                # build deterministic M-RoPE grids for t2i (no MM features).
+                extra_args = dict(getattr(params, "extra_args", {}) or {})
+                extra_args["target_h"] = int(height)
+                extra_args["target_w"] = int(width)
+                params.extra_args = extra_args
                 logger.info(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
             except (ImportError, ValueError, TypeError) as e:
                 logger.warning(f"Failed to compute max_tokens: {e}, using default if available")

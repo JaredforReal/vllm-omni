@@ -2751,9 +2751,23 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Input format: "text<sop>H W<eop><sop>h w<eop><bos>" where <bos>=image_start_token_id=16384
         # For 1024x1024: H=32, W=32 (large), h=16, w=16 (small preview)
         if not image_grid_thw:
+            # Preferred path for t2i: use explicit target size propagated from
+            # serving/request sampling params. This avoids fragile grid parsing
+            # from token IDs and matches HF processor grid construction.
+            target_h = kwargs.get("target_h")
+            target_w = kwargs.get("target_w")
+            if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
+                factor = 32
+                token_h = target_h // factor
+                token_w = target_w // factor
+                ratio = token_h / token_w if token_w > 0 else 1.0
+                small_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+                small_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+                image_grid_thw = [[1, token_h, token_w], [1, small_h, small_w]]
+
             # Try to parse from kwargs (passed from processor)
             hf_config_arg = kwargs.get("hf_config")
-            if hf_config_arg is not None and hasattr(hf_config_arg, "image_grid_thw"):
+            if (not image_grid_thw) and hf_config_arg is not None and hasattr(hf_config_arg, "image_grid_thw"):
                 image_grid_thw = hf_config_arg.image_grid_thw
 
             # If still empty, try to infer from input tokens

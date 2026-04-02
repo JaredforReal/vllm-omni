@@ -696,10 +696,59 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         )
 
         if not isinstance(prompt, str):
-            raise ValueError(
-                "GLM-Image i2i requires raw text prompt for HF apply_chat_template; "
-                f"got prompt type={type(prompt).__name__}"
+            # Online OpenAI chat preprocessing can arrive here with tokenized
+            # prompts (list[int]) before serving_chat replaces engine prompt
+            # with the clean text prompt. Do not fail the whole request.
+            logger.warning(
+                "_apply_hf_processor_main i2i: got tokenized prompt type=%s; "
+                "using compatibility path for preprocessing",
+                type(prompt).__name__,
             )
+
+            prompt_ids = list(prompt)
+            mm_processed_data = self._apply_hf_processor_mm_only(
+                mm_items=mm_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+
+            # Preserve full grids for M-RoPE decode (source + target), while
+            # keeping image_grid_thw source-only for MM batching.
+            try:
+                source_grid_thw = mm_processed_data.get("image_grid_thw")
+                if source_grid_thw is not None and isinstance(source_grid_thw, torch.Tensor):
+                    target_h = (
+                        hf_processor_mm_kwargs.get("target_h")
+                        if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
+                        else None
+                    )
+                    target_w = (
+                        hf_processor_mm_kwargs.get("target_w")
+                        if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
+                        else None
+                    )
+                    if target_h is None or target_w is None:
+                        target_h = (
+                            hf_processor_mm_kwargs.get("height")
+                            if isinstance(hf_processor_mm_kwargs.get("height"), int)
+                            else 1024
+                        )
+                        target_w = (
+                            hf_processor_mm_kwargs.get("width")
+                            if isinstance(hf_processor_mm_kwargs.get("width"), int)
+                            else 1024
+                        )
+
+                    factor = 32
+                    token_h = max(1, target_h // factor)
+                    token_w = max(1, target_w // factor)
+                    target_grid = torch.tensor([[1, token_h, token_w]], dtype=source_grid_thw.dtype)
+                    mm_processed_data["mrope_image_grid_thw"] = torch.cat([source_grid_thw, target_grid], dim=0)
+            except Exception:
+                pass
+
+            # Prompt updates will expand image placeholders in this compatibility path.
+            return prompt_ids, mm_processed_data, False
 
         images = mm_items.get_items("image", ImageProcessorItems)
         image_list = [images.get(i) for i in range(images.get_count())]

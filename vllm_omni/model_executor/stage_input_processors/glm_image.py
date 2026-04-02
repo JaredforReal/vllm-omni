@@ -13,6 +13,47 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = init_logger(__name__)
 
 
+def _has_source_image(mm_data: Any) -> bool:
+    """Return whether prompt multi_modal_data contains a source image.
+
+    Normalizes legacy/new keys used across omni pipelines:
+    - `image`: single PIL image or list
+    - `img2img`: legacy single-image key
+    - `images`: list or single image
+    """
+    if not isinstance(mm_data, dict):
+        return False
+    if mm_data.get("image") is not None:
+        return True
+    if mm_data.get("img2img") is not None:
+        return True
+    images = mm_data.get("images")
+    return bool(images)
+
+
+def _first_source_image(mm_data: Any) -> Any:
+    """Get first source image from normalized multimodal keys."""
+    if not isinstance(mm_data, dict):
+        return None
+
+    image = mm_data.get("image")
+    if image is not None:
+        if isinstance(image, list):
+            return image[0] if image else None
+        return image
+
+    image = mm_data.get("img2img")
+    if image is not None:
+        if isinstance(image, list):
+            return image[0] if image else None
+        return image
+
+    images = mm_data.get("images")
+    if isinstance(images, list):
+        return images[0] if images else None
+    return images
+
+
 def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
@@ -230,45 +271,24 @@ def ar2diffusion(
         )
         text_prompt = original_prompt.get("prompt", "")
 
-        # Detect i2i mode using multiple signals (not only multimodal_output).
-        # In some paths, prior_token_image_ids can be dropped/serialized before
-        # ar2diffusion runs, while prompt metadata still clearly indicates i2i.
+        # Detect i2i mode.
+        # Prefer normalized prompt multi_modal_data source-image presence, with
+        # multimodal output as secondary signal.
         is_i2i = False
-        mode_reasons: list[str] = []
 
         prompt_modalities = original_prompt.get("modalities")
         if isinstance(prompt_modalities, list) and "img2img" in prompt_modalities:
             is_i2i = True
-            mode_reasons.append("prompt.modalities contains img2img")
 
         prompt_mm_data = original_prompt.get("multi_modal_data")
-        if isinstance(prompt_mm_data, dict):
-            if prompt_mm_data.get("img2img") is not None:
-                is_i2i = True
-                mode_reasons.append("prompt.multi_modal_data has img2img")
-            elif prompt_mm_data.get("image") is not None:
-                is_i2i = True
-                mode_reasons.append("prompt.multi_modal_data has image")
-            elif prompt_mm_data.get("images"):
-                is_i2i = True
-                mode_reasons.append("prompt.multi_modal_data has images")
+        if _has_source_image(prompt_mm_data):
+            is_i2i = True
 
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
             if isinstance(mm_output, dict):
                 if mm_output.get("prior_token_image_ids") is not None:
                     is_i2i = True
-                    mode_reasons.append("ar_output.multimodal_output has prior_token_image_ids")
-                elif "prior_token_image_ids" in mm_output:
-                    # Keep this as a weak signal for diagnostics only.
-                    mode_reasons.append("ar_output.multimodal_output has prior_token_image_ids key (None)")
-
-        logger.info(
-            "[ar2diffusion] Request %s: mode=%s reasons=%s",
-            i,
-            "i2i" if is_i2i else "t2i",
-            mode_reasons if mode_reasons else ["no-i2i-signal"],
-        )
 
         # Parse and upsample prior tokens
         try:
@@ -347,14 +367,7 @@ def ar2diffusion(
         if requires_multimodal_data:
             mm_data = original_prompt.get("multi_modal_data")
             if mm_data:
-                pil_image = mm_data.get("image")
-                if pil_image is None:
-                    pil_image = mm_data.get("img2img")
-                if pil_image is None:
-                    # Try "images" (plural) as fallback
-                    images = mm_data.get("images")
-                    if images:
-                        pil_image = images[0] if isinstance(images, list) else images
+                pil_image = _first_source_image(mm_data)
                 diffusion_input["pil_image"] = pil_image
 
         for key in ["seed", "num_inference_steps", "guidance_scale", "negative_prompt"]:

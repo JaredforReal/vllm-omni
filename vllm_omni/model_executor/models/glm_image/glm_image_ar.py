@@ -687,9 +687,100 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
             return prompt_ids, mm_processed_data, False
 
-        # i2i mode with enable_hf_prompt_update=False (cache miss scenario)
-        # We need to build prompt_ids with image placeholders
-        logger.debug(f"_apply_hf_processor_main: i2i mode with enable_hf_prompt_update=False, num_images={num_images}")
+        # i2i mode: prefer HF processor.apply_chat_template for prompt fidelity.
+        # This keeps i2i prompt construction aligned with transformers behavior:
+        #   source image placeholders + one target grid + bos.
+        logger.debug(
+            "_apply_hf_processor_main: i2i mode (enable_hf_prompt_update=%s), num_images=%s",
+            enable_hf_prompt_update,
+            num_images,
+        )
+
+        target_h = (
+            hf_processor_mm_kwargs.get("target_h") if isinstance(hf_processor_mm_kwargs.get("target_h"), int) else None
+        )
+        target_w = (
+            hf_processor_mm_kwargs.get("target_w") if isinstance(hf_processor_mm_kwargs.get("target_w"), int) else None
+        )
+        if target_h is None or target_w is None:
+            target_h = (
+                hf_processor_mm_kwargs.get("height") if isinstance(hf_processor_mm_kwargs.get("height"), int) else 1024
+            )
+            target_w = (
+                hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
+            )
+
+        processor = self.info.get_hf_processor()
+        if processor is not None and isinstance(prompt, str):
+            try:
+                images = mm_items.get_items("image", ImageProcessorItems)
+                image_list = [images.get(i) for i in range(images.get_count())]
+
+                clean_prompt = prompt.replace("<|image|>", "")
+                content = [{"type": "image", "image": img} for img in image_list]
+                content.append({"type": "text", "text": clean_prompt})
+                messages = [{"role": "user", "content": content}]
+
+                hf_inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    target_h=target_h,
+                    target_w=target_w,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+
+                input_ids = hf_inputs.get("input_ids")
+                if input_ids is None:
+                    raise ValueError("HF apply_chat_template returned no input_ids in i2i mode")
+
+                if isinstance(input_ids, torch.Tensor):
+                    prompt_ids = input_ids[0].tolist() if input_ids.dim() > 1 else input_ids.tolist()
+                else:
+                    prompt_ids = (
+                        input_ids[0]
+                        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list)
+                        else list(input_ids)
+                    )
+
+                mm_processed_data = BatchFeature(dict(), tensor_type="pt")
+                if hf_inputs.get("pixel_values") is not None:
+                    mm_processed_data["pixel_values"] = hf_inputs["pixel_values"]
+
+                image_grid_thw = hf_inputs.get("image_grid_thw")
+                if image_grid_thw is not None:
+                    # Preserve full grids for M-RoPE (source + target)
+                    mm_processed_data["mrope_image_grid_thw"] = image_grid_thw
+
+                    # Keep source-only grids for MM batching/validation
+                    source_grids = image_grid_thw[:num_images]
+                    mm_processed_data["image_grid_thw"] = source_grids
+
+                hf_config = self.info.get_hf_config()
+                image_token_id = getattr(hf_config, "image_token_id", 167855)
+                image_token_count = prompt_ids.count(image_token_id)
+                logger.info(
+                    "_apply_hf_processor_main i2i(HF): target=%sx%s, num_images=%s, "
+                    "prompt_len=%s, image_token_count=%s, full_grid_shape=%s, source_grid_shape=%s",
+                    target_h,
+                    target_w,
+                    num_images,
+                    len(prompt_ids),
+                    image_token_count,
+                    tuple(image_grid_thw.shape) if image_grid_thw is not None else None,
+                    tuple(mm_processed_data["image_grid_thw"].shape) if "image_grid_thw" in mm_processed_data else None,
+                )
+
+                # HF processor already expanded image placeholders in input_ids.
+                return prompt_ids, mm_processed_data, True
+            except Exception as e:
+                logger.warning(
+                    "_apply_hf_processor_main i2i: HF apply_chat_template path failed, falling back to manual path: %s",
+                    e,
+                )
+
+        # Fallback i2i path: manual prompt construction + prompt updates.
+        logger.debug("_apply_hf_processor_main: i2i manual fallback path, num_images=%s", num_images)
 
         # Get mm data from our overridden _apply_hf_processor_mm_only
         mm_processed_data = self._apply_hf_processor_mm_only(
@@ -705,30 +796,6 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             source_grid_thw = mm_processed_data.get("image_grid_thw")
             if source_grid_thw is not None and isinstance(source_grid_thw, torch.Tensor):
                 # Compute target grid following HF GlmImageProcessor: factor=32.
-                # Prefer explicit target_h/target_w if present, otherwise fall back.
-                target_h = (
-                    hf_processor_mm_kwargs.get("target_h")
-                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
-                    else None
-                )
-                target_w = (
-                    hf_processor_mm_kwargs.get("target_w")
-                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
-                    else None
-                )
-                if target_h is None or target_w is None:
-                    # Some callers pass generation size as height/width.
-                    target_h = (
-                        hf_processor_mm_kwargs.get("height")
-                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
-                        else 1024
-                    )
-                    target_w = (
-                        hf_processor_mm_kwargs.get("width")
-                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
-                        else 1024
-                    )
-
                 factor = 32
                 target_h = (target_h // factor) * factor
                 target_w = (target_w // factor) * factor
@@ -755,29 +822,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 grid_eos = getattr(tokenizer, "grid_eos_token", "")
                 bos = getattr(tokenizer, "bos_token", "")
 
-                # Use the same target sizes we used for mrope grids when available.
-                target_h = (
-                    hf_processor_mm_kwargs.get("target_h")
-                    if isinstance(hf_processor_mm_kwargs.get("target_h"), int)
-                    else None
-                )
-                target_w = (
-                    hf_processor_mm_kwargs.get("target_w")
-                    if isinstance(hf_processor_mm_kwargs.get("target_w"), int)
-                    else None
-                )
-                if target_h is None or target_w is None:
-                    target_h = (
-                        hf_processor_mm_kwargs.get("height")
-                        if isinstance(hf_processor_mm_kwargs.get("height"), int)
-                        else 1024
-                    )
-                    target_w = (
-                        hf_processor_mm_kwargs.get("width")
-                        if isinstance(hf_processor_mm_kwargs.get("width"), int)
-                        else 1024
-                    )
-
+                # Use the same target sizes computed above for mrope grids.
                 factor = 32
                 target_h = (target_h // factor) * factor
                 target_w = (target_w // factor) * factor
@@ -794,7 +839,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # Prepend image placeholders - one per image
         prompt_ids = [image_token_id] * num_images + text_ids
 
-        logger.debug(f"_apply_hf_processor_main: built prompt_ids with {num_images} image placeholders")
+        logger.info(
+            "_apply_hf_processor_main i2i(manual): target=%sx%s, num_images=%s, prompt_len=%s",
+            target_h,
+            target_w,
+            num_images,
+            len(prompt_ids),
+        )
 
         # Return is_update_applied=False so _apply_prompt_updates will expand the placeholders
         return prompt_ids, mm_processed_data, False

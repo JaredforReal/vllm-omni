@@ -275,7 +275,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request.modalities = (
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
-        
+
         num_inference_steps = None
 
         # Pre-scan user messages for reference images so i2i requests are not
@@ -307,14 +307,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
-                
+
                 num_inference_steps = extra_body.get("num_inference_steps")
                 if num_inference_steps is not None:
                     try:
                         num_inference_steps = int(num_inference_steps)
                     except Exception:
                         num_inference_steps = None
-                    
+
                 negative_prompt = extra_body.get("negative_prompt")
 
                 engine_prompt_image: dict[str, Any] | None = None

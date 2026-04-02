@@ -95,11 +95,6 @@ def _parse_generated_tokens(
     large_image_tokens = token_h * token_w
 
     # Calculate small preview image dimensions (used in text-to-image)
-    # Keep this consistent with GlmImageProcessor._build_prompt_with_target_shape:
-    #   prev_token_h = int(sqrt(token_h/token_w) * (factor // 2))
-    #   prev_token_w = int(sqrt(token_w/token_h) * (factor // 2))
-    # NOTE: This is NOT token_h//2, token_w//2. For square images it is fixed
-    # to 16x16 when factor=32, including 512x512 requests.
     import math
 
     ratio = token_h / token_w if token_w > 0 else 1.0
@@ -116,23 +111,8 @@ def _parse_generated_tokens(
         token_tensor = token_tensor[:-1]
 
     actual_tokens = len(token_tensor)
-    expected_tokens_no_eos = large_image_tokens if is_i2i else (small_image_tokens + large_image_tokens)
-    likely_truncated = (not has_terminal_eos) and (len(token_ids) >= (expected_tokens_no_eos + 1))
-
-    logger.info(
-        f"[_parse_generated_tokens] mode={'i2i' if is_i2i else 't2i'}, "
-        f"height={height}, width={width}, "
-        f"token_h={token_h}, token_w={token_w}, "
-        f"large_image_tokens={large_image_tokens}, small_image_tokens={small_image_tokens}, "
-        f"expected_no_eos={expected_tokens_no_eos}, "
-        f"raw_tokens={len(token_ids)}, actual_tokens={actual_tokens}, "
-        f"has_terminal_eos={has_terminal_eos}, likely_truncated={likely_truncated}, "
-        f"tail_tokens={token_ids[-8:] if len(token_ids) >= 8 else token_ids}"
-    )
 
     if is_i2i:
-        # i2i primary rule (HF-aligned): large tokens start at offset 0.
-        # Fallback only when we clearly observe full t2i-style token length.
         if actual_tokens >= small_image_tokens + large_image_tokens:
             large_start = small_image_tokens
             large_end = large_start + large_image_tokens
@@ -152,16 +132,14 @@ def _parse_generated_tokens(
                 large_image_tokens,
             )
         else:
-            # Insufficient tokens for expected i2i large grid; fall through to
-            # generic recovery logic below.
             logger.warning(
-                "[_parse_generated_tokens] i2i tokens insufficient for large grid: "
-                "actual_tokens=%s < large_image_tokens=%s; trying recovery",
+                "[_parse_generated_tokens] i2i token parse failed: actual_tokens=%s < expected_large_tokens=%s",
                 actual_tokens,
                 large_image_tokens,
             )
-            prior_token_ids_d32 = token_tensor
-            actual_h, actual_w = token_h, token_w
+            raise ValueError(
+                f"i2i token parse failed: actual_tokens={actual_tokens} < expected_large_tokens={large_image_tokens}"
+            )
     elif actual_tokens >= small_image_tokens + large_image_tokens:
         # Text-to-image: extract large image tokens after small image tokens
         large_start = small_image_tokens
@@ -169,92 +147,22 @@ def _parse_generated_tokens(
         prior_token_ids_d32 = token_tensor[large_start:large_end]
         actual_h, actual_w = token_h, token_w
     elif actual_tokens >= large_image_tokens:
-        # Image-to-image: large image tokens are at the beginning
-        prior_token_ids_d32 = token_tensor[:large_image_tokens]
-        actual_h, actual_w = token_h, token_w
+        logger.warning(
+            "[_parse_generated_tokens] t2i token parse failed: got only large tokens without small preview "
+            "(actual_tokens=%s, expected_small_plus_large=%s)",
+            actual_tokens,
+            small_image_tokens + large_image_tokens,
+        )
+        raise ValueError("t2i token parse failed: missing small-preview tokens; refusing low-quality fallback")
     else:
-        # Insufficient tokens - try to infer the actual grid size
-
-        for scale in [1, 2, 4]:
-            test_h = token_h // scale
-            test_w = token_w // scale
-            test_ratio = test_h / test_w if test_w > 0 else 1.0
-            test_small_h = max(1, int(math.sqrt(test_ratio) * (factor // 2)))
-            test_small_w = max(1, int(math.sqrt(1 / test_ratio) * (factor // 2)))
-            test_large = test_h * test_w
-            test_small = test_small_h * test_small_w
-
-            if actual_tokens >= test_small + test_large:
-                prior_token_ids_d32 = token_tensor[test_small : test_small + test_large]
-                actual_h, actual_w = test_h, test_w
-                height = test_h * factor
-                width = test_w * factor
-                logger.warning(f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}")
-                break
-            elif actual_tokens >= test_large:
-                prior_token_ids_d32 = token_tensor[:test_large]
-                actual_h, actual_w = test_h, test_w
-                height = test_h * factor
-                width = test_w * factor
-                logger.warning(f"Adjusted grid to {test_h}x{test_w}, output will be {height}x{width}")
-                break
-        else:
-            sqrt_tokens = int(math.sqrt(actual_tokens))
-            actual_h = actual_w = sqrt_tokens
-            usable_tokens = sqrt_tokens * sqrt_tokens
-            prior_token_ids_d32 = token_tensor[:usable_tokens]
-            height = sqrt_tokens * factor
-            width = sqrt_tokens * factor
-            logger.error(f"Grid pattern mismatch. Using {sqrt_tokens}x{sqrt_tokens}, output: {height}x{width}")
-
-    # If i2i fallback path above could not determine a usable slice, run the
-    # generic recovery path to infer an actual grid from produced token count.
-    if is_i2i and len(prior_token_ids_d32) < large_image_tokens and actual_tokens < large_image_tokens:
-        for scale in [1, 2, 4]:
-            test_h = token_h // scale
-            test_w = token_w // scale
-            test_ratio = test_h / test_w if test_w > 0 else 1.0
-            test_small_h = max(1, int(math.sqrt(test_ratio) * (factor // 2)))
-            test_small_w = max(1, int(math.sqrt(1 / test_ratio) * (factor // 2)))
-            test_large = test_h * test_w
-            test_small = test_small_h * test_small_w
-
-            if actual_tokens >= test_small + test_large:
-                prior_token_ids_d32 = token_tensor[test_small : test_small + test_large]
-                actual_h, actual_w = test_h, test_w
-                height = test_h * factor
-                width = test_w * factor
-                logger.warning(
-                    "[_parse_generated_tokens] i2i recovery adjusted grid to %sx%s (small+large path)",
-                    test_h,
-                    test_w,
-                )
-                break
-            elif actual_tokens >= test_large:
-                prior_token_ids_d32 = token_tensor[:test_large]
-                actual_h, actual_w = test_h, test_w
-                height = test_h * factor
-                width = test_w * factor
-                logger.warning(
-                    "[_parse_generated_tokens] i2i recovery adjusted grid to %sx%s (large-only path)",
-                    test_h,
-                    test_w,
-                )
-                break
-        else:
-            sqrt_tokens = int(math.sqrt(actual_tokens))
-            actual_h = actual_w = max(1, sqrt_tokens)
-            usable_tokens = max(1, actual_h * actual_w)
-            prior_token_ids_d32 = token_tensor[:usable_tokens]
-            height = actual_h * factor
-            width = actual_w * factor
-            logger.error(
-                "[_parse_generated_tokens] i2i recovery fallback square grid=%sx%s output=%sx%s",
-                actual_h,
-                actual_w,
-                height,
-                width,
-            )
+        logger.warning(
+            "[_parse_generated_tokens] token parse failed: insufficient tokens "
+            "(actual_tokens=%s, expected=%s, mode=%s)",
+            actual_tokens,
+            large_image_tokens if is_i2i else (small_image_tokens + large_image_tokens),
+            "i2i" if is_i2i else "t2i",
+        )
+        raise ValueError(f"token parse failed: actual_tokens={actual_tokens}, mode={'i2i' if is_i2i else 't2i'}")
 
     # Upsample from 32x to 16x
     prior_token_ids = _upsample_token_ids(prior_token_ids_d32, actual_h, actual_w)
@@ -320,17 +228,6 @@ def ar2diffusion(
             mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
             _coerce_dim(original_prompt.get("width"), 1024),
         )
-        logger.info(
-            "[ar2diffusion] Request %s: resolved target size height=%s, width=%s "
-            "(mm_target_h=%s, mm_target_w=%s, prompt_height=%s, prompt_width=%s)",
-            i,
-            height,
-            width,
-            mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-            mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-            original_prompt.get("height"),
-            original_prompt.get("width"),
-        )
         text_prompt = original_prompt.get("prompt", "")
 
         # Detect i2i mode using multiple signals (not only multimodal_output).
@@ -356,31 +253,44 @@ def ar2diffusion(
                 is_i2i = True
                 mode_reasons.append("prompt.multi_modal_data has images")
 
-        prior_ids_present_on_output = False
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
             if isinstance(mm_output, dict):
                 if mm_output.get("prior_token_image_ids") is not None:
                     is_i2i = True
-                    prior_ids_present_on_output = True
                     mode_reasons.append("ar_output.multimodal_output has prior_token_image_ids")
                 elif "prior_token_image_ids" in mm_output:
                     # Keep this as a weak signal for diagnostics only.
                     mode_reasons.append("ar_output.multimodal_output has prior_token_image_ids key (None)")
 
         logger.info(
-            "[ar2diffusion] Request %s: mode=%s (reasons=%s, prompt_modalities=%s, "
-            "prompt_mm_keys=%s, prior_ids_on_output=%s)",
+            "[ar2diffusion] Request %s: mode=%s reasons=%s",
             i,
             "i2i" if is_i2i else "t2i",
             mode_reasons if mode_reasons else ["no-i2i-signal"],
-            prompt_modalities,
-            list(prompt_mm_data.keys()) if isinstance(prompt_mm_data, dict) else None,
-            prior_ids_present_on_output,
         )
 
         # Parse and upsample prior tokens
-        prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(generated_token_ids, height, width, is_i2i=is_i2i)
+        try:
+            prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(
+                generated_token_ids,
+                height,
+                width,
+                is_i2i=is_i2i,
+            )
+        except ValueError as e:
+            logger.warning(
+                "[ar2diffusion] Request %s: skip due to token parse failure: %s "
+                "(target=%sx%s, mode=%s, raw_tokens=%s, tail=%s)",
+                i,
+                e,
+                height,
+                width,
+                "i2i" if is_i2i else "t2i",
+                len(generated_token_ids),
+                generated_token_ids[-8:] if len(generated_token_ids) >= 8 else generated_token_ids,
+            )
+            continue
 
         # Get prior_token_image_ids from AR model output (for i2i mode)
         # This contains VQ-VAE tokens from input image, used for KV cache conditioning

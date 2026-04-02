@@ -283,10 +283,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if has_reference_images and (not request.modalities or "image" not in request.modalities):
             existing_modalities = list(request.modalities) if request.modalities else []
             request.modalities = list(dict.fromkeys(existing_modalities + ["image"]))
-            logger.info(
-                "Detected reference images in request messages; forcing image modality. modalities=%s",
-                request.modalities,
-            )
 
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own

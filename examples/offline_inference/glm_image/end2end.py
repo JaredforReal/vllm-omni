@@ -305,6 +305,12 @@ def main(args: argparse.Namespace) -> None:
         stop_token_ids=[GLM_IMAGE_EOS_TOKEN_ID],  # 16385, CRITICAL for stopping
         seed=args.seed,
         detokenize=False,
+        # Keep target size available in runner/model for deterministic M-RoPE
+        # decode grids in t2i (no mm_features available in this path).
+        extra_args={
+            "target_h": int(target_height),
+            "target_w": int(target_width),
+        },
     )
 
     # For diffusion stage, sampling_params contains diffusion-specific parameters

@@ -277,21 +277,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Pre-scan user messages for reference images so i2i requests are not
         # dropped when clients omit `modalities` in the OpenAI payload.
-        messages_as_dicts: list[dict[str, Any]] = []
-        for msg in request.messages:
-            if hasattr(msg, "model_dump"):
-                messages_as_dicts.append(msg.model_dump())
-            elif isinstance(msg, dict):
-                messages_as_dicts.append(msg)
-            else:
-                messages_as_dicts.append(
-                    {
-                        "role": getattr(msg, "role", "user"),
-                        "content": getattr(msg, "content", ""),
-                    }
-                )
-        _, precheck_reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
-        has_reference_images = len(precheck_reference_images) > 0
+        messages_as_dicts = self._messages_to_dicts(request.messages)
+        has_reference_images = self._get_reference_image_count(messages_as_dicts) > 0
 
         if has_reference_images and (not request.modalities or "image" not in request.modalities):
             existing_modalities = list(request.modalities) if request.modalities else []
@@ -319,16 +306,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_body = getattr(request, "extra_body", None)
                 if not extra_body:
                     extra_body = request.model_extra or {}
-                height = extra_body.get("height")
-                width = extra_body.get("width")
-                if "size" in extra_body:
-                    try:
-                        size_str = extra_body["size"]
-                        if isinstance(size_str, str) and "x" in size_str.lower():
-                            w, h = size_str.lower().split("x")
-                            width, height = int(w), int(h)
-                    except Exception:
-                        pass
+                height, width = self._resolve_height_width_from_extra_body(extra_body)
                 negative_prompt = extra_body.get("negative_prompt")
 
                 engine_prompt_image: dict[str, Any] | None = None
@@ -721,41 +699,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # For GLM-Image: compute max_tokens from height/width with mode-aware
         # budgeting (t2i vs i2i).
         extra_body = getattr(request, "extra_body", {}) or {}
-        height = extra_body.get("height")
-        width = extra_body.get("width")
-
-        if "size" in extra_body and (height is None or width is None):
-            try:
-                size_str = extra_body["size"]
-                if isinstance(size_str, str) and "x" in size_str.lower():
-                    w, h = size_str.lower().split("x")
-                    width, height = int(w), int(h)
-            except Exception:
-                logger.warning("[SamplingParams] Invalid size format in extra_body: %s", extra_body.get("size"))
+        height, width = self._resolve_height_width_from_extra_body(extra_body)
 
         # Best-effort mode detection from user messages.
         # i2i requests include at least one reference image in message content.
-        is_img2img = False
-        ref_image_count = 0
-        try:
-            messages_as_dicts: list[dict[str, Any]] = []
-            for msg in request.messages:
-                if hasattr(msg, "model_dump"):
-                    messages_as_dicts.append(msg.model_dump())
-                elif isinstance(msg, dict):
-                    messages_as_dicts.append(msg)
-                else:
-                    messages_as_dicts.append(
-                        {
-                            "role": getattr(msg, "role", "user"),
-                            "content": getattr(msg, "content", ""),
-                        }
-                    )
-            _, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
-            ref_image_count = len(reference_images)
-            is_img2img = ref_image_count > 0
-        except Exception as e:
-            logger.debug("[SamplingParams] Failed to detect i2i mode from messages: %s", e)
+        messages_as_dicts = self._messages_to_dicts(request.messages)
+        ref_image_count = self._get_reference_image_count(messages_as_dicts)
+        is_img2img = ref_image_count > 0
 
         if height is not None and width is not None:
             try:
@@ -769,15 +719,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
                 params.extra_args = extra_args
-                logger.info(
-                    "[SamplingParams] max_tokens=%s for %sx%s (mode=%s, ref_images=%s, explicit_fields=%s)",
-                    computed_max,
-                    height,
-                    width,
-                    "i2i" if is_img2img else "t2i",
-                    ref_image_count,
-                    sorted(list(explicit_fields)) if explicit_fields else [],
-                )
             except (ImportError, ValueError, TypeError) as e:
                 logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
         else:
@@ -822,15 +763,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 # For other stages, clone default params
                 sampling_params_list.append(default_params.clone())
-
-        # Log final sampling params for debugging
-        logger.info(
-            f"[SamplingParams] Stage {comprehension_idx} (comprehension): "
-            f"max_tokens={sampling_params_list[comprehension_idx].max_tokens}, "
-            f"stop_token_ids={sampling_params_list[comprehension_idx].stop_token_ids}, "
-            f"temperature={sampling_params_list[comprehension_idx].temperature}, "
-            f"explicit_fields_set={getattr(request, 'model_fields_set', getattr(request, '__fields_set__', set()))}"
-        )
 
         return sampling_params_list
 
@@ -2433,6 +2365,46 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt = " ".join(prompt_parts).strip()
         return prompt, images
+
+    @staticmethod
+    def _messages_to_dicts(messages: list[Any]) -> list[dict[str, Any]]:
+        """Normalize request messages to plain dicts."""
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if hasattr(msg, "model_dump"):
+                out.append(msg.model_dump())
+            elif isinstance(msg, dict):
+                out.append(msg)
+            else:
+                out.append(
+                    {
+                        "role": getattr(msg, "role", "user"),
+                        "content": getattr(msg, "content", ""),
+                    }
+                )
+        return out
+
+    @staticmethod
+    def _resolve_height_width_from_extra_body(extra_body: dict[str, Any]) -> tuple[Any, Any]:
+        """Extract generation height/width with optional size string fallback."""
+        height = extra_body.get("height")
+        width = extra_body.get("width")
+
+        if "size" in extra_body and (height is None or width is None):
+            try:
+                size_str = extra_body["size"]
+                if isinstance(size_str, str) and "x" in size_str.lower():
+                    w, h = size_str.lower().split("x")
+                    width, height = int(w), int(h)
+            except Exception:
+                pass
+
+        return height, width
+
+    def _get_reference_image_count(self, messages_as_dicts: list[dict[str, Any]]) -> int:
+        """Count reference images embedded in user chat messages."""
+        _, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+        return len(reference_images)
 
     def _create_error_response(
         self,

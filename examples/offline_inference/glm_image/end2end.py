@@ -293,10 +293,11 @@ def main(args: argparse.Namespace) -> None:
     # Default args.max_tokens is 16384 (very large), so prefer calculated value
     effective_max_tokens = calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
 
-    print(
-        f"AR max_tokens: {effective_max_tokens} "
-        f"(calculated: {calculated_max_tokens}, arg: {args.max_tokens}, mode: {'i2i' if is_i2i else 't2i'})"
-    )
+    if args.verbose:
+        print(
+            f"AR max_tokens: {effective_max_tokens} "
+            f"(calculated: {calculated_max_tokens}, arg: {args.max_tokens}, mode: {'i2i' if is_i2i else 't2i'})"
+        )
 
     # IMPORTANT: GLM-Image AR model requires these exact sampling parameters
     # from generation_config.json for proper image token generation.

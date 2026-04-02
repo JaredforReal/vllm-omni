@@ -707,16 +707,50 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if value is not None:
                 setattr(params, field_name, value)
 
-        # For GLM-Image: compute max_tokens from height/width if not provided by user or YAML
+        # For GLM-Image: compute max_tokens from height/width with mode-aware
+        # budgeting (t2i vs i2i).
         extra_body = getattr(request, "extra_body", {}) or {}
         height = extra_body.get("height")
         width = extra_body.get("width")
+
+        if "size" in extra_body and (height is None or width is None):
+            try:
+                size_str = extra_body["size"]
+                if isinstance(size_str, str) and "x" in size_str.lower():
+                    w, h = size_str.lower().split("x")
+                    width, height = int(w), int(h)
+            except Exception:
+                logger.warning("[SamplingParams] Invalid size format in extra_body: %s", extra_body.get("size"))
+
+        # Best-effort mode detection from user messages.
+        # i2i requests include at least one reference image in message content.
+        is_img2img = False
+        ref_image_count = 0
+        try:
+            messages_as_dicts: list[dict[str, Any]] = []
+            for msg in request.messages:
+                if hasattr(msg, "model_dump"):
+                    messages_as_dicts.append(msg.model_dump())
+                elif isinstance(msg, dict):
+                    messages_as_dicts.append(msg)
+                else:
+                    messages_as_dicts.append(
+                        {
+                            "role": getattr(msg, "role", "user"),
+                            "content": getattr(msg, "content", ""),
+                        }
+                    )
+            _, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+            ref_image_count = len(reference_images)
+            is_img2img = ref_image_count > 0
+        except Exception as e:
+            logger.debug("[SamplingParams] Failed to detect i2i mode from messages: %s", e)
 
         if height is not None and width is not None:
             try:
                 from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
-                computed_max = compute_max_tokens(int(height), int(width))
+                computed_max = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
                 params.max_tokens = computed_max
                 # Keep target size in stage-0 sampling params so runner/model can
                 # build deterministic M-RoPE grids for t2i (no MM features).
@@ -724,9 +758,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
                 params.extra_args = extra_args
-                logger.info(f"[SamplingParams] Computed max_tokens={computed_max} for {height}x{width}")
+                logger.info(
+                    "[SamplingParams] max_tokens=%s for %sx%s (mode=%s, ref_images=%s, explicit_fields=%s)",
+                    computed_max,
+                    height,
+                    width,
+                    "i2i" if is_img2img else "t2i",
+                    ref_image_count,
+                    sorted(list(explicit_fields)) if explicit_fields else [],
+                )
             except (ImportError, ValueError, TypeError) as e:
                 logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
+        else:
+            logger.info(
+                "[SamplingParams] Skip dynamic max_tokens (height=%s, width=%s, mode=%s, ref_images=%s)",
+                height,
+                width,
+                "i2i" if is_img2img else "t2i",
+                ref_image_count,
+            )
 
         return params
 

@@ -57,22 +57,22 @@ GLM_IMAGE_EOS_TOKEN_ID = 16385  # eos_token_id from generation_config.json
 GLM_IMAGE_VISION_VOCAB_SIZE = 16512  # top_k should be vision_vocab_size
 
 
-def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
+def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
 
-    GLM-Image generates tokens in this order for text-to-image:
-    1. Small preview image (half resolution in each dimension)
-    2. Large target image (full resolution)
-    3. EOS token
+    GLM-Image generation differs by mode:
+    - text-to-image (t2i): small preview + large target + EOS
+    - image-to-image (i2i): large target + EOS
 
     Args:
         height: Target image height in pixels
         width: Target image width in pixels
         factor: Downsampling factor (32 for GLM-Image AR output)
+        is_i2i: Whether the request is image-to-image mode
 
     Returns:
-        Total number of tokens to generate (small + large + EOS)
+        Total number of tokens to generate for the specified mode
     """
     # Large image tokens (target resolution)
     token_h = height // factor
@@ -87,7 +87,8 @@ def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
     small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
     small_tokens = small_token_h * small_token_w
 
-    # Total: small + large + EOS
+    if is_i2i:
+        return large_tokens + 1
     return small_tokens + large_tokens + 1
 
 
@@ -285,13 +286,17 @@ def main(args: argparse.Namespace) -> None:
     # Compute max_tokens dynamically based on target image size
     target_height = prompt_dict.get("height", 1024)
     target_width = prompt_dict.get("width", 1024)
-    calculated_max_tokens = compute_max_tokens(target_height, target_width)
+    is_i2i = source_image is not None
+    calculated_max_tokens = compute_max_tokens(target_height, target_width, is_i2i=is_i2i)
 
     # Use calculated value unless user explicitly specified a different value
     # Default args.max_tokens is 16384 (very large), so prefer calculated value
     effective_max_tokens = calculated_max_tokens if args.max_tokens == 16384 else args.max_tokens
 
-    print(f"AR max_tokens: {effective_max_tokens} (calculated: {calculated_max_tokens}, arg: {args.max_tokens})")
+    print(
+        f"AR max_tokens: {effective_max_tokens} "
+        f"(calculated: {calculated_max_tokens}, arg: {args.max_tokens}, mode: {'i2i' if is_i2i else 't2i'})"
+    )
 
     # IMPORTANT: GLM-Image AR model requires these exact sampling parameters
     # from generation_config.json for proper image token generation.

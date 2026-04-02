@@ -2821,19 +2821,29 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         prompt_ends_with_start = len(input_tokens) > 0 and input_tokens[-1] == image_start_token_id
         if prompt_ends_with_start and len(image_grid_thw) == num_source_images and num_source_images > 0:
             # i2i mode: source grids exist but no target grids
-            # Parse target grids from prompt tokens or use defaults
-            parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
-            if parsed_grids:
-                # parsed_grids contains all grids mentioned in prompt
-                # For i2i, add only the generation target grids
-                if len(parsed_grids) > num_source_images:
-                    image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
-                else:
-                    # Fallback: add default 1024x1024 generation grids (1 target for i2i)
-                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+            # Prefer explicit target size propagated from request sampling params.
+            # This avoids fragile grid parsing from token IDs for non-1024 i2i.
+            target_h = kwargs.get("target_h")
+            target_w = kwargs.get("target_w")
+            if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
+                factor = 32
+                token_h = target_h // factor
+                token_w = target_w // factor
+                image_grid_thw = list(image_grid_thw) + [[1, token_h, token_w]]
             else:
-                # Fallback to default 1024x1024 grids for generation
-                image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+                # Parse target grids from prompt tokens or use defaults
+                parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
+                if parsed_grids:
+                    # parsed_grids contains all grids mentioned in prompt
+                    # For i2i, add only the generation target grids
+                    if len(parsed_grids) > num_source_images:
+                        image_grid_thw = list(image_grid_thw) + parsed_grids[num_source_images:]
+                    else:
+                        # Fallback: add default 1024x1024 generation grid (1 target for i2i)
+                        image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
+                else:
+                    # Fallback to default 1024x1024 grid for generation
+                    image_grid_thw = list(image_grid_thw) + [[1, 32, 32]]
 
         llm_pos_ids_list: list[torch.Tensor] = []
 

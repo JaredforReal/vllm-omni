@@ -128,13 +128,13 @@ class GlmImageDataParser(MultiModalDataParser):
         parsers["img2img"] = self._parse_image_data
         return parsers
 
-    def parse_mm_data(self, mm_data):
+    def parse_mm_data(self, mm_data, **kwargs):
         # Normalize "img2img" to "image" so the rest of the pipeline
         # (mm_hashes, _merge_mm_kwargs) uses a single modality key.
         normalized = {}
         for k, v in mm_data.items():
             normalized["image" if k == "img2img" else k] = v
-        return super().parse_mm_data(normalized)
+        return super().parse_mm_data(normalized, **kwargs)
 
 
 class GlmImageProcessingInfo(BaseProcessingInfo):

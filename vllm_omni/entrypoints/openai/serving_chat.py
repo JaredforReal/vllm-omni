@@ -280,8 +280,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Pre-scan user messages for reference images so i2i requests are not
         # dropped when clients omit `modalities` in the OpenAI payload.
-        messages_as_dicts = self._messages_to_dicts(request.messages)
-        has_reference_images = self._get_reference_image_count(messages_as_dicts) > 0
+        extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
+        has_reference_images = len(reference_images) > 0
 
         if has_reference_images and (not request.modalities or "image" not in request.modalities):
             existing_modalities = list(request.modalities) if request.modalities else []
@@ -294,7 +294,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # effectively unconditioned and produce nonsense images.
         if (request.modalities and ("image" in request.modalities)) or has_reference_images:
             try:
-                extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
@@ -507,20 +506,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # containing image tokens.
         req_modalities = getattr(request, "modalities", [])
         if req_modalities and ("image" in req_modalities):
-            messages_as_dicts: list[dict[str, Any]] = []
-            for msg in messages:
-                if hasattr(msg, "model_dump"):
-                    messages_as_dicts.append(msg.model_dump())
-                elif isinstance(msg, dict):
-                    messages_as_dicts.append(msg)
-                else:
-                    messages_as_dicts.append(
-                        {
-                            "role": getattr(msg, "role", "user"),
-                            "content": getattr(msg, "content", ""),
-                        }
-                    )
-            extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
+            extracted_prompt, _ = self._extract_diffusion_prompt_and_images_from_messages(messages)
             if extracted_prompt:
                 engine_prompt["prompt"] = extracted_prompt
 
@@ -712,16 +698,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Best-effort mode detection from user messages.
         # i2i requests include at least one reference image in message content.
-        messages_as_dicts = self._messages_to_dicts(request.messages)
-        ref_image_count = self._get_reference_image_count(messages_as_dicts)
+        _, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
+        ref_image_count = len(reference_images)
         is_img2img = ref_image_count > 0
 
         if height is not None and width is not None:
             try:
                 from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
-                computed_max = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
-                params.max_tokens = computed_max
+                max_tokens = getattr(explicit_fields, "max_tokens", None)
+                if max_tokens is None:
+                    max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
+                params.max_tokens = max_tokens
                 # Keep target size in stage-0 sampling params so runner/model can
                 # build deterministic M-RoPE grids for t2i (no MM features).
                 extra_args = dict(getattr(params, "extra_args", {}) or {})
@@ -2380,6 +2368,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt = " ".join(prompt_parts).strip()
         return prompt, images
 
+    def _extract_diffusion_prompt_and_images_from_messages(
+        self,
+        messages: list[Any],
+    ) -> tuple[str, list[str]]:
+        """Normalize mixed message types and extract prompt + reference images once."""
+        return self._extract_diffusion_prompt_and_images(self._messages_to_dicts(messages))
+
     @staticmethod
     def _messages_to_dicts(messages: list[Any]) -> list[dict[str, Any]]:
         """Normalize request messages to plain dicts."""
@@ -2414,11 +2409,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 pass
 
         return height, width
-
-    def _get_reference_image_count(self, messages_as_dicts: list[dict[str, Any]]) -> int:
-        """Count reference images embedded in user chat messages."""
-        _, reference_images = self._extract_diffusion_prompt_and_images(messages_as_dicts)
-        return len(reference_images)
 
     def _create_error_response(
         self,

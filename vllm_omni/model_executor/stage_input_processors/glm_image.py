@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
+import math
 from typing import Any
 
 import torch
@@ -136,8 +137,6 @@ def _parse_generated_tokens(
     large_image_tokens = token_h * token_w
 
     # Calculate small preview image dimensions (used in text-to-image)
-    import math
-
     ratio = token_h / token_w if token_w > 0 else 1.0
     small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
     small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))

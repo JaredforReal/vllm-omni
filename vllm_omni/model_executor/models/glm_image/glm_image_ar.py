@@ -355,7 +355,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         target_h = mm_kwargs.get("target_h", 1024) if mm_kwargs else 1024
         target_w = mm_kwargs.get("target_w", 1024) if mm_kwargs else 1024
 
-        logger.info(
+        logger.debug(
             f"_call_hf_processor: target dimensions for generation: {target_h}x{target_w}, mm_kwargs={mm_kwargs}"
         )
 

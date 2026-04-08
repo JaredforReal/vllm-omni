@@ -177,7 +177,11 @@ class TestGetMropeInputPositions:
         # Decode order (reversed): grid[-1]=[1,16,16]=256, grid[-2]=[1,8,8]=64, EOS=1
         total_decode = 256 + 64 + 1  # 321
         assert positions.shape == (3, 4 + total_decode)
-        assert delta == total_decode
+        # delta = max_position + 1 - seq_len
+        # Positions advance by max(h,w) per grid: max(16,16)=16, max(8,8)=8
+        # max_pos = seq_len(4) + 16 + 8 = 28, then EOS at 28
+        # delta = 28 + 1 - 4 = 25
+        assert delta == 25
 
     def test_t2i_1024_default_grids(self, model):
         """t2i with default 1024x1024 grids when no explicit target size."""

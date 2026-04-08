@@ -332,3 +332,172 @@ def test_get_comprehension_stage_index_raises_when_not_found(mocker: MockerFixtu
 
     with pytest.raises(ValueError, match="No comprehension stage"):
         instance._get_comprehension_stage_index()
+
+
+# =============================================================================
+# Tests for _resolve_height_width_from_extra_body
+# =============================================================================
+
+
+class TestResolveHeightWidth:
+    def test_explicit_height_width(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"height": 512, "width": 768})
+        assert h == 512
+        assert w == 768
+
+    def test_size_string(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "768x512"})
+        assert w == 768
+        assert h == 512
+
+    def test_size_string_uppercase(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "768X512"})
+        assert w == 768
+        assert h == 512
+
+    def test_size_fallback_when_height_missing(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "512x512", "width": 1024})
+        # height is None, so size is used
+        assert h == 512
+        assert w == 1024
+
+    def test_empty_extra_body(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({})
+        assert h is None
+        assert w is None
+
+    def test_none_extra_body(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body(None)
+        assert h is None
+        assert w is None
+
+    def test_invalid_size_format_ignored(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "invalid"})
+        assert h is None
+        assert w is None
+
+
+# =============================================================================
+# Tests for _apply_request_overrides with GLM-Image (max_tokens computation)
+# =============================================================================
+
+
+class TestApplyRequestOverridesGLMImage:
+    """Test dynamic max_tokens computation for GLM-Image AR stage."""
+
+    @pytest.fixture
+    def glm_serving_chat(self, mock_engine_client, mocker: MockerFixture):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        instance = object.__new__(OmniOpenAIServingChat)
+        instance.engine_client = mock_engine_client
+        # Mock the image extraction to return no reference images (t2i by default)
+        instance._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(return_value=("a cat", []))
+        return instance
+
+    @pytest.fixture
+    def glm_request(self, mocker: MockerFixture):
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {"height": 1024, "width": 1024}
+        req.model_fields_set = set()
+        return req
+
+    def test_t2i_computes_max_tokens(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """t2i mode: max_tokens computed from height/width, no reference images."""
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        # t2i 1024x1024 = 256 + 1024 + 1 = 1281
+        assert result.max_tokens == 1281
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+
+    def test_i2i_computes_fewer_tokens(
+        self, glm_serving_chat, glm_request, default_comprehension_params, mocker: MockerFixture
+    ):
+        """i2i mode: max_tokens should be smaller than t2i for same dimensions."""
+        # Make it detect reference images
+        glm_serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(
+            return_value=("edit this", ["fake_image"])
+        )
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        # i2i 1024x1024 = 1024 + 1 = 1025
+        assert result.max_tokens == 1025
+
+    def test_user_max_tokens_overrides_computation(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """User-provided max_tokens should override dynamic computation."""
+        glm_request.max_tokens = 500
+        glm_request.model_fields_set = {"max_tokens"}
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        # User-specified max_tokens takes priority
+        assert result.max_tokens == 500
+
+    def test_no_height_width_preserves_default(
+        self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
+    ):
+        """When no height/width in extra_body, keep YAML default max_tokens."""
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {}
+        req.model_fields_set = set()
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
+        assert result.max_tokens == 2048  # YAML default
+
+    def test_size_string_parsed_for_glm_image(
+        self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
+    ):
+        """'size' in extra_body is parsed as fallback for height/width."""
+        req = mocker.MagicMock()
+        req.temperature = None
+        req.top_p = None
+        req.top_k = None
+        req.max_tokens = None
+        req.min_tokens = None
+        req.seed = None
+        req.ignore_eos = None
+        req.stop = None
+        req.stop_token_ids = None
+        req.frequency_penalty = None
+        req.presence_penalty = None
+        req.extra_body = {"size": "512x512"}
+        req.model_fields_set = set()
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
+        # 512x512 t2i = 256 + 256 + 1 = 513
+        assert result.max_tokens == 513

@@ -109,7 +109,8 @@ class TestBuildGenerationGrids:
         grids = processor._build_generation_grids(kwargs)
         assert grids.shape == (2, 3)
         assert grids[0].tolist() == [1, 16, 16]
-        assert grids[1].tolist() == [1, 8, 8]
+        # small: ratio=1.0, small_h=int(sqrt(1)*16)=16, small_w=16
+        assert grids[1].tolist() == [1, 16, 16]
 
     def test_non_square(self, processor):
         kwargs = {"target_h": 1024, "target_w": 512}
@@ -164,7 +165,7 @@ class TestGetMropeInputPositions:
         # All three dims should be [0, 1, 2, 3]
         for dim in range(3):
             assert positions[dim].tolist() == [0, 1, 2, 3]
-        assert delta == 1  # max + 1 - seq_len = 4 - 4 + 1 = 1 (but max=3, so 3+1-4=0)
+        assert delta == 0  # max(3) + 1 - seq_len(4) = 0
 
     def test_t2i_with_target_size(self, model):
         """t2i with explicit target_h/target_w: grids built from them."""
@@ -172,9 +173,9 @@ class TestGetMropeInputPositions:
         kwargs = {"target_h": 256, "target_w": 256}
 
         positions, delta = model.get_mrope_input_positions(input_tokens, **kwargs)
-        # seq_len = 4, grids = [[1,8,8], [1,4,4]]
-        # Prefill: 4 tokens, decode: 16 (small) + 64 (large) + 1 (EOS) = 81
-        total_decode = 4 * 4 + 8 * 8 + 1  # 16 + 64 + 1 = 81
+        # 256/32=8 -> grids = [[1,8,8], [1,16,16]] (small uses factor//2=16 base)
+        # Decode order (reversed): grid[-1]=[1,16,16]=256, grid[-2]=[1,8,8]=64, EOS=1
+        total_decode = 256 + 64 + 1  # 321
         assert positions.shape == (3, 4 + total_decode)
         assert delta == total_decode
 
@@ -226,58 +227,56 @@ class TestGlmImageRotaryEmbedding:
             GlmImageRotaryEmbedding,
         )
 
-        return GlmImageRotaryEmbedding(head_dim=32, mrope_section=[8, 12, 12])
+        # mrope_section=[8,12,12] sums to 32, so rotary_dim//2 must be >= 32
+        # -> head_dim=64 gives rotary_dim=64, rotary_dim//2=32
+        return GlmImageRotaryEmbedding(head_dim=64, mrope_section=[8, 12, 12])
 
     def test_apply_mrope_shape(self, rotary_emb):
         """Output shape matches [num_tokens, rotary_dim // 2]."""
-        freqs = torch.randn(3, 5, 16)  # 3 dims, 5 tokens, rotary_dim//2=16
+        freqs = torch.randn(3, 5, 32)  # 3 dims, 5 tokens, rotary_dim//2=32
         result = rotary_emb._apply_mrope(freqs)
-        assert result.shape == (5, 16)
+        assert result.shape == (5, 32)
 
     def test_apply_mrope_interleaving(self, rotary_emb):
         """Verify that M-RoPE correctly interleaves T/H/W sections."""
-        # mrope_section = [8, 12, 12] -> splits 16 into [8, 8] (only 2 chunks from 3 dims)
-        # Actually: 16 / sum of first pass = 8, 16/... let's compute:
-        # split([8, 12, 12]) on dim 16 => chunks of 8 and 8 (16 total)
-        # chunk 0 (size 8): take dim 0 % 3 = 0 (temporal)
-        # chunk 1 (size 8): take dim 1 % 3 = 1 (height)
-        # But we need 16 total, so only 2 chunks from [8, 12, 12]
-        freqs = torch.ones(3, 1, 16)
-        # Make each dim different
+        # mrope_section = [8, 12, 12] splits dim 32 into 3 chunks: [8, 12, 12]
+        # chunk 0 (size 8):  dim 0 % 3 = 0 (temporal)
+        # chunk 1 (size 12): dim 1 % 3 = 1 (height)
+        # chunk 2 (size 12): dim 2 % 3 = 2 (width)
+        freqs = torch.ones(3, 1, 32)
         freqs[0, :, :] = 1.0  # temporal
         freqs[1, :, :] = 2.0  # height
         freqs[2, :, :] = 3.0  # width
 
         result = rotary_emb._apply_mrope(freqs)
-        # chunk 0 (size 8): should be from dim 0 (all 1.0)
-        # chunk 1 (size 8): should be from dim 1 (all 2.0)
-        assert result.shape == (1, 16)
-        assert (result[0, :8] == 1.0).all()
-        assert (result[0, 8:16] == 2.0).all()
+        assert result.shape == (1, 32)
+        assert (result[0, :8] == 1.0).all()  # chunk 0: temporal
+        assert (result[0, 8:20] == 2.0).all()  # chunk 1: height
+        assert (result[0, 20:32] == 3.0).all()  # chunk 2: width
 
     def test_forward_1d_positions(self, rotary_emb):
         """Forward with 1D positions (text-only) produces correct shapes."""
         positions = torch.arange(10)  # [10]
-        q = torch.randn(10, 32)
-        k = torch.randn(10, 32)
+        q = torch.randn(10, 64)
+        k = torch.randn(10, 64)
         q_out, k_out = rotary_emb(positions, q, k)
-        assert q_out.shape == (10, 32)
-        assert k_out.shape == (10, 32)
+        assert q_out.shape == (10, 64)
+        assert k_out.shape == (10, 64)
 
     def test_forward_3d_positions(self, rotary_emb):
         """Forward with 3D M-RoPE positions produces correct shapes."""
         positions = torch.arange(30).reshape(3, 10)  # [3, 10]
-        q = torch.randn(10, 32)
-        k = torch.randn(10, 32)
+        q = torch.randn(10, 64)
+        k = torch.randn(10, 64)
         q_out, k_out = rotary_emb(positions, q, k)
-        assert q_out.shape == (10, 32)
-        assert k_out.shape == (10, 32)
+        assert q_out.shape == (10, 64)
+        assert k_out.shape == (10, 64)
 
     def test_forward_preserves_dtype(self, rotary_emb):
         """Output dtype matches input dtype."""
         positions = torch.arange(5)
-        q = torch.randn(5, 32, dtype=torch.float32)
-        k = torch.randn(5, 32, dtype=torch.float32)
+        q = torch.randn(5, 64, dtype=torch.float32)
+        k = torch.randn(5, 64, dtype=torch.float32)
         q_out, k_out = rotary_emb(positions, q, k)
         assert q_out.dtype == torch.float32
         assert k_out.dtype == torch.float32

@@ -188,6 +188,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "DiffusersBridge": (
+        "diffusers_bridge",
+        "pipeline_diffusers_bridge",
+        "DiffusersBridgePipeline",
+    ),
 }
 
 
@@ -204,6 +209,7 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "DiffusersBridgePipeline",
 }
 
 
@@ -375,6 +381,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "DiffusersBridgePipeline": "get_diffusers_bridge_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

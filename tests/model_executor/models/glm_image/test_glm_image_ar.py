@@ -2,11 +2,36 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for GLM-Image AR model: DataParser, processor, and M-RoPE."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+# The model module imports from transformers.models.glm_image at the top level,
+# but that package may not be available in CI. Stub it out before importing the
+# model code so the unit tests can run without the proprietary transformers
+# submodule.
+for _mod_name in (
+    "transformers.models.glm_image",
+    "transformers.models.glm_image.configuration_glm_image",
+    "transformers.models.glm_image.processing_glm_image",
+):
+    if _mod_name not in sys.modules:
+        sys.modules[_mod_name] = ModuleType(_mod_name)
+
+sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageConfig = type("GlmImageConfig", (), {})
+sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageTextConfig = type(
+    "GlmImageTextConfig", (), {}
+)
+sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageVisionConfig = type(
+    "GlmImageVisionConfig", (), {}
+)
+sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageVQVAEConfig = type(
+    "GlmImageVQVAEConfig", (), {}
+)
+sys.modules["transformers.models.glm_image.processing_glm_image"].GlmImageProcessor = type("GlmImageProcessor", (), {})
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

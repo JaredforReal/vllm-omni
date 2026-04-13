@@ -2,36 +2,91 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for GLM-Image AR model: DataParser, processor, and M-RoPE."""
 
+import importlib.util
+import os
 import sys
-from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock
+import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-# The model module imports from transformers.models.glm_image at the top level,
-# but that package may not be available in CI. Stub it out before importing the
-# model code so the unit tests can run without the proprietary transformers
-# submodule.
-for _mod_name in (
-    "transformers.models.glm_image",
-    "transformers.models.glm_image.configuration_glm_image",
-    "transformers.models.glm_image.processing_glm_image",
-):
-    if _mod_name not in sys.modules:
-        sys.modules[_mod_name] = ModuleType(_mod_name)
+# ---------------------------------------------------------------------------
+# Load target classes via importlib to avoid requiring transformers.models.glm_image
+# (which may not exist in CI).  This follows the same pattern as
+# tests/model_executor/models/qwen3_tts/test_code_predictor_dtype.py.
+# ---------------------------------------------------------------------------
 
-sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageConfig = type("GlmImageConfig", (), {})
-sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageTextConfig = type(
-    "GlmImageTextConfig", (), {}
+_BASE = os.path.join(
+    os.path.dirname(__file__),
+    os.pardir,
+    os.pardir,
+    os.pardir,
+    os.pardir,
+    "vllm_omni",
+    "model_executor",
+    "models",
+    "glm_image",
 )
-sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageVisionConfig = type(
-    "GlmImageVisionConfig", (), {}
-)
-sys.modules["transformers.models.glm_image.configuration_glm_image"].GlmImageVQVAEConfig = type(
-    "GlmImageVQVAEConfig", (), {}
-)
-sys.modules["transformers.models.glm_image.processing_glm_image"].GlmImageProcessor = type("GlmImageProcessor", (), {})
+
+
+def _load_module(name: str, filename: str):
+    path = os.path.abspath(os.path.join(_BASE, filename))
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _build_mock_modules() -> dict[str, object]:
+    """Build the dict of modules to inject into sys.modules."""
+    # Stub transformers.models.glm_image submodules
+    glm_image_mod = types.ModuleType("transformers.models.glm_image")
+    glm_config_mod = types.ModuleType("transformers.models.glm_image.configuration_glm_image")
+    glm_config_mod.GlmImageConfig = type("GlmImageConfig", (), {})
+    glm_config_mod.GlmImageTextConfig = type("GlmImageTextConfig", (), {})
+    glm_config_mod.GlmImageVisionConfig = type("GlmImageVisionConfig", (), {})
+    glm_config_mod.GlmImageVQVAEConfig = type("GlmImageVQVAEConfig", (), {})
+    glm_proc_mod = types.ModuleType("transformers.models.glm_image.processing_glm_image")
+    glm_proc_mod.GlmImageProcessor = type("GlmImageProcessor", (), {})
+
+    # vllm_omni submodules needed by the import chain
+    vllm_omni_mod = MagicMock()
+    vllm_omni_models = types.ModuleType("vllm_omni.model_executor.models")
+    vllm_omni_glm_image_pkg = types.ModuleType("vllm_omni.model_executor.models.glm_image")
+    vllm_omni_glm_image_pkg.__path__ = [os.path.abspath(_BASE)]
+    vllm_omni_output = MagicMock()
+
+    return {
+        "transformers.models.glm_image": glm_image_mod,
+        "transformers.models.glm_image.configuration_glm_image": glm_config_mod,
+        "transformers.models.glm_image.processing_glm_image": glm_proc_mod,
+        "vllm_omni": vllm_omni_mod,
+        "vllm_omni.model_executor": types.ModuleType("vllm_omni.model_executor"),
+        "vllm_omni.model_executor.models": vllm_omni_models,
+        "vllm_omni.model_executor.models.glm_image": vllm_omni_glm_image_pkg,
+        "vllm_omni.model_executor.models.output_templates": vllm_omni_output,
+    }
+
+
+def _load_target_classes():
+    """Load the glm_image_ar module with mocked dependencies."""
+    mocks = _build_mock_modules()
+    with patch.dict(sys.modules, mocks):
+        mod = _load_module(
+            "vllm_omni.model_executor.models.glm_image.glm_image_ar",
+            "glm_image_ar.py",
+        )
+        sys.modules["vllm_omni.model_executor.models.glm_image.glm_image_ar"] = mod
+    return mod
+
+
+_ar_mod = _load_target_classes()
+
+GlmImageDataParser = _ar_mod.GlmImageDataParser
+GlmImageMultiModalProcessor = _ar_mod.GlmImageMultiModalProcessor
+GlmImageForConditionalGeneration = _ar_mod.GlmImageForConditionalGeneration
+GlmImageRotaryEmbedding = _ar_mod.GlmImageRotaryEmbedding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -51,6 +106,8 @@ def _make_hf_config(**overrides):
         "grid_eos_token_id": None,
     }
     defaults.update(overrides)
+    from types import SimpleNamespace
+
     return SimpleNamespace(**defaults)
 
 
@@ -63,8 +120,6 @@ class TestGlmImageDataParser:
     """Test that img2img key is normalized to image in the data parser."""
 
     def test_img2img_normalized_to_image(self):
-        from vllm_omni.model_executor.models.glm_image.glm_image_ar import GlmImageDataParser
-
         parser = GlmImageDataParser.__new__(GlmImageDataParser)
         parser._expected_hidden_size = 4096
         # The _get_subparsers should include img2img
@@ -73,8 +128,6 @@ class TestGlmImageDataParser:
         assert subparsers["img2img"] == parser._parse_image_data
 
     def test_parse_mm_data_normalizes_img2img(self):
-        from vllm_omni.model_executor.models.glm_image.glm_image_ar import GlmImageDataParser
-
         parser = GlmImageDataParser.__new__(GlmImageDataParser)
         parser._expected_hidden_size = 4096
         # Create a mock for the parent parse_mm_data
@@ -112,10 +165,6 @@ class TestBuildGenerationGrids:
     @pytest.fixture
     def processor(self):
         """Create a minimal processor instance with mocked info."""
-        from vllm_omni.model_executor.models.glm_image.glm_image_ar import (
-            GlmImageMultiModalProcessor,
-        )
-
         proc = object.__new__(GlmImageMultiModalProcessor)
         proc.info = MagicMock()
         return proc
@@ -174,10 +223,6 @@ class TestGetMropeInputPositions:
     @pytest.fixture
     def model(self):
         """Create a minimal model instance for M-RoPE testing."""
-        from vllm_omni.model_executor.models.glm_image.glm_image_ar import (
-            GlmImageForConditionalGeneration,
-        )
-
         model = object.__new__(GlmImageForConditionalGeneration)
         model.config = _make_hf_config()
         return model
@@ -252,10 +297,6 @@ class TestGlmImageRotaryEmbedding:
 
     @pytest.fixture
     def rotary_emb(self):
-        from vllm_omni.model_executor.models.glm_image.glm_image_ar import (
-            GlmImageRotaryEmbedding,
-        )
-
         # mrope_section=[8,12,12] sums to 32, so rotary_dim//2 must be >= 32
         # -> head_dim=64 gives rotary_dim=64, rotary_dim//2=32
         return GlmImageRotaryEmbedding(head_dim=64, mrope_section=[8, 12, 12])

@@ -40,6 +40,10 @@ class OmniInputPreprocessor(InputPreprocessor):
         """
         prompt_text = parsed_content["prompt"]
         mm_processor_kwargs = parsed_content.get("mm_processor_kwargs") or {}
+        # When the deprecated raw-prompt path is used, process_inputs does
+        # not pass mm_uuids to preprocess().  Fall back to reading it from
+        # the prompt dict so the Renderer's _validate_mm_uuids can see it.
+        effective_mm_uuids = mm_uuids or parsed_content.get("multi_modal_uuids")
 
         inputs: OmniTokenInputs | MultiModalInput
         if multi_modal_data := parsed_content.get("multi_modal_data"):
@@ -48,7 +52,7 @@ class OmniInputPreprocessor(InputPreprocessor):
                 multi_modal_data,
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
+                mm_uuids=effective_mm_uuids,
             )
             prompt_embeds = parsed_content.get("prompt_embeds")
             if prompt_embeds is not None:
@@ -62,7 +66,7 @@ class OmniInputPreprocessor(InputPreprocessor):
                 {},
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
+                mm_uuids=effective_mm_uuids,
             )
         else:
             prompt_token_ids = self._tokenize_prompt(

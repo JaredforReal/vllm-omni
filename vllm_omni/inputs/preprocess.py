@@ -29,6 +29,8 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        mm_uuids: Any | None = None,
     ) -> OmniTokenInputs | MultiModalInput:
         """Process text prompts with support for mm_processor_kwargs.
 
@@ -46,6 +48,7 @@ class OmniInputPreprocessor(InputPreprocessor):
                 multi_modal_data,
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
             )
             prompt_embeds = parsed_content.get("prompt_embeds")
             if prompt_embeds is not None:
@@ -59,6 +62,7 @@ class OmniInputPreprocessor(InputPreprocessor):
                 {},
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
             )
         else:
             prompt_token_ids = self._tokenize_prompt(

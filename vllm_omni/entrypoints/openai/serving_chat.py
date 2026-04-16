@@ -335,6 +335,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
+                    # Provide multi_modal_uuids so that newer vLLM versions
+                    # can validate multi_modal_data / multi_modal_uuids
+                    # consistency.  After the multimodal processor consumes
+                    # the image data, the uuids remain as a stable reference.
+                    tprompt["multi_modal_uuids"] = {
+                        k: [f"{request_id}-{k}-{i}"] for i, k in enumerate(engine_prompt_image)
+                    }
 
                 engine_prompts = [tprompt]
                 # Store height/width for applying to diffusion stage sampling params later

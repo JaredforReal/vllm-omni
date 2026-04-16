@@ -146,6 +146,8 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         prompt: SingletonDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        mm_uuids: Any | None = None,
     ) -> SingletonInput:
         """
         Extract the singleton inputs from a prompt.
@@ -170,6 +172,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             return self._process_text(
                 prompt,  # type: ignore[arg-type]
                 tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
             )
 
         assert_never(prompt)  # type: ignore[arg-type]

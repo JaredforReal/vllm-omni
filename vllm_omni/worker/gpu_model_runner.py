@@ -143,8 +143,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             sp_extra_args = getattr(req_state.sampling_params, "extra_args", {}) if req_state.sampling_params else {}
             target_h = sp_extra_args.get("target_h") if isinstance(sp_extra_args, dict) else None
             target_w = sp_extra_args.get("target_w") if isinstance(sp_extra_args, dict) else None
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
-                req_state.prompt_token_ids,
+            kwargs = dict(
                 mm_features=req_state.mm_features,
                 hf_config=self.model_config.hf_config,
                 image_grid_thw=image_grid_thw,
@@ -152,8 +151,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 second_per_grid_ts=second_per_grid_ts,
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
-                target_h=target_h,
-                target_w=target_w,
+            )
+            if target_h is not None:
+                kwargs["target_h"] = target_h
+            if target_w is not None:
+                kwargs["target_w"] = target_w
+            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                **kwargs,
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(

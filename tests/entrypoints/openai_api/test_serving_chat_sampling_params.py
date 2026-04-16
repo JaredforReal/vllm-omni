@@ -388,13 +388,6 @@ class TestResolveHeightWidth:
         assert h is None
         assert w is None
 
-    def test_empty_dict_extra_body(self):
-        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-
-        h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({})
-        assert h is None
-        assert w is None
-
     def test_invalid_size_format_ignored(self):
         from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 

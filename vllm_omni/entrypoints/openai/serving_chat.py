@@ -275,22 +275,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         num_inference_steps = None
 
-        # Pre-scan user messages for reference images so i2i requests are not
-        # dropped when clients omit `modalities` in the OpenAI payload.
-        extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-        has_reference_images = len(reference_images) > 0
-
-        if has_reference_images and (not request.modalities or "image" not in request.modalities):
-            existing_modalities = list(request.modalities) if request.modalities else []
-            request.modalities = list(dict.fromkeys(existing_modalities + ["image"]))
-
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
-        if (request.modalities and ("image" in request.modalities)) or has_reference_images:
+        if request.modalities and ("image" in request.modalities):
             try:
+                extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images_from_messages(
+                    request.messages
+                )
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
@@ -319,16 +313,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        # GLM-Image i2i path expects source image under "image".
-                        engine_prompt_image = {"image": img}
+                        engine_prompt_image = {"img2img": img}
                     except Exception:
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
-                # Keep stage-0 input modality as "image" for both t2i and i2i
-                # so the model processor receives image items consistently.
-                tprompt["modalities"] = ["image"]
+                if engine_prompt_image:
+                    tprompt["modalities"] = ["img2img"]
+                else:
+                    tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs

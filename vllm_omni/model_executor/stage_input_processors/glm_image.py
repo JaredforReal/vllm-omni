@@ -3,6 +3,7 @@
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
 import math
+import time
 from typing import Any
 
 import torch
@@ -217,6 +218,8 @@ def ar2diffusion(
     requires_multimodal_data: bool = False,
 ) -> list[dict[str, Any]]:
     """Process AR stage outputs to create Diffusion stage inputs."""
+    _t_total = time.perf_counter()
+
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
 
@@ -235,6 +238,7 @@ def ar2diffusion(
         prompt = [prompt] if prompt is not None else [{}]
 
     for i, ar_output in enumerate(ar_outputs):
+        _t_req = time.perf_counter()
         output = ar_output.outputs[0]
         generated_token_ids = output.token_ids
 
@@ -273,6 +277,7 @@ def ar2diffusion(
         # Detect i2i mode.
         # Prefer normalized prompt multi_modal_data source-image presence, with
         # multimodal output as secondary signal.
+        _t_mode = time.perf_counter()
         is_i2i = False
 
         prompt_modalities = original_prompt.get("modalities")
@@ -288,8 +293,10 @@ def ar2diffusion(
             if isinstance(mm_output, dict):
                 if mm_output.get("prior_token_image_ids") is not None:
                     is_i2i = True
+        _dt_mode = (time.perf_counter() - _t_mode) * 1000
 
         # Parse and upsample prior tokens
+        _t_parse = time.perf_counter()
         try:
             prior_token_ids, pixel_h, pixel_w = _parse_generated_tokens(
                 generated_token_ids,
@@ -310,10 +317,12 @@ def ar2diffusion(
                 generated_token_ids[-8:] if len(generated_token_ids) >= 8 else generated_token_ids,
             )
             continue
+        _dt_parse = (time.perf_counter() - _t_parse) * 1000
 
         # Get prior_token_image_ids from AR model output (for i2i mode)
         # This contains VQ-VAE tokens from input image, used for KV cache conditioning
         # NOTE: multimodal_output is attached to ar_output (RequestOutput), NOT output (CompletionOutput)
+        _t_prior_img = time.perf_counter()
         prior_token_image_ids = None
 
         # Check ar_output (RequestOutput) for multimodal_output - this is the correct location
@@ -352,6 +361,7 @@ def ar2diffusion(
                             prior_token_image_ids = [raw_prior_image_ids]
                         elif isinstance(raw_prior_image_ids, list):
                             prior_token_image_ids = raw_prior_image_ids
+        _dt_prior_img = (time.perf_counter() - _t_prior_img) * 1000
 
         diffusion_input = {
             "prompt": text_prompt,
@@ -373,6 +383,31 @@ def ar2diffusion(
             if key in original_prompt:
                 diffusion_input[key] = original_prompt[key]
 
+        _dt_req = (time.perf_counter() - _t_req) * 1000
+        logger.info(
+            "[ar2diffusion] req=%d mode=%s target=%dx%d "
+            "raw_tokens=%d prior_tokens=%d prior_image_ids=%s "
+            "timing: mode_detect=%.3fms parse+upsample=%.3fms "
+            "prior_image_ids_extract=%.3fms req_total=%.3fms",
+            i,
+            "i2i" if is_i2i else "t2i",
+            pixel_h,
+            pixel_w,
+            len(generated_token_ids),
+            len(prior_token_ids),
+            "yes" if prior_token_image_ids is not None else "no",
+            _dt_mode,
+            _dt_parse,
+            _dt_prior_img,
+            _dt_req,
+        )
         diffusion_inputs.append(diffusion_input)
+
+    _dt_total = (time.perf_counter() - _t_total) * 1000
+    logger.info(
+        "[ar2diffusion] batch done: %d reqs, total=%.3fms",
+        len(diffusion_inputs),
+        _dt_total,
+    )
 
     return diffusion_inputs

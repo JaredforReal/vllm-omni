@@ -316,6 +316,8 @@ def test_apply_overrides_empty_stop_list_preserves_default(serving_chat, mocker)
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -337,6 +339,8 @@ def test_apply_overrides_nonempty_stop_list_overrides_default(serving_chat, mock
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -379,6 +383,8 @@ def test_apply_overrides_nonempty_stop_token_ids_overrides_default(serving_chat,
     request.stop_token_ids = [100]  # non-empty list — should override
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -404,6 +410,8 @@ def test_apply_overrides_mixed_empty_and_nonempty_lists(serving_chat, mocker):
     request.stop_token_ids = [100, 200]  # non-empty — SHOULD override
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"temperature", "stop", "stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -427,6 +435,8 @@ def test_apply_overrides_none_scalar_still_preserves_default(serving_chat, mocke
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = set()
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 
@@ -454,6 +464,8 @@ def test_apply_overrides_both_lists_empty_preserves_defaults(serving_chat, mocke
     request.stop_token_ids = []
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.model_fields_set = {"stop", "stop_token_ids"}
+    request.extra_body = {}
 
     result = serving_chat._apply_request_overrides(default_params, request)
 

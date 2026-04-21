@@ -16,6 +16,7 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
     model_type="glm_image",
     model_arch="GlmImageForConditionalGeneration",
     hf_architectures=("GlmImageForConditionalGeneration",),
+    diffusers_class_name="GlmImagePipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -27,6 +28,8 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             model_arch="GlmImageForConditionalGeneration",
             engine_output_type="token_ids",
+            model_subdir="vision_language_encoder",
+            tokenizer_subdir="processor",
         ),
         StagePipelineConfig(
             stage_id=1,

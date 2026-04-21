@@ -16,8 +16,6 @@ stages:
     enforce_eager: false
     max_num_batched_tokens: 32768
     devices: "0"
-    model_subdir: vision_language_encoder
-    tokenizer_subdir: processor
     default_sampling_params:
       temperature: 0.9
       top_p: 0.75

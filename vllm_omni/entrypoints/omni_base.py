@@ -122,6 +122,7 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
@@ -313,6 +314,13 @@ class OmniBase(PDDisaggregationMixin):
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
         peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
+
+        # Merge AR stage timing from OrchestratorAggregator.stage_events
+        if self._enable_ar_profiler:
+            ar_events = metrics.stage_events.get(str(req_id), [])
+            for evt in ar_events:
+                if evt.stage_id != stage_id:
+                    stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")

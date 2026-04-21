@@ -40,7 +40,7 @@ GLM-Image uses a 2-stage pipeline:
 
 ```bash
 python end2end.py \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/deploy/glm_image.yaml \
     --prompt "A beautiful sunset over the ocean with sailing boats" \
     --height 1024 \
     --width 1024 \
@@ -51,7 +51,7 @@ python end2end.py \
 
 ```bash
 python end2end.py \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/deploy/glm_image.yaml \
     --prompt "Transform this scene into a winter wonderland" \
     --image input.png \
     --output output_i2i.png
@@ -99,7 +99,7 @@ The stage config (`glm_image.yaml`) defines:
   - Model: `GlmImagePipeline`
   - Output: Generated image
 
-See `vllm_omni/model_executor/stage_configs/glm_image.yaml` for full configuration.
+See `vllm_omni/deploy/glm_image.yaml` for full configuration.
 
 ## Comparison with Single-Stage
 

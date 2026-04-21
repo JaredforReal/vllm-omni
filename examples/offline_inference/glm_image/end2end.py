@@ -48,7 +48,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Default stage config path (relative to vllm_omni package)
-DEFAULT_CONFIG_PATH = "vllm_omni/model_executor/stage_configs/glm_image.yaml"
+DEFAULT_CONFIG_PATH = "vllm_omni/deploy/glm_image.yaml"
 
 SEED = 42
 
@@ -194,7 +194,7 @@ def main(args: argparse.Namespace) -> None:
         else:
             # Try relative to script location
             script_dir = Path(__file__).parent.parent.parent.parent
-            config_path = script_dir / "vllm_omni/model_executor/stage_configs/glm_image.yaml"
+            config_path = script_dir / "vllm_omni/deploy/glm_image.yaml"
             if not config_path.exists():
                 raise FileNotFoundError(
                     f"Stage config not found. Please specify --config-path. Tried: {DEFAULT_CONFIG_PATH}"

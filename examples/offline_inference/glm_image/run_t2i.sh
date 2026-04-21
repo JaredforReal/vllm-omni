@@ -6,7 +6,7 @@ set -e
 
 # Default values
 MODEL_PATH="${MODEL_PATH:-/path/to/glm-image}"
-CONFIG_PATH="${CONFIG_PATH:-vllm_omni/model_executor/stage_configs/glm_image.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-vllm_omni/deploy/glm_image.yaml}"
 PROMPT="${PROMPT:-A beautiful mountain landscape with snow-capped peaks and a clear blue lake}"
 OUTPUT="${OUTPUT:-output_t2i.png}"
 HEIGHT="${HEIGHT:-1024}"

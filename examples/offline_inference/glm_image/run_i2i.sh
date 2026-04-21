@@ -6,7 +6,7 @@ set -e
 
 # Default values
 MODEL_PATH="${MODEL_PATH:-/path/to/glm-image}"
-CONFIG_PATH="${CONFIG_PATH:-vllm_omni/model_executor/stage_configs/glm_image.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-vllm_omni/deploy/glm_image.yaml}"
 PROMPT="${PROMPT:-Transform this image into an oil painting style}"
 INPUT_IMAGE=""
 OUTPUT="${OUTPUT:-output_i2i.png}"

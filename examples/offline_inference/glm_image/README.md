@@ -62,7 +62,7 @@ python end2end.py \
 ```bash
 python end2end.py \
     --model-path /path/to/glm-image \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
+    --config-path ../../../vllm_omni/deploy/glm_image.yaml \
     --prompt "A photorealistic cat sitting on a window sill" \
     --height 1024 \
     --width 1024 \

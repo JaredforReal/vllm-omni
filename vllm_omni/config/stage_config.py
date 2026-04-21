@@ -1371,6 +1371,23 @@ class StageConfigFactory:
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
 
+        # Fallback for diffusers-style models: check model_index.json.
+        # Some models (e.g. GLM-Image) have no root config.json but ship a
+        # model_index.json with _class_name that maps to a pipeline key.
+        try:
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+
+            from vllm_omni.entrypoints.utils import _DIFFUSERS_CLASS_TO_CONFIG
+
+            model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+            if model_index and "_class_name" in model_index:
+                model_type = _DIFFUSERS_CLASS_TO_CONFIG.get(model_index["_class_name"])
+                if model_type:
+                    logger.info("Detected pipeline %r from model_index.json", model_type)
+                    return model_type, None
+        except Exception:
+            pass
+
         return None, None
 
     @classmethod

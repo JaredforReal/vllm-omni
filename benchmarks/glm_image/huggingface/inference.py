@@ -163,7 +163,7 @@ def benchmark(args: argparse.Namespace) -> None:
         if args.mode == "i2i":
             img_path = item.get("image_path")
             if img_path and os.path.exists(img_path):
-                gen_kwargs["image"] = Image.open(img_path).convert("RGB")
+                gen_kwargs["image"] = [Image.open(img_path).convert("RGB")]
             else:
                 print(f"  [{i + 1}] SKIP: no source image")
                 failed += 1

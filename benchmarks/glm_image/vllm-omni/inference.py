@@ -292,14 +292,14 @@ def benchmark(args: argparse.Namespace) -> None:
     print(f"{'Successful:':<40} {success}/{valid}")
     print(f"{'Failed:':<40} {failed}")
     print("-" * 50)
-    if latencies:
-        arr = np.array(latencies)
+    per_request = np.diff([0.0] + list(latencies)) if latencies else np.array([])
+    if len(per_request) > 0:
         print(f"{'Total generation time (s):':<40} {total_gen_time:.2f}")
         print(f"{'Throughput (img/s):':<40} {success / total_gen_time:.4f}")
-        print(f"{'Latency Mean (s):':<40} {arr.mean():.4f}")
-        print(f"{'Latency Median (s):':<40} {np.median(arr):.4f}")
-        print(f"{'Latency P95 (s):':<40} {np.percentile(arr, 95):.4f}")
-        print(f"{'Latency P99 (s):':<40} {np.percentile(arr, 99):.4f}")
+        print(f"{'Latency Mean (s):':<40} {per_request.mean():.4f}")
+        print(f"{'Latency Median (s):':<40} {np.median(per_request):.4f}")
+        print(f"{'Latency P95 (s):':<40} {np.percentile(per_request, 95):.4f}")
+        print(f"{'Latency P99 (s):':<40} {np.percentile(per_request, 99):.4f}")
 
     print(f"\n{'Output dir:':<40} {args.output_dir}")
     print("=" * 60)
@@ -317,10 +317,10 @@ def benchmark(args: argparse.Namespace) -> None:
         "failed_requests": failed,
         "total_gen_time_s": total_gen_time,
         "throughput_qps": success / total_gen_time if total_gen_time > 0 else 0,
-        "latency_mean": float(np.mean(latencies)) if latencies else 0,
-        "latency_median": float(np.median(latencies)) if latencies else 0,
-        "latency_p95": float(np.percentile(latencies, 95)) if latencies else 0,
-        "latency_p99": float(np.percentile(latencies, 99)) if latencies else 0,
+        "latency_mean": float(per_request.mean()) if len(per_request) > 0 else 0,
+        "latency_median": float(np.median(per_request)) if len(per_request) > 0 else 0,
+        "latency_p95": float(np.percentile(per_request, 95)) if len(per_request) > 0 else 0,
+        "latency_p99": float(np.percentile(per_request, 99)) if len(per_request) > 0 else 0,
     }
     if args.output_file:
         with open(args.output_file, "w") as f:

@@ -245,6 +245,7 @@ async def async_glm_image_request(
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
+        "modalities": ["image"],
     }
     if extra_body:
         payload["extra_body"] = extra_body

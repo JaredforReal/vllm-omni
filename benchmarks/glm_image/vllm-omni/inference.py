@@ -308,12 +308,16 @@ def benchmark(args: argparse.Namespace) -> None:
         print(f"{'Latency P99 (s):':<40} {np.percentile(per_request, 99):.4f}")
 
     # Stage-level profiling
+    # AR stage timings from the orchestrator are cumulative wall-clock offsets
+    # (measured from batch submission). Convert to per-request deltas.
     if all_stage_durations:
         stage_keys = sorted(all_stage_durations[0].keys())
         print("-" * 50)
         print("Stage Durations Mean (s):")
         for key in stage_keys:
             vals = [d.get(key, 0.0) for d in all_stage_durations]
+            if key.startswith("ar_stage_"):
+                vals = list(np.diff([0.0] + vals))
             print(f"  {key + ':':<38} {np.mean(vals):.4f}")
 
     print(f"\n{'Output dir:':<40} {args.output_dir}")
@@ -342,6 +346,8 @@ def benchmark(args: argparse.Namespace) -> None:
         stage_metrics = {}
         for key in stage_keys:
             vals = [d.get(key, 0.0) for d in all_stage_durations]
+            if key.startswith("ar_stage_"):
+                vals = list(np.diff([0.0] + vals))
             stage_metrics[key] = {
                 "mean": float(np.mean(vals)),
                 "median": float(np.median(vals)),

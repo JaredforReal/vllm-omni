@@ -1416,7 +1416,7 @@ class StageConfigFactory:
                         return pipeline_cfg.model_type, None
         except Exception:
             pass
-          
+
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path
         # basename against registered pipeline keys — longest match wins

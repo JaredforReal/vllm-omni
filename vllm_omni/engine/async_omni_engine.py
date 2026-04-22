@@ -1446,6 +1446,17 @@ class AsyncOmniEngine:
                         or cfg.engine_args.quantization_config is None
                     ):
                         cfg.engine_args.quantization_config = quantization_config
+                # Inject profiler flags for diffusion stages
+                for profiler_key in (
+                    "enable_diffusion_pipeline_profiler",
+                    "enable_ar_profiler",
+                ):
+                    val = kwargs.get(profiler_key)
+                    if val:
+                        if not hasattr(cfg.engine_args, profiler_key) or not getattr(
+                            cfg.engine_args, profiler_key, False
+                        ):
+                            setattr(cfg.engine_args, profiler_key, val)
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

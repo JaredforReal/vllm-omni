@@ -191,6 +191,8 @@ def benchmark(args: argparse.Namespace) -> None:
         deploy_config=deploy_config,
         log_stats=False,
         stage_init_timeout=args.stage_init_timeout,
+        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        enable_ar_profiler=args.enable_ar_profiler,
     )
 
     init_time = time.perf_counter() - t0
@@ -244,6 +246,7 @@ def benchmark(args: argparse.Namespace) -> None:
     print("-" * 60)
 
     latencies = []
+    all_stage_durations: list[dict[str, float]] = []
     success = 0
     failed = 0
     wall_start = time.perf_counter()
@@ -269,6 +272,9 @@ def benchmark(args: argparse.Namespace) -> None:
                             img.save(out_path)
                     success += 1
                     latencies.append(elapsed)
+                    stage_durations = getattr(request_output, "stage_durations", {})
+                    if stage_durations:
+                        all_stage_durations.append(stage_durations)
                     print(f"  [{success}/{valid}] id={request_id[:8]} {elapsed:.2f}s")
                     output_idx += 1
                 else:
@@ -301,6 +307,15 @@ def benchmark(args: argparse.Namespace) -> None:
         print(f"{'Latency P95 (s):':<40} {np.percentile(per_request, 95):.4f}")
         print(f"{'Latency P99 (s):':<40} {np.percentile(per_request, 99):.4f}")
 
+    # Stage-level profiling
+    if all_stage_durations:
+        stage_keys = sorted(all_stage_durations[0].keys())
+        print("-" * 50)
+        print("Stage Durations Mean (s):")
+        for key in stage_keys:
+            vals = [d.get(key, 0.0) for d in all_stage_durations]
+            print(f"  {key + ':':<38} {np.mean(vals):.4f}")
+
     print(f"\n{'Output dir:':<40} {args.output_dir}")
     print("=" * 60)
 
@@ -322,6 +337,17 @@ def benchmark(args: argparse.Namespace) -> None:
         "latency_p95": float(np.percentile(per_request, 95)) if len(per_request) > 0 else 0,
         "latency_p99": float(np.percentile(per_request, 99)) if len(per_request) > 0 else 0,
     }
+    if all_stage_durations:
+        stage_keys = sorted(all_stage_durations[0].keys())
+        stage_metrics = {}
+        for key in stage_keys:
+            vals = [d.get(key, 0.0) for d in all_stage_durations]
+            stage_metrics[key] = {
+                "mean": float(np.mean(vals)),
+                "median": float(np.median(vals)),
+                "p95": float(np.percentile(vals, 95)),
+            }
+        metrics["stage_durations"] = stage_metrics
     if args.output_file:
         with open(args.output_file, "w") as f:
             json.dump(metrics, f, indent=2)
@@ -346,6 +372,16 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="benchmarks/glm_image/vllm-omni/outputs")
     parser.add_argument("--output-file", type=str, default=None, help="JSON file for metrics")
     parser.add_argument("--stage-init-timeout", type=int, default=600)
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler for stage-level timing",
+    )
+    parser.add_argument(
+        "--enable-ar-profiler",
+        action="store_true",
+        help="Enable AR stage profiler to include AR timing in stage_durations",
+    )
     args = parser.parse_args()
     benchmark(args)
 

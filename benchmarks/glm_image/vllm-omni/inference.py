@@ -98,17 +98,24 @@ def download_image(url: str, cache_dir: Path) -> str:
 
 
 def compute_max_tokens(height: int, width: int, is_i2i: bool = False) -> int:
-    token_h = height // 32
-    token_w = width // 32
+    factor = 32
+    token_h = height // factor
+    token_w = width // factor
     large_tokens = token_h * token_w
 
-    if is_i2i:
-        return large_tokens + 1
+    # Small preview tokens (half resolution in each dimension)
 
     ratio = token_h / token_w if token_w > 0 else 1.0
-    small_h = max(1, int(math.sqrt(ratio) * 16))
-    small_w = max(1, int(math.sqrt(1 / ratio) * 16))
-    return small_h * small_w + large_tokens + 1
+    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
+    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
+    small_tokens = small_token_h * small_token_w
+
+    # Mode-dependent totals:
+    # - t2i: small + large + EOS
+    # - i2i: large + EOS
+    if is_i2i:
+        return large_tokens + 1
+    return small_tokens + large_tokens + 1
 
 
 def build_prompt_t2i(prompt: str, height: int, width: int, **gen_kw) -> dict:

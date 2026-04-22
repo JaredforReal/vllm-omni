@@ -1,389 +1,347 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Batch inference script for GLM-Image with prompts from CSV file.
+vLLM-Omni offline benchmark for GLM-Image.
 
-This script reads prompts from a CSV file and processes them sequentially,
-measuring the total time and average time per image.
+Supports T2I and I2I modes with the prompt.json dataset.
+Downloads source images for I2I from image_url on first run and caches locally.
 
 Usage:
-    python batch_inference.py \
-        --model-path /path/to/glm-image \
-        --csv-path dedup_prompts.csv \
-        --output-dir ./outputs \
-        --num-prompts 100
+    # T2I mode
+    python benchmarks/glm_image/vllm-omni/inference.py \
+        --model-path zai-org/GLM-Image \
+        --mode t2i --num-prompts 10
+
+    # I2I mode (downloads source images)
+    python benchmarks/glm_image/vllm-omni/inference.py \
+        --model-path zai-org/GLM-Image \
+        --mode i2i --num-prompts 10
 """
 
 import argparse
-import csv
+import json
+import math
 import os
 import time
 from pathlib import Path
 
+import numpy as np
+import requests
 from PIL import Image
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-# Default stage config path (relative to vllm_omni package)
+BENCHMARK_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
+IMAGE_CACHE_DIR = BENCHMARK_DIR / "prompt" / "images"
 DEFAULT_CONFIG_PATH = "vllm_omni/model_executor/stage_configs/glm_image.yaml"
 
 SEED = 42
+HEIGHT = 1024
+WIDTH = 1024
+NUM_INFERENCE_STEPS = 50
+GUIDANCE_SCALE = 1.5
 
-# GLM-Image special tokens
 GLM_IMAGE_EOS_TOKEN_ID = 16385
 GLM_IMAGE_VISION_VOCAB_SIZE = 16512
 
 
-def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:
-    """Compute max_new_tokens for GLM-Image AR generation."""
-    token_h = height // factor
-    token_w = width // factor
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+
+def load_dataset(
+    dataset_path: str | None,
+    mode: str,
+    num_prompts: int,
+) -> list[dict]:
+    path = dataset_path or str(DEFAULT_PROMPT_JSON)
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+
+    items = []
+    for entry in raw:
+        prompt_key = "t2i_prompt" if mode == "t2i" else "i2i_prompt"
+        prompt_text = entry.get(prompt_key, "").strip()
+        if not prompt_text:
+            continue
+
+        item = {"prompt": prompt_text}
+        if mode == "i2i":
+            item["image_url"] = entry.get("image_url", "")
+        items.append(item)
+
+    if num_prompts and len(items) > num_prompts:
+        items = items[:num_prompts]
+    return items
+
+
+def download_image(url: str, cache_dir: Path) -> str:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fname = url.rsplit("/", 1)[-1]
+    local_path = cache_dir / fname
+    if local_path.exists():
+        return str(local_path)
+    print(f"  Downloading {url} ...")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    local_path.write_bytes(resp.content)
+    return str(local_path)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def compute_max_tokens(height: int, width: int, is_i2i: bool = False) -> int:
+    token_h = height // 32
+    token_w = width // 32
     large_tokens = token_h * token_w
-    small_h = token_h // 2
-    small_w = token_w // 2
-    small_tokens = small_h * small_w
-    return small_tokens + large_tokens + 1
+
+    if is_i2i:
+        return large_tokens + 1
+
+    ratio = token_h / token_w if token_w > 0 else 1.0
+    small_h = max(1, int(math.sqrt(ratio) * 16))
+    small_w = max(1, int(math.sqrt(1 / ratio) * 16))
+    return small_h * small_w + large_tokens + 1
 
 
-def load_prompts_from_csv(csv_path: str, num_prompts: int = 100) -> list[dict]:
-    """
-    Load prompts from CSV file.
-
-    Args:
-        csv_path: Path to CSV file
-        num_prompts: Maximum number of prompts to load
-
-    Returns:
-        List of dicts containing log_id and code (prompt)
-    """
-    prompts = []
-    with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if i >= num_prompts:
-                break
-            prompts.append(
-                {
-                    "log_id": row.get("log_id", f"prompt_{i}"),
-                    "code": row.get("code", ""),
-                }
-            )
-    return prompts
-
-
-def save_image(image: Image.Image, output_path: str) -> None:
-    """Save an image to file path."""
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    image.save(output_path)
-
-
-def build_prompt_dict(
-    prompt: str,
-    height: int = 1024,
-    width: int = 1024,
-    seed: int = SEED,
-    num_inference_steps: int = 50,
-    guidance_scale: float = 1.5,
-) -> dict:
-    """Build prompt dict for text-to-image generation."""
+def build_prompt_t2i(prompt: str, height: int, width: int, **gen_kw) -> dict:
     return {
         "prompt": prompt,
         "height": height,
         "width": width,
-        "mm_processor_kwargs": {
-            "target_h": height,
-            "target_w": width,
-        },
-        "seed": seed,
-        "num_inference_steps": num_inference_steps,
-        "guidance_scale": guidance_scale,
+        "mm_processor_kwargs": {"target_h": height, "target_w": width},
+        **gen_kw,
     }
 
 
-def main(args: argparse.Namespace) -> None:
-    """Main entry point for batch inference."""
+def build_prompt_i2i(prompt: str, image_path: str, height: int, width: int, **gen_kw) -> dict:
+    return {
+        "prompt": prompt,
+        "height": height,
+        "width": width,
+        "mm_processor_kwargs": {"target_h": height, "target_w": width},
+        "multi_modal_data": {"image": Image.open(image_path).convert("RGB")},
+        **gen_kw,
+    }
+
+
+def resolve_config_path(args: argparse.Namespace) -> str:
+    if args.config_path:
+        return args.config_path
+    if os.path.exists(DEFAULT_CONFIG_PATH):
+        return DEFAULT_CONFIG_PATH
+    fallback = Path(__file__).resolve().parents[3] / DEFAULT_CONFIG_PATH
+    if fallback.exists():
+        return str(fallback)
+    raise FileNotFoundError("Stage config not found. Specify --config-path.")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
+
+def benchmark(args: argparse.Namespace) -> None:
+    is_i2i = args.mode == "i2i"
+
     print("=" * 60)
-    print("GLM-Image Batch Inference from CSV")
+    print("GLM-Image vLLM-Omni Benchmark")
+    print(f"Mode: {args.mode}  |  Model: {args.model_path}")
+    print(f"Size: {args.height}x{args.width}  |  Steps: {args.num_inference_steps}")
     print("=" * 60)
 
-    # Validate arguments
-    if not args.model_path:
-        raise ValueError("--model-path is required")
-    if not args.csv_path:
-        raise ValueError("--csv-path is required")
-    if not os.path.exists(args.csv_path):
-        raise FileNotFoundError(f"CSV file not found: {args.csv_path}")
-
-    # Determine config path
-    config_path = args.config_path
-    if config_path is None:
-        if os.path.exists(DEFAULT_CONFIG_PATH):
-            config_path = DEFAULT_CONFIG_PATH
-        else:
-            script_dir = Path(__file__).parent.parent.parent.parent
-            config_path = script_dir / "vllm_omni/model_executor/stage_configs/glm_image.yaml"
-            if not config_path.exists():
-                raise FileNotFoundError("Stage config not found. Please specify --config-path.")
-            config_path = str(config_path)
-
-    print(f"Model path: {args.model_path}")
-    print(f"Config path: {config_path}")
-    print(f"CSV path: {args.csv_path}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Number of prompts: {args.num_prompts}")
-    print(f"Image size: {args.height}x{args.width}")
-
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load prompts from CSV
-    print("\nLoading prompts from CSV...")
-    prompts_data = load_prompts_from_csv(args.csv_path, args.num_prompts)
-    actual_num_prompts = len(prompts_data)
-    print(f"Loaded {actual_num_prompts} prompts")
-
-    if actual_num_prompts == 0:
-        print("No prompts found in CSV. Exiting.")
+    # Load dataset
+    items = load_dataset(args.dataset_path, args.mode, args.num_prompts)
+    if not items:
+        print("No prompts loaded. Exiting.")
         return
+    print(f"Loaded {len(items)} prompts for {args.mode} mode")
 
-    # Initialize Omni
-    print("\nInitializing Omni with multistage pipeline...")
-    init_start_time = time.time()
+    # Download I2I source images
+    if is_i2i:
+        print("Preparing source images...")
+        for item in items:
+            url = item.get("image_url", "")
+            if url:
+                item["image_path"] = download_image(url, IMAGE_CACHE_DIR)
+            else:
+                item["image_path"] = None
+
+    # Init Omni
+    config_path = resolve_config_path(args)
+    print(f"\nInitializing vLLM-Omni (config: {config_path}) ...")
+    t0 = time.perf_counter()
 
     omni = Omni(
         model=args.model_path,
         stage_configs_path=config_path,
-        log_stats=args.enable_stats,
+        log_stats=False,
         stage_init_timeout=args.stage_init_timeout,
     )
 
-    init_time = time.time() - init_start_time
-    print(f"Initialization completed in {init_time:.2f}s")
+    init_time = time.perf_counter() - t0
+    print(f"Initialized in {init_time:.2f}s")
 
-    # Prepare sampling parameters
-    from vllm import SamplingParams
-
-    calculated_max_tokens = compute_max_tokens(args.height, args.width)
-
-    ar_sampling_params = SamplingParams(
+    # Sampling params
+    max_tokens = compute_max_tokens(args.height, args.width, is_i2i=is_i2i)
+    ar_params = SamplingParams(
         temperature=0.9,
         top_p=0.75,
         top_k=GLM_IMAGE_VISION_VOCAB_SIZE,
-        max_tokens=calculated_max_tokens,
+        max_tokens=max_tokens,
         stop_token_ids=[GLM_IMAGE_EOS_TOKEN_ID],
         seed=args.seed,
         detokenize=False,
+        extra_args={"target_h": args.height, "target_w": args.width},
     )
+    diff_params = OmniDiffusionSamplingParams(
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        height=args.height,
+        width=args.width,
+        seed=args.seed,
+    )
+    sampling_params_list = [ar_params, diff_params]
 
-    diffusion_sampling_params = {
+    # Build all prompts
+    gen_kw = {
+        "seed": args.seed,
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
-        "height": args.height,
-        "width": args.width,
-        "seed": args.seed,
     }
-
-    sampling_params_list = [ar_sampling_params, diffusion_sampling_params]
-
-    # Build all prompt dicts
-    print("\nBuilding prompt dicts...")
     all_prompts = []
-    prompt_id_to_log_id = {}  # Map request index to log_id
-    skipped_count = 0
+    for item in items:
+        if is_i2i:
+            img_path = item.get("image_path")
+            if not img_path or not os.path.exists(img_path):
+                continue
+            all_prompts.append(build_prompt_i2i(item["prompt"], img_path, args.height, args.width, **gen_kw))
+        else:
+            all_prompts.append(build_prompt_t2i(item["prompt"], args.height, args.width, **gen_kw))
 
-    for idx, prompt_data in enumerate(prompts_data):
-        log_id = prompt_data["log_id"]
-        prompt_text = prompt_data["code"]
+    valid = len(all_prompts)
+    print(f"Valid prompts: {valid}")
 
-        if not prompt_text.strip():
-            print(f"Skipping empty prompt at index {idx} (log_id: {log_id})")
-            skipped_count += 1
-            continue
+    # Create output dir
+    os.makedirs(args.output_dir, exist_ok=True)
 
-        prompt_dict = build_prompt_dict(
-            prompt=prompt_text,
-            height=args.height,
-            width=args.width,
-            seed=args.seed,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-        )
-        prompt_id_to_log_id[len(all_prompts)] = log_id
-        all_prompts.append(prompt_dict)
-
-    valid_num_prompts = len(all_prompts)
-    print(f"Valid prompts: {valid_num_prompts}, Skipped: {skipped_count}")
-
-    if valid_num_prompts == 0:
-        print("No valid prompts found. Exiting.")
-        omni.close()
-        return
-
-    # Process all prompts in one batch (Omni handles them sequentially internally)
-    print(f"\nProcessing {valid_num_prompts} prompts...")
+    # Run
+    print(f"\nRunning {valid} requests...")
     print("-" * 60)
 
-    total_gen_time = 0.0
-    successful_count = 0
-    failed_count = 0
-    individual_times = []
-    request_start_times = {}
-
-    # Record start time for all requests
-    batch_start_time = time.time()
+    latencies = []
+    success = 0
+    failed = 0
+    wall_start = time.perf_counter()
 
     try:
-        output_count = 0
+        output_idx = 0
         for stage_outputs in omni.generate(all_prompts, sampling_params_list, py_generator=True):
             if stage_outputs.final_output_type == "image":
-                for output in stage_outputs.request_output:
-                    request_id = output.request_id
-                    # Extract the index from request_id (format: "idx_uuid")
-                    try:
-                        req_idx = int(request_id.split("_")[0])
-                        log_id = prompt_id_to_log_id.get(req_idx, request_id)
-                    except (ValueError, IndexError):
-                        log_id = request_id
+                request_output = stage_outputs.request_output
+                request_id = getattr(request_output, "request_id", "")
 
-                    images = output.images if hasattr(output, "images") else []
-                    if not images and hasattr(output, "multimodal_output"):
-                        images = output.multimodal_output.get("images", [])
+                images = getattr(request_output, "images", [])
+                if not images and hasattr(request_output, "multimodal_output"):
+                    mm = request_output.multimodal_output
+                    if isinstance(mm, dict):
+                        images = mm.get("images", [])
 
-                    for img_idx, img in enumerate(images):
+                elapsed = time.perf_counter() - wall_start
+                if images:
+                    for img in images:
                         if isinstance(img, Image.Image):
-                            output_path = os.path.join(args.output_dir, f"{log_id}_{img_idx}.png")
-                            save_image(img, output_path)
-
-                    output_count += 1
-                    successful_count += 1
-                    current_time = time.time()
-                    elapsed = current_time - batch_start_time
-                    print(f"[{output_count}/{valid_num_prompts}] Generated - {log_id} (elapsed: {elapsed:.2f}s)")
-
+                            out_path = os.path.join(args.output_dir, f"{output_idx:04d}.png")
+                            img.save(out_path)
+                    success += 1
+                    latencies.append(elapsed)
+                    print(f"  [{success}/{valid}] id={request_id[:8]} {elapsed:.2f}s")
+                    output_idx += 1
+                else:
+                    failed += 1
     except Exception as e:
-        print(f"Error during generation: {e}")
-        failed_count = valid_num_prompts - successful_count
+        print(f"Error: {e}")
+        failed = valid - success
 
-    total_gen_time = time.time() - batch_start_time
+    total_gen_time = time.perf_counter() - wall_start
 
-    # Print statistics
+    # Report
     print("\n" + "=" * 60)
-    print("BATCH INFERENCE STATISTICS")
+    print("vLLM-Omni Benchmark Results")
     print("=" * 60)
-    print(f"Total prompts:     {valid_num_prompts}")
-    print(f"Successful:        {successful_count}")
-    print(f"Failed:            {failed_count}")
-    print(f"Skipped (empty):   {skipped_count}")
-    print("-" * 60)
-    print(f"Initialization time:   {init_time:.2f}s")
-    print(f"Total generation time: {total_gen_time:.2f}s")
+    print(f"{'Mode:':<40} {args.mode}")
+    print(f"{'Model:':<40} {args.model_path}")
+    print(f"{'Image size:':<40} {args.height}x{args.width}")
+    print(f"{'Num inference steps:':<40} {args.num_inference_steps}")
+    print("-" * 50)
+    print(f"{'Init time (s):':<40} {init_time:.2f}")
+    print(f"{'Successful:':<40} {success}/{valid}")
+    print(f"{'Failed:':<40} {failed}")
+    print("-" * 50)
+    if latencies:
+        arr = np.array(latencies)
+        print(f"{'Total generation time (s):':<40} {total_gen_time:.2f}")
+        print(f"{'Throughput (img/s):':<40} {success / total_gen_time:.4f}")
+        print(f"{'Latency Mean (s):':<40} {arr.mean():.4f}")
+        print(f"{'Latency Median (s):':<40} {np.median(arr):.4f}")
+        print(f"{'Latency P95 (s):':<40} {np.percentile(arr, 95):.4f}")
+        print(f"{'Latency P99 (s):':<40} {np.percentile(arr, 99):.4f}")
 
-    if successful_count > 0:
-        avg_time = total_gen_time / successful_count
-        print(f"Average time per image: {avg_time:.2f}s")
-        print(f"\nThroughput: {successful_count / total_gen_time:.2f} images/second")
-
-    print(f"\nOutput directory: {args.output_dir}")
+    print(f"\n{'Output dir:':<40} {args.output_dir}")
     print("=" * 60)
-    print("=" * 60)
 
-    # Cleanup
+    # Metrics JSON
+    metrics = {
+        "backend": "vllm-omni",
+        "mode": args.mode,
+        "model": args.model_path,
+        "height": args.height,
+        "width": args.width,
+        "num_inference_steps": args.num_inference_steps,
+        "init_time_s": init_time,
+        "completed_requests": success,
+        "failed_requests": failed,
+        "total_gen_time_s": total_gen_time,
+        "throughput_qps": success / total_gen_time if total_gen_time > 0 else 0,
+        "latency_mean": float(np.mean(latencies)) if latencies else 0,
+        "latency_median": float(np.median(latencies)) if latencies else 0,
+        "latency_p95": float(np.percentile(latencies, 95)) if latencies else 0,
+        "latency_p99": float(np.percentile(latencies, 99)) if latencies else 0,
+    }
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Metrics saved to {args.output_file}")
+
     omni.close()
-    print("\nDone!")
+    print("Done!")
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="GLM-Image Batch Inference from CSV",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    # Required arguments
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        required=True,
-        help="Path to GLM-Image model directory or HuggingFace model ID",
-    )
-    parser.add_argument(
-        "--csv-path",
-        type=str,
-        required=True,
-        help="Path to CSV file containing prompts (must have 'code' column)",
-    )
-
-    # Optional arguments
-    parser.add_argument(
-        "--config-path",
-        type=str,
-        default=None,
-        help="Path to stage config YAML file (default: auto-detect)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./batch_outputs",
-        help="Output directory for generated images (default: ./batch_outputs)",
-    )
-    parser.add_argument(
-        "--num-prompts",
-        type=int,
-        default=100,
-        help="Number of prompts to process from CSV (default: 100)",
-    )
-
-    # Generation parameters
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=1024,
-        help="Output image height (default: 1024)",
-    )
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="Output image width (default: 1024)",
-    )
-    parser.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=50,
-        help="Number of diffusion denoising steps (default: 50)",
-    )
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=1.5,
-        help="Classifier-free guidance scale (default: 1.5)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=SEED,
-        help=f"Random seed for reproducibility (default: {SEED})",
-    )
-
-    # Runtime options
-    parser.add_argument(
-        "--enable-stats",
-        action="store_true",
-        default=False,
-        help="Enable statistics logging",
-    )
-    parser.add_argument(
-        "--stage-init-timeout",
-        type=int,
-        default=600,
-        help="Timeout for stage initialization in seconds (default: 600)",
-    )
-
-    return parser.parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="GLM-Image vLLM-Omni offline benchmark")
+    parser.add_argument("--model-path", type=str, default="zai-org/GLM-Image")
+    parser.add_argument("--config-path", type=str, default=None, help="Stage config YAML")
+    parser.add_argument("--mode", type=str, default="t2i", choices=["t2i", "i2i"])
+    parser.add_argument("--dataset-path", type=str, default=None, help="Path to prompt.json")
+    parser.add_argument("--num-prompts", type=int, default=10)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--num-inference-steps", type=int, default=NUM_INFERENCE_STEPS)
+    parser.add_argument("--guidance-scale", type=float, default=GUIDANCE_SCALE)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--output-dir", type=str, default="benchmarks/glm_image/vllm-omni/outputs")
+    parser.add_argument("--output-file", type=str, default=None, help="JSON file for metrics")
+    parser.add_argument("--stage-init-timeout", type=int, default=600)
+    args = parser.parse_args()
+    benchmark(args)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()

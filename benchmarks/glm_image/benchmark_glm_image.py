@@ -1,48 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Benchmark online serving for GLM-Image (T2I and I2I modes).
+Online serving benchmark for GLM-Image (T2I and I2I modes).
 
 Sends requests to the /v1/chat/completions endpoint and reports end-to-end
 latency, throughput, and per-stage durations (when the server is started with
 --enable-diffusion-pipeline-profiler and/or --enable-ar-profiler).
 
+Supports three dataset types:
+  - prompt:   Use prompt.json (default). T2I uses t2i_prompt, I2I uses i2i_prompt
+              and sends source images from image_url.
+  - random:   Generate synthetic prompts (and random images for I2I).
+  - custom:   Load from a user-specified JSON file.
+
 Usage:
-    # Text-to-image (T2I)
+    # T2I with prompt.json (default)
     python benchmarks/glm_image/benchmark_glm_image.py \
         --mode t2i --num-prompts 10
 
-    # Image-to-image (I2I)
+    # I2I with prompt.json (downloads source images automatically)
     python benchmarks/glm_image/benchmark_glm_image.py \
         --mode i2i --num-prompts 10
+
+    # Random dataset
+    python benchmarks/glm_image/benchmark_glm_image.py \
+        --mode t2i --dataset random --num-prompts 20
 
     # Custom dataset
     python benchmarks/glm_image/benchmark_glm_image.py \
         --mode i2i --dataset custom \
-        --dataset-path prompts.json --num-prompts 5
+        --dataset-path my_prompts.json --num-prompts 5
 """
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 import numpy as np
+import requests as sync_requests
 from PIL import Image
 from tqdm.asyncio import tqdm
 
 # Import backends from the diffusion benchmark (add parent dirs to path)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "diffusion"))
-from backends import RequestFuncInput, RequestFuncOutput, async_request_chat_completions
+from backends import RequestFuncOutput
+
+BENCHMARK_DIR = Path(__file__).resolve().parent
+DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
+IMAGE_CACHE_DIR = BENCHMARK_DIR / "prompt" / "images"
+
 
 # ---------------------------------------------------------------------------
-# Datasets
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -50,6 +68,68 @@ from backends import RequestFuncInput, RequestFuncOutput, async_request_chat_com
 class GLMImageRequest:
     prompt: str
     image_path: str | None = None  # Only for I2I mode
+
+
+def download_image(url: str) -> str:
+    """Download an image to cache and return the local path."""
+    IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fname = url.rsplit("/", 1)[-1]
+    local_path = IMAGE_CACHE_DIR / fname
+    if local_path.exists():
+        return str(local_path)
+    resp = sync_requests.get(url, timeout=30)
+    resp.raise_for_status()
+    local_path.write_bytes(resp.content)
+    return str(local_path)
+
+
+def encode_image_as_data_url(path: str) -> str:
+    """Encode a local image file as a base64 data URL."""
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    ext = Path(path).suffix.lower()
+    mime = {"png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+    return f"data:{mime};base64,{encoded}"
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
+
+class PromptDataset:
+    """Load from prompt.json. T2I uses t2i_prompt, I2I uses i2i_prompt + image_url."""
+
+    def __init__(self, args: argparse.Namespace):
+        path = args.dataset_path or str(DEFAULT_PROMPT_JSON)
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+
+        prompt_key = "t2i_prompt" if args.mode == "t2i" else "i2i_prompt"
+        self.items: list[GLMImageRequest] = []
+
+        for entry in raw:
+            prompt = entry.get(prompt_key, "").strip()
+            if not prompt:
+                continue
+            image_path = None
+            if args.mode == "i2i":
+                url = entry.get("image_url", "")
+                if url:
+                    image_path = download_image(url)
+            self.items.append(GLMImageRequest(prompt=prompt, image_path=image_path))
+
+        if args.num_prompts and len(self.items) > args.num_prompts:
+            self.items = self.items[: args.num_prompts]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> GLMImageRequest:
+        return self.items[idx]
+
+    def get_requests(self) -> list[GLMImageRequest]:
+        return list(self.items)
 
 
 class RandomDataset:
@@ -88,7 +168,7 @@ class RandomDataset:
 
 
 class CustomDataset:
-    """Load prompts and optional image paths from a JSON file.
+    """Load from a user-specified JSON file.
 
     Expected format:
     [
@@ -100,7 +180,7 @@ class CustomDataset:
     def __init__(self, args: argparse.Namespace):
         if not args.dataset_path:
             raise ValueError("--dataset-path is required for custom dataset")
-        with open(args.dataset_path) as f:
+        with open(args.dataset_path, encoding="utf-8") as f:
             raw = json.load(f)
         self.items: list[GLMImageRequest] = []
         for item in raw:
@@ -124,27 +204,98 @@ class CustomDataset:
 
 
 # ---------------------------------------------------------------------------
+# Async request for GLM-Image (chat completions with image support)
+# ---------------------------------------------------------------------------
+
+
+async def async_glm_image_request(
+    req: GLMImageRequest,
+    api_url: str,
+    model: str,
+    session: aiohttp.ClientSession,
+    pbar: Any,
+    args: argparse.Namespace,
+) -> RequestFuncOutput:
+    """Send a single T2I or I2I request via chat completions endpoint."""
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    # Build messages
+    if req.image_path and args.mode == "i2i":
+        data_url = encode_image_as_data_url(req.image_path)
+        content = [
+            {"type": "text", "text": req.prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+    else:
+        content = req.prompt
+
+    messages = [{"role": "user", "content": content}]
+
+    extra_body: dict[str, Any] = {}
+    if args.height:
+        extra_body["height"] = args.height
+    if args.width:
+        extra_body["width"] = args.width
+    if args.num_inference_steps:
+        extra_body["num_inference_steps"] = args.num_inference_steps
+    if args.seed is not None:
+        extra_body["seed"] = args.seed
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if extra_body:
+        payload["extra_body"] = extra_body
+
+    try:
+        async with session.post(api_url, json=payload) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+                try:
+                    choices = resp_json.get("choices", [])
+                    if choices and isinstance(choices, list):
+                        msg = choices[0].get("message", {})
+                        if isinstance(msg, dict):
+                            resp_content = msg.get("content", [])
+                            if resp_content and isinstance(resp_content, list) and len(resp_content) > 0:
+                                first_item = resp_content[0]
+                                if isinstance(first_item, dict):
+                                    output.stage_durations = first_item.get("stage_durations") or {}
+                                    output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
+                except (IndexError, TypeError, AttributeError):
+                    pass
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
 
 
-async def iter_requests(
-    requests_list: list[RequestFuncInput],
-    request_rate: float,
-) -> Any:
-    """Yield requests; Poisson inter-arrival when request_rate is finite."""
+async def iter_requests(n: int, request_rate: float) -> Any:
     import random as _random
 
-    for i, req in enumerate(requests_list):
+    for i in range(n):
         if request_rate != float("inf") and i > 0:
             await asyncio.sleep(_random.expovariate(request_rate))
-        yield req
+        yield i
 
 
-def calculate_metrics(
-    outputs: list[RequestFuncOutput],
-    total_duration: float,
-) -> dict[str, Any]:
+def calculate_metrics(outputs: list[RequestFuncOutput], total_duration: float) -> dict[str, Any]:
     success = [o for o in outputs if o.success]
     errors = [o for o in outputs if not o.success]
     latencies = [o.latency for o in success]
@@ -155,7 +306,7 @@ def calculate_metrics(
         for stage, dur in (o.stage_durations or {}).items():
             stage_duration_lists.setdefault(stage, []).append(dur)
 
-    metrics: dict[str, Any] = {
+    return {
         "duration": total_duration,
         "completed_requests": len(success),
         "failed_requests": len(errors),
@@ -168,14 +319,15 @@ def calculate_metrics(
         "stage_durations_mean": {s: float(np.mean(v)) for s, v in stage_duration_lists.items()},
         "stage_durations_p50": {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()},
     }
-    return metrics
 
 
 async def benchmark(args: argparse.Namespace) -> None:
     api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
 
     # Load dataset
-    if args.dataset == "random":
+    if args.dataset == "prompt":
+        dataset = PromptDataset(args)
+    elif args.dataset == "random":
         dataset = RandomDataset(args)
     elif args.dataset == "custom":
         dataset = CustomDataset(args)
@@ -183,58 +335,40 @@ async def benchmark(args: argparse.Namespace) -> None:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     glm_requests = dataset.get_requests()
-    print(f"Prepared {len(glm_requests)} requests (mode={args.mode})")
+    print(f"Prepared {len(glm_requests)} requests (mode={args.mode}, dataset={args.dataset})")
 
-    # Convert to RequestFuncInput
-    requests_list: list[RequestFuncInput] = []
-    for req in glm_requests:
-        image_paths = [req.image_path] if req.image_path else None
-        requests_list.append(
-            RequestFuncInput(
-                prompt=req.prompt,
-                api_url=api_url,
-                model=args.model,
-                width=args.width,
-                height=args.height,
-                num_inference_steps=args.num_inference_steps,
-                seed=args.seed,
-                image_paths=image_paths,
-            )
-        )
-
-    # Concurrency semaphore
     semaphore = asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
 
-    async def limited_request(req: RequestFuncInput, session: aiohttp.ClientSession, pbar: Any):
+    async def limited_request(idx: int, req: GLMImageRequest, session: aiohttp.ClientSession, pbar: Any):
         if semaphore:
             async with semaphore:
-                return await async_request_chat_completions(req, session, pbar)
-        return await async_request_chat_completions(req, session, pbar)
+                return await async_glm_image_request(req, api_url, args.model, session, pbar, args)
+        return await async_glm_image_request(req, api_url, args.model, session, pbar, args)
 
-    # Warmup
     async with aiohttp.ClientSession() as session:
-        if args.warmup_requests and requests_list:
+        # Warmup
+        if args.warmup_requests and glm_requests:
             print(f"Running {args.warmup_requests} warmup request(s)...")
             for i in range(args.warmup_requests):
-                warm_req = requests_list[i % len(requests_list)]
-                await limited_request(warm_req, session, None)
+                await limited_request(i, glm_requests[i % len(glm_requests)], session, None)
 
         # Main benchmark
-        pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
+        pbar = tqdm(total=len(glm_requests), disable=args.disable_tqdm)
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list, args.request_rate):
-            tasks.append(asyncio.create_task(limited_request(req, session, pbar)))
+        async for idx in iter_requests(len(glm_requests), args.request_rate):
+            tasks.append(asyncio.create_task(limited_request(idx, glm_requests[idx], session, pbar)))
         outputs = await asyncio.gather(*tasks)
         total_duration = time.perf_counter() - start_time
         pbar.close()
 
-    # Calculate and print metrics
+    # Metrics
     metrics = calculate_metrics(outputs, total_duration)
     metrics["mode"] = args.mode
     metrics["model"] = args.model
+    metrics["dataset"] = args.dataset
 
-    print(f"\n{' GLM-Image Benchmark Result ':=^60}")
+    print(f"\n{' GLM-Image Online Benchmark Result ':=^60}")
     print(f"{'Mode:':<40} {args.mode}")
     print(f"{'Model:':<40} {args.model}")
     print(f"{'Dataset:':<40} {args.dataset}")
@@ -242,7 +376,7 @@ async def benchmark(args: argparse.Namespace) -> None:
     print(f"{'Benchmark duration (s):':<40} {metrics['duration']:.2f}")
     print(f"{'Request rate:':<40} {args.request_rate}")
     print(f"{'Max concurrency:':<40} {args.max_concurrency}")
-    print(f"{'Successful requests:':<40} {metrics['completed_requests']}/{len(requests_list)}")
+    print(f"{'Successful requests:':<40} {metrics['completed_requests']}/{len(glm_requests)}")
     print("-" * 50)
     print(f"{'Throughput (req/s):':<40} {metrics['throughput_qps']:.2f}")
     print(f"{'Latency Mean (s):':<40} {metrics['latency_mean']:.4f}")
@@ -269,29 +403,24 @@ async def benchmark(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark GLM-Image T2I/I2I serving.")
-    parser.add_argument("--mode", type=str, default="t2i", choices=["t2i", "i2i"], help="Generation mode.")
-    parser.add_argument("--dataset", type=str, default="random", choices=["random", "custom"], help="Dataset type.")
-    parser.add_argument("--dataset-path", type=str, default=None, help="Path to custom dataset JSON.")
-    parser.add_argument("--num-prompts", type=int, default=10, help="Number of requests.")
-    parser.add_argument("--max-concurrency", type=int, default=1, help="Max concurrent requests.")
-    parser.add_argument("--request-rate", type=float, default=float("inf"), help="Requests per second.")
-    parser.add_argument("--warmup-requests", type=int, default=1, help="Number of warmup requests.")
-    parser.add_argument("--width", type=int, default=1024, help="Output image width.")
-    parser.add_argument("--height", type=int, default=1024, help="Output image height.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Diffusion denoising steps.")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
-    parser.add_argument("--model", type=str, default="default", help="Model name.")
-    parser.add_argument("--host", type=str, default="localhost", help="Server host.")
-    parser.add_argument("--port", type=int, default=8091, help="Server port.")
-    parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
-    parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
-    parser.add_argument(
-        "--num-input-images",
-        type=int,
-        default=1,
-        help="Number of synthetic input images for I2I mode (random dataset).",
-    )
+    parser = argparse.ArgumentParser(description="Benchmark GLM-Image T2I/I2I online serving.")
+    parser.add_argument("--mode", type=str, default="t2i", choices=["t2i", "i2i"])
+    parser.add_argument("--dataset", type=str, default="prompt", choices=["prompt", "random", "custom"])
+    parser.add_argument("--dataset-path", type=str, default=None)
+    parser.add_argument("--num-prompts", type=int, default=10)
+    parser.add_argument("--max-concurrency", type=int, default=1)
+    parser.add_argument("--request-rate", type=float, default=float("inf"))
+    parser.add_argument("--warmup-requests", type=int, default=1)
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--num-inference-steps", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--model", type=str, default="default")
+    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--output-file", type=str, default=None)
+    parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument("--num-input-images", type=int, default=1, help="For random I2I dataset.")
     args = parser.parse_args()
     asyncio.run(benchmark(args))
 

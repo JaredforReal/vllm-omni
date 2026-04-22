@@ -36,7 +36,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 BENCHMARK_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
 IMAGE_CACHE_DIR = BENCHMARK_DIR / "prompt" / "images"
-DEFAULT_CONFIG_PATH = "vllm_omni/model_executor/stage_configs/glm_image.yaml"
+DEFAULT_DEPLOY_CONFIG = "vllm_omni/deploy/glm_image.yaml"
 
 SEED = 42
 HEIGHT = 1024
@@ -139,15 +139,15 @@ def build_prompt_i2i(prompt: str, image_path: str, height: int, width: int, **ge
     }
 
 
-def resolve_config_path(args: argparse.Namespace) -> str:
-    if args.config_path:
-        return args.config_path
-    if os.path.exists(DEFAULT_CONFIG_PATH):
-        return DEFAULT_CONFIG_PATH
-    fallback = Path(__file__).resolve().parents[3] / DEFAULT_CONFIG_PATH
+def resolve_deploy_config(args: argparse.Namespace) -> str:
+    if args.deploy_config:
+        return args.deploy_config
+    if os.path.exists(DEFAULT_DEPLOY_CONFIG):
+        return DEFAULT_DEPLOY_CONFIG
+    fallback = Path(__file__).resolve().parents[3] / DEFAULT_DEPLOY_CONFIG
     if fallback.exists():
         return str(fallback)
-    raise FileNotFoundError("Stage config not found. Specify --config-path.")
+    raise FileNotFoundError("Deploy config not found. Specify --deploy-config.")
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +182,13 @@ def benchmark(args: argparse.Namespace) -> None:
                 item["image_path"] = None
 
     # Init Omni
-    config_path = resolve_config_path(args)
-    print(f"\nInitializing vLLM-Omni (config: {config_path}) ...")
+    deploy_config = resolve_deploy_config(args)
+    print(f"\nInitializing vLLM-Omni (deploy config: {deploy_config}) ...")
     t0 = time.perf_counter()
 
     omni = Omni(
         model=args.model_path,
-        stage_configs_path=config_path,
+        deploy_config=deploy_config,
         log_stats=False,
         stage_init_timeout=args.stage_init_timeout,
     )
@@ -334,7 +334,7 @@ def benchmark(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="GLM-Image vLLM-Omni offline benchmark")
     parser.add_argument("--model-path", type=str, default="zai-org/GLM-Image")
-    parser.add_argument("--config-path", type=str, default=None, help="Stage config YAML")
+    parser.add_argument("--deploy-config", type=str, default=None, help="Deploy config YAML")
     parser.add_argument("--mode", type=str, default="t2i", choices=["t2i", "i2i"])
     parser.add_argument("--dataset-path", type=str, default=None, help="Path to prompt.json")
     parser.add_argument("--num-prompts", type=int, default=10)

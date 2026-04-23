@@ -330,6 +330,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     - Grid dimension calculation for M-RoPE position encoding
     """
 
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # i2i: prompt text must be modified based on mm data presence,
+        # and grid computation requires all images together — bypass cache.
+        if inputs.mm_data_items.get_all_counts().get("image", 0) > 0:
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -531,7 +538,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         images = mm_items.get_items("image", ImageProcessorItems)
         image_list = [images.get(i) for i in range(images.get_count())]
 
-        logger.debug(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
+        logger.info(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
 
         # Process images directly with image processor
         image_inputs = image_processor(
@@ -547,7 +554,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             image_grid_thw = image_grid_thw[:num_images]
             image_inputs["image_grid_thw"] = image_grid_thw
 
-        logger.debug(
+        logger.info(
             f"_apply_hf_processor_mm_only: pixel_values shape=\
                 {pixel_values.shape if pixel_values is not None else None}, "
             f"image_grid_thw shape={image_grid_thw.shape if image_grid_thw is not None else None}"
@@ -566,7 +573,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         text_ids = tokenizer.encode(dummy_text, add_special_tokens=False)
         input_ids = [image_token_id] * num_images + text_ids
 
-        logger.debug(
+        logger.info(
             f"_apply_hf_processor_mm_only: built input_ids with {num_images} image tokens + {len(text_ids)} text tokens"
         )
 
@@ -657,7 +664,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
+        logger.info(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
 
         if num_images == 0 and isinstance(prompt, str):
             # t2i mode or normal flow - use parent implementation
@@ -689,7 +696,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # i2i mode: use unified HF processor path only.
         # This avoids drift between duplicated manual/HF i2i implementations.
-        logger.debug(
+        logger.info(
             "_apply_hf_processor_main: i2i mode (enable_hf_prompt_update=%s), num_images=%s",
             enable_hf_prompt_update,
             num_images,

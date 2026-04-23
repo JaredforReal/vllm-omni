@@ -299,6 +299,33 @@ def benchmark(args: argparse.Namespace) -> None:
 
     total_gen_time = time.perf_counter() - wall_start
 
+    # Diff stage_0_gen_ms with previous request to remove accumulated wait time.
+    # stage_0_gen_ms is measured from submit_ts (same for all requests submitted
+    # at once), so it accumulates queue/scheduling overhead across requests.
+    # Other stages and pipeline timings are per-request already.
+    _TIMING_ORDER = [
+        "preprocess_ms",
+        "stage_0_gen_ms",
+        "ar2diffusion_ms",
+        "stage_1_gen_ms",
+        "queue_wait_ms",
+    ]
+
+    per_request_actual: list[dict[str, float]] = []
+    prev_stage_0_ms = 0.0
+    for sd in all_stage_durations:
+        actual = dict(sd)
+        s0 = sd.get("stage_0_gen_ms", 0.0)
+        actual["stage_0_gen_ms"] = s0 - prev_stage_0_ms
+        prev_stage_0_ms = s0
+        per_request_actual.append(actual)
+
+    per_request_e2e_ms: list[float] = []
+    for actual in per_request_actual:
+        e2e_ms = sum(v for k, v in actual.items() if k.startswith("stage_") and k.endswith("_gen_ms"))
+        if e2e_ms > 0:
+            per_request_e2e_ms.append(e2e_ms)
+
     # Report
     print("\n" + "=" * 60)
     print("vLLM-Omni Benchmark Results")
@@ -312,29 +339,44 @@ def benchmark(args: argparse.Namespace) -> None:
     print(f"{'Successful:':<40} {success}/{valid}")
     print(f"{'Failed:':<40} {failed}")
     print("-" * 50)
-    per_request = np.diff([0.0] + list(latencies)) if latencies else np.array([])
-    if len(per_request) > 0:
+
+    if per_request_e2e_ms:
+        per_request_s = np.array(per_request_e2e_ms) / 1000.0
         print(f"{'Total generation time (s):':<40} {total_gen_time:.2f}")
         print(f"{'Throughput (img/s):':<40} {success / total_gen_time:.4f}")
-        print(f"{'Latency Mean (s):':<40} {per_request.mean():.4f}")
-        print(f"{'Latency Median (s):':<40} {np.median(per_request):.4f}")
-        print(f"{'Latency P95 (s):':<40} {np.percentile(per_request, 95):.4f}")
-        print(f"{'Latency P99 (s):':<40} {np.percentile(per_request, 99):.4f}")
-        print(f"{'Latency Min (s):':<40} {per_request.min():.4f}")
-        print(f"{'Latency Max (s):':<40} {per_request.max():.4f}")
+        print(f"{'Latency Mean (s):':<40} {per_request_s.mean():.4f}")
+        print(f"{'Latency Median (s):':<40} {np.median(per_request_s):.4f}")
+        print(f"{'Latency P95 (s):':<40} {np.percentile(per_request_s, 95):.4f}")
+        print(f"{'Latency P99 (s):':<40} {np.percentile(per_request_s, 99):.4f}")
+        print(f"{'Latency Min (s):':<40} {per_request_s.min():.4f}")
+        print(f"{'Latency Max (s):':<40} {per_request_s.max():.4f}")
+    elif latencies:
+        per_request = np.diff([0.0] + list(latencies))
+        print(f"{'Total generation time (s):':<40} {total_gen_time:.2f}")
+        print(f"{'Throughput (img/s):':<40} {success / total_gen_time:.4f}")
+        print(f"{'Latency Mean (s) [wall-clock]:':<40} {per_request.mean():.4f}")
+        print(f"{'Latency Median (s) [wall-clock]:':<40} {np.median(per_request):.4f}")
+        print(f"{'Latency P95 (s) [wall-clock]:':<40} {np.percentile(per_request, 95):.4f}")
+        print(f"{'Latency P99 (s) [wall-clock]:':<40} {np.percentile(per_request, 99):.4f}")
+        print(f"{'Latency Min (s) [wall-clock]:':<40} {per_request.min():.4f}")
+        print(f"{'Latency Max (s) [wall-clock]:':<40} {per_request.max():.4f}")
 
-    # Stage-level profiling from pipeline timings
-    # Note: per-request latency above is wall-clock delta between successive
-    # outputs (includes queue + overlap). Use stage_durations for accurate
-    # per-stage breakdowns.
-    if all_stage_durations:
-        stage_keys = sorted(all_stage_durations[0].keys())
+    if per_request_actual:
         print("-" * 50)
-        print("Stage Durations Mean:")
-        for key in stage_keys:
-            vals = [d.get(key, 0.0) for d in all_stage_durations]
-            unit = "ms" if key.endswith("_ms") else "s"
-            print(f"  {key + ':':<38} {np.mean(vals):.4f} ({unit})")
+        print("Pipeline Timings Mean:")
+        for key in _TIMING_ORDER:
+            vals = [d.get(key, 0.0) for d in per_request_actual]
+            if any(v != 0 for v in vals):
+                unit = "ms" if key.endswith("_ms") else "s"
+                print(f"  {key + ':':<38} {np.mean(vals):.4f} ({unit})")
+        # Show any extra keys not in the ordered list
+        ordered_set = set(_TIMING_ORDER)
+        extra_keys = sorted(k for k in per_request_actual[0].keys() if k not in ordered_set)
+        for key in extra_keys:
+            vals = [d.get(key, 0.0) for d in per_request_actual]
+            if any(v != 0 for v in vals):
+                unit = "ms" if key.endswith("_ms") else "s"
+                print(f"  {key + ':':<38} {np.mean(vals):.4f} ({unit})")
 
     print(f"\n{'Output dir:':<40} {args.output_dir}")
     print("=" * 60)
@@ -352,16 +394,29 @@ def benchmark(args: argparse.Namespace) -> None:
         "failed_requests": failed,
         "total_gen_time_s": total_gen_time,
         "throughput_qps": success / total_gen_time if total_gen_time > 0 else 0,
-        "latency_mean": float(per_request.mean()) if len(per_request) > 0 else 0,
-        "latency_median": float(np.median(per_request)) if len(per_request) > 0 else 0,
-        "latency_p95": float(np.percentile(per_request, 95)) if len(per_request) > 0 else 0,
-        "latency_p99": float(np.percentile(per_request, 99)) if len(per_request) > 0 else 0,
     }
-    if all_stage_durations:
-        stage_keys = sorted(all_stage_durations[0].keys())
+    if per_request_e2e_ms:
+        per_request_s = np.array(per_request_e2e_ms) / 1000.0
+        metrics["latency_mean"] = float(per_request_s.mean())
+        metrics["latency_median"] = float(np.median(per_request_s))
+        metrics["latency_p95"] = float(np.percentile(per_request_s, 95))
+        metrics["latency_p99"] = float(np.percentile(per_request_s, 99))
+    elif latencies:
+        per_request = np.diff([0.0] + list(latencies))
+        metrics["latency_mean"] = float(per_request.mean())
+        metrics["latency_median"] = float(np.median(per_request))
+        metrics["latency_p95"] = float(np.percentile(per_request, 95))
+        metrics["latency_p99"] = float(np.percentile(per_request, 99))
+    else:
+        metrics["latency_mean"] = 0
+        metrics["latency_median"] = 0
+        metrics["latency_p95"] = 0
+        metrics["latency_p99"] = 0
+    if per_request_actual:
+        all_keys = list(_TIMING_ORDER) + sorted(k for k in per_request_actual[0].keys() if k not in set(_TIMING_ORDER))
         stage_metrics = {}
-        for key in stage_keys:
-            vals = [d.get(key, 0.0) for d in all_stage_durations]
+        for key in all_keys:
+            vals = [d.get(key, 0.0) for d in per_request_actual]
             stage_metrics[key] = {
                 "mean": float(np.mean(vals)),
                 "median": float(np.median(vals)),

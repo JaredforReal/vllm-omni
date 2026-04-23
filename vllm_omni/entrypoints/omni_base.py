@@ -383,6 +383,16 @@ class OmniBase(PDDisaggregationMixin):
             for key, value in _m.pipeline_timings.items():
                 if key not in stage_durations:
                     stage_durations[key] = value
+
+        # Merge per-stage gen times into stage_durations
+        for evt in metrics.stage_events.get(str(req_id), []):
+            key = f"stage_{evt.stage_id}_gen_ms"
+            if key not in stage_durations:
+                stage_durations[key] = evt.stage_gen_time_ms
+        # Current stage gen time (not yet in stage_events at this point)
+        if _m is not None:
+            stage_durations.setdefault(f"stage_{stage_id}_gen_ms", _m.stage_gen_time_ms)
+
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")

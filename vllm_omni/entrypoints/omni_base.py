@@ -376,6 +376,13 @@ class OmniBase(PDDisaggregationMixin):
             for evt in ar_events:
                 if evt.stage_id != stage_id:
                     stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
+
+        # Merge pipeline timings from Orchestrator into stage_durations
+        _m = result.get("metrics")
+        if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
+            for key, value in _m.pipeline_timings.items():
+                if key not in stage_durations:
+                    stage_durations[key] = value
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")

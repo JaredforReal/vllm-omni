@@ -390,9 +390,10 @@ async def benchmark(args: argparse.Namespace) -> None:
 
     if metrics["stage_durations_mean"]:
         print("-" * 50)
-        print("Stage Durations Mean (s):")
+        print("Stage Durations Mean:")
         for stage, val in sorted(metrics["stage_durations_mean"].items()):
-            print(f"  {stage + ':':<38} {val:.4f}")
+            unit = "ms" if stage.endswith("_ms") else "s"
+            print(f"  {stage + ':':<38} {val:.4f} ({unit})")
 
     print("=" * 60)
 

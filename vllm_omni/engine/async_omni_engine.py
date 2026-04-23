@@ -1023,6 +1023,7 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
+        _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
@@ -1032,6 +1033,7 @@ class AsyncOmniEngine:
                     _inject_global_id(item, request_id)
 
             # Full input processing (tokenization, multimodal, etc.)
+            _t_preprocess = time.perf_counter()
             request = self.input_processor.process_inputs(
                 request_id=request_id,
                 prompt=prompt,
@@ -1045,6 +1047,7 @@ class AsyncOmniEngine:
                 data_parallel_rank=data_parallel_rank,
                 resumable=resumable,
             )
+            _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -1081,6 +1084,8 @@ class AsyncOmniEngine:
             "original_prompt": original_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
+            "preprocess_ms": _preprocess_ms,
+            "enqueue_ts": time.perf_counter(),
         }
 
     def _enqueue_cfg_companions(

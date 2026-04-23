@@ -102,6 +102,7 @@ STAGE_EXCLUDE = {
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
     "final_output_type",
+    "pipeline_timings",
 }
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}

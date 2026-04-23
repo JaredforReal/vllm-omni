@@ -595,9 +595,6 @@ class Orchestrator:
         submit_ts = req_state.stage_submit_ts.get(stage_id, now)
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
-        # Record per-stage wall time in pipeline_timings
-        req_state.pipeline_timings[f"stage_{stage_id}_wall_ms"] = stage_gen_time_ms
-
         num_tokens_out = count_tokens_from_outputs(request_outputs)
         num_tokens_in = 0
         if stage_id == 0:

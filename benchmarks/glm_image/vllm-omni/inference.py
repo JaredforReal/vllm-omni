@@ -282,10 +282,14 @@ def benchmark(args: argparse.Namespace) -> None:
                             img.save(out_path)
                     success += 1
                     latencies.append(elapsed)
-                    stage_durations = getattr(request_output, "stage_durations", {})
+                    stage_durations = getattr(stage_outputs, "stage_durations", {})
                     if stage_durations:
                         all_stage_durations.append(stage_durations)
-                    print(f"  [{success}/{valid}] id={request_id[:8]} {elapsed:.2f}s")
+                    # Show wall-clock elapsed and pipeline breakdown if available
+                    preprocess_str = ""
+                    if "preprocess_ms" in stage_durations:
+                        preprocess_str = f" preprocess={stage_durations['preprocess_ms'] / 1000.0:.2f}s"
+                    print(f"  [{success}/{valid}] id={request_id[:8]} {elapsed:.2f}s{preprocess_str}")
                     output_idx += 1
                 else:
                     failed += 1
@@ -316,18 +320,19 @@ def benchmark(args: argparse.Namespace) -> None:
         print(f"{'Latency Median (s):':<40} {np.median(per_request):.4f}")
         print(f"{'Latency P95 (s):':<40} {np.percentile(per_request, 95):.4f}")
         print(f"{'Latency P99 (s):':<40} {np.percentile(per_request, 99):.4f}")
+        print(f"{'Latency Min (s):':<40} {per_request.min():.4f}")
+        print(f"{'Latency Max (s):':<40} {per_request.max():.4f}")
 
-    # Stage-level profiling
-    # AR stage timings from the orchestrator are cumulative wall-clock offsets
-    # (measured from batch submission). Convert to per-request deltas.
+    # Stage-level profiling from pipeline timings
+    # Note: per-request latency above is wall-clock delta between successive
+    # outputs (includes queue + overlap). Use stage_durations for accurate
+    # per-stage breakdowns.
     if all_stage_durations:
         stage_keys = sorted(all_stage_durations[0].keys())
         print("-" * 50)
         print("Stage Durations Mean:")
         for key in stage_keys:
             vals = [d.get(key, 0.0) for d in all_stage_durations]
-            if key.startswith("ar_stage_"):
-                vals = list(np.diff([0.0] + vals))
             unit = "ms" if key.endswith("_ms") else "s"
             print(f"  {key + ':':<38} {np.mean(vals):.4f} ({unit})")
 
@@ -357,8 +362,6 @@ def benchmark(args: argparse.Namespace) -> None:
         stage_metrics = {}
         for key in stage_keys:
             vals = [d.get(key, 0.0) for d in all_stage_durations]
-            if key.startswith("ar_stage_"):
-                vals = list(np.diff([0.0] + vals))
             stage_metrics[key] = {
                 "mean": float(np.mean(vals)),
                 "median": float(np.median(vals)),

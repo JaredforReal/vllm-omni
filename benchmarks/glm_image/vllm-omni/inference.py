@@ -246,8 +246,7 @@ def benchmark(args: argparse.Namespace) -> None:
         print("Running warmup request...")
         try:
             warmup_prompt = [all_prompts[0]]
-            for _ in omni.generate(warmup_prompt, sampling_params_list, py_generator=True):
-                pass
+            omni.generate(warmup_prompt, sampling_params_list, py_generator=False)
             print("Warmup done.\n")
         except Exception as e:
             print(f"Warmup failed (continuing): {e}")

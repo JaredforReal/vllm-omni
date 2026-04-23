@@ -322,7 +322,7 @@ def benchmark(args: argparse.Namespace) -> None:
 
     per_request_e2e_ms: list[float] = []
     for actual in per_request_actual:
-        e2e_ms = sum(v for k, v in actual.items() if k.startswith("stage_") and k.endswith("_gen_ms"))
+        e2e_ms = sum(v for k, v in actual.items() if k in _TIMING_ORDER)
         if e2e_ms > 0:
             per_request_e2e_ms.append(e2e_ms)
 

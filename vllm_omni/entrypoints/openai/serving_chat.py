@@ -304,15 +304,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # processor can construct the correct inputs.
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
-        # Triggered by either:
-        #   1. request.modalities contains "image" (explicit opt-in), OR
-        #   2. Messages contain reference images (I2I detection for curl / bare HTTP).
-        _has_modalities_image = request.modalities and ("image" in request.modalities)
-        if not _has_modalities_image:
-            _, _ref_check = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-            if _ref_check:
-                _has_modalities_image = True
-        if _has_modalities_image:
+        if request.modalities and ("image" in request.modalities):
             try:
                 extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images_from_messages(
                     request.messages

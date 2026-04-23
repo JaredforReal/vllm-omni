@@ -538,7 +538,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         images = mm_items.get_items("image", ImageProcessorItems)
         image_list = [images.get(i) for i in range(images.get_count())]
 
-        logger.info(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
+        logger.debug(f"_apply_hf_processor_mm_only: processing {len(image_list)} images directly")
 
         # Process images directly with image processor
         image_inputs = image_processor(
@@ -554,7 +554,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             image_grid_thw = image_grid_thw[:num_images]
             image_inputs["image_grid_thw"] = image_grid_thw
 
-        logger.info(
+        logger.debug(
             f"_apply_hf_processor_mm_only: pixel_values shape=\
                 {pixel_values.shape if pixel_values is not None else None}, "
             f"image_grid_thw shape={image_grid_thw.shape if image_grid_thw is not None else None}"
@@ -573,7 +573,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         text_ids = tokenizer.encode(dummy_text, add_special_tokens=False)
         input_ids = [image_token_id] * num_images + text_ids
 
-        logger.info(
+        logger.debug(
             f"_apply_hf_processor_mm_only: built input_ids with {num_images} image tokens + {len(text_ids)} text tokens"
         )
 
@@ -664,7 +664,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        logger.info(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
+        logger.debug(f"_apply_hf_processor_main: mm_counts={mm_counts}, num_images={num_images}")
 
         if num_images == 0 and isinstance(prompt, str):
             # t2i mode or normal flow - use parent implementation
@@ -685,7 +685,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             try:
                 mrope_grid_thw = self._build_generation_grids(hf_processor_mm_kwargs)
                 mm_processed_data["mrope_image_grid_thw"] = mrope_grid_thw
-                logger.info(
+                logger.debug(
                     "_apply_hf_processor_main t2i: mrope_image_grid_thw=%s",
                     mrope_grid_thw.tolist(),
                 )
@@ -696,7 +696,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
 
         # i2i mode: use unified HF processor path only.
         # This avoids drift between duplicated manual/HF i2i implementations.
-        logger.info(
+        logger.debug(
             "_apply_hf_processor_main: i2i mode (enable_hf_prompt_update=%s), num_images=%s",
             enable_hf_prompt_update,
             num_images,
@@ -793,7 +793,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         hf_config = self.info.get_hf_config()
         image_token_id = getattr(hf_config, "image_token_id", 167855)
         image_token_count = prompt_ids.count(image_token_id)
-        logger.info(
+        logger.debug(
             "_apply_hf_processor_main i2i(HF): num_images=%s, prompt_len=%s, image_token_count=%s, "
             "source_grid_shape=%s, mrope_grid_shape=%s",
             num_images,
@@ -2334,7 +2334,7 @@ class GlmImageModel(nn.Module):
 
             # Debug: log prior_token_image_ids_info
             shapes = [t.shape for t in upsampled_token_ids]
-            logger.info(
+            logger.debug(
                 f"[GlmImageModel.forward] Built prior_token_image_ids_info: "
                 f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
                 f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2546,7 +2546,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
 
         # Debug: log prior_token_info
         shapes = [t.shape for t in upsampled_token_ids]
-        logger.info(
+        logger.debug(
             f"[_process_image_input] Built prior_token_info: "
             f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
             f"image_grid_thw={image_grid_thw.tolist()}"

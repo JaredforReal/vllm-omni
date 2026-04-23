@@ -189,7 +189,7 @@ def benchmark(args: argparse.Namespace) -> None:
     omni = Omni(
         model=args.model_path,
         deploy_config=deploy_config,
-        log_stats=False,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         enable_ar_profiler=args.enable_ar_profiler,
@@ -240,6 +240,17 @@ def benchmark(args: argparse.Namespace) -> None:
 
     # Create output dir
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Warmup: run 1 request to prime caches, CUDA graphs, etc.
+    if all_prompts:
+        print("Running warmup request...")
+        try:
+            warmup_prompt = [all_prompts[0]]
+            for _ in omni.generate(warmup_prompt, sampling_params_list, py_generator=True):
+                pass
+            print("Warmup done.\n")
+        except Exception as e:
+            print(f"Warmup failed (continuing): {e}")
 
     # Run
     print(f"\nRunning {valid} requests...")
@@ -313,12 +324,13 @@ def benchmark(args: argparse.Namespace) -> None:
     if all_stage_durations:
         stage_keys = sorted(all_stage_durations[0].keys())
         print("-" * 50)
-        print("Stage Durations Mean (s):")
+        print("Stage Durations Mean:")
         for key in stage_keys:
             vals = [d.get(key, 0.0) for d in all_stage_durations]
             if key.startswith("ar_stage_"):
                 vals = list(np.diff([0.0] + vals))
-            print(f"  {key + ':':<38} {np.mean(vals):.4f}")
+            unit = "ms" if key.endswith("_ms") else "s"
+            print(f"  {key + ':':<38} {np.mean(vals):.4f} ({unit})")
 
     print(f"\n{'Output dir:':<40} {args.output_dir}")
     print("=" * 60)
@@ -387,6 +399,11 @@ def main() -> None:
         "--enable-ar-profiler",
         action="store_true",
         help="Enable AR stage profiler to include AR timing in stage_durations",
+    )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable detailed per-request pipeline stats logging",
     )
     args = parser.parse_args()
     benchmark(args)

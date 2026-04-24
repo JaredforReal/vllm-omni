@@ -1801,6 +1801,10 @@ async def edit_images(
                 extra_body["strength"] = strength
             if true_cfg_scale is not None:
                 extra_body["true_cfg_scale"] = true_cfg_scale
+            if layers is not None:
+                extra_body["layers"] = layers
+            if resolution is not None:
+                extra_body["resolution"] = resolution
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)

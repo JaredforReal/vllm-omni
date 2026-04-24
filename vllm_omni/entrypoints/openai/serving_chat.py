@@ -705,8 +705,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        For GLM-Image AR stage, if max_tokens is not in YAML and user provides
-        height/width in extra_body, computes max_tokens dynamically.
+        For models needing spatial metadata (e.g. GLM-Image), target_h/w is
+        injected into extra_args so the runner can build M-RoPE position grids.
+        max_tokens is NOT computed dynamically — it uses the deploy YAML default.
 
         Args:
             default_params: Default SamplingParams from stage config YAML.

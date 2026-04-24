@@ -58,6 +58,40 @@ BENCHMARK_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
 IMAGE_CACHE_DIR = BENCHMARK_DIR / "prompt" / "images"
 
+DATASET_REPO = "JaredforReal/glm-image-bench"
+DATASET_FILE = "prompt.json"
+
+
+def _ensure_prompt_json(dataset_path: str | None) -> str:
+    """Return path to prompt.json, downloading from HuggingFace if needed."""
+    if dataset_path:
+        return dataset_path
+    local = DEFAULT_PROMPT_JSON
+    if local.exists():
+        return str(local)
+    print(f"Downloading {DATASET_FILE} from {DATASET_REPO} ...")
+    try:
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=DATASET_REPO,
+            filename=DATASET_FILE,
+            repo_type="dataset",
+        )
+        local.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+
+        shutil.copy2(downloaded, local)
+        print(f"Saved to {local}")
+    except ImportError:
+        url = f"https://huggingface.co/datasets/{DATASET_REPO}/resolve/main/{DATASET_FILE}"
+        import urllib.request
+
+        local.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(url, local)
+        print(f"Saved to {local}")
+    return str(local)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,7 +135,7 @@ class PromptDataset:
     """Load from prompt.json. T2I uses t2i_prompt, I2I uses i2i_prompt + image_url."""
 
     def __init__(self, args: argparse.Namespace):
-        path = args.dataset_path or str(DEFAULT_PROMPT_JSON)
+        path = _ensure_prompt_json(args.dataset_path)
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
 

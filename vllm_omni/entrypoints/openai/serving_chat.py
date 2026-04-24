@@ -726,36 +726,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body = getattr(request, "extra_body", {}) or {}
         height, width = self._resolve_height_width_from_extra_body(extra_body)
 
-        # Best-effort mode detection from user messages.
-        # i2i requests include at least one reference image in message content.
-        _, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-        ref_image_count = len(reference_images)
-        is_img2img = ref_image_count > 0
-
         if height is not None and width is not None:
-            try:
-                from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
-
-                max_tokens = getattr(explicit_fields, "max_tokens", None)
-                if max_tokens is None:
-                    max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
-                params.max_tokens = max_tokens
-                # Keep target size in stage-0 sampling params so runner/model can
-                # build deterministic M-RoPE grids for t2i (no MM features).
-                extra_args = dict(getattr(params, "extra_args", {}) or {})
-                extra_args["target_h"] = int(height)
-                extra_args["target_w"] = int(width)
-                params.extra_args = extra_args
-            except (ImportError, ValueError, TypeError) as e:
-                logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
-        else:
-            logger.info(
-                "[SamplingParams] Skip dynamic max_tokens (height=%s, width=%s, mode=%s, ref_images=%s)",
-                height,
-                width,
-                "i2i" if is_img2img else "t2i",
-                ref_image_count,
-            )
+            # Keep target size in stage-0 sampling params so runner/model can
+            # build deterministic M-RoPE grids for t2i (no MM features).
+            extra_args = dict(getattr(params, "extra_args", {}) or {})
+            extra_args["target_h"] = int(height)
+            extra_args["target_w"] = int(width)
+            params.extra_args = extra_args
 
         return params
 
@@ -2157,6 +2134,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
+            # Provide multi_modal_uuids so that newer vLLM versions can
+            # validate multi_modal_data / multi_modal_uuids consistency.
+            engine_prompt["multi_modal_uuids"] = {k: [f"img-{k}-{i}"] for i, k in enumerate(engine_prompt_data)}
 
         comprehension_idx = None
         for idx, stage in enumerate(stage_configs):
@@ -2186,6 +2166,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 and hasattr(default_stage_params, "seed")
             ):
                 default_stage_params.seed = seed
+
+            # Inject target_h/w into comprehension (AR) stage sampling params
+            # for models that need M-RoPE position pre-computation (e.g.
+            # GLM-Image).  max_tokens is handled via the deploy YAML default
+            # (upper-bound ceiling) rather than computed dynamically here.
+            if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
+                extra_args = getattr(default_stage_params, "extra_args", None)
+                if extra_args is None:
+                    extra_args = {}
+                    default_stage_params.extra_args = extra_args
+                extra_args["target_h"] = int(height)
+                extra_args["target_w"] = int(width)
 
             if stage_type == "diffusion":
                 self._set_if_supported(
@@ -2235,16 +2227,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         engine = self._diffusion_engine if self._diffusion_engine is not None else self.engine_client
 
-        height = extra_body.get("height")
-        width = extra_body.get("width")
-        if "size" in extra_body:
-            try:
-                size_str = extra_body["size"]
-                if isinstance(size_str, str) and "x" in size_str.lower():
-                    w, h = size_str.lower().split("x")
-                    width, height = int(w), int(h)
-            except ValueError:
-                logger.warning("Invalid size format: %s", extra_body.get("size"))
+        height, width = self._resolve_height_width_from_extra_body(extra_body)
 
         seed = extra_body.get("seed")
         generator_device = extra_body.get("generator_device")
@@ -2276,6 +2259,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
             resolution=extra_body.get("resolution"),
+            strength=extra_body.get("strength"),
         )
 
         if lora_body and isinstance(lora_body, dict):
@@ -2396,16 +2380,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
-            height = extra_body.get("height")
-            width = extra_body.get("width")
-            if "size" in extra_body:
-                try:
-                    size_str = extra_body["size"]
-                    if isinstance(size_str, str) and "x" in size_str.lower():
-                        w, h = size_str.lower().split("x")
-                        width, height = int(w), int(h)
-                except ValueError:
-                    logger.warning("Invalid size format: %s", extra_body.get("size"))
+            height, width = self._resolve_height_width_from_extra_body(extra_body)
 
             # Get request parameters from extra_body.
             # Avoid hardcoded defaults here — let each pipeline's forward()
@@ -2722,8 +2697,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if isinstance(size_str, str) and "x" in size_str.lower():
                     w, h = size_str.lower().split("x")
                     width, height = int(w), int(h)
-            except Exception:
-                pass
+            except ValueError:
+                logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
 

@@ -1457,10 +1457,7 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
-                # Prefer explicit quantization_config; fallback to legacy --quantization.
                 quantization_config = kwargs.get("quantization_config")
-                if quantization_config is None:
-                    quantization_config = kwargs.get("quantization")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
@@ -1478,6 +1475,10 @@ class AsyncOmniEngine:
                             cfg.engine_args, profiler_key, False
                         ):
                             setattr(cfg.engine_args, profiler_key, val)
+                quantization = kwargs.get("quantization")
+                if quantization is not None:
+                    if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
+                        cfg.engine_args.quantization = quantization
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

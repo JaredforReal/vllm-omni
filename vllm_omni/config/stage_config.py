@@ -439,7 +439,7 @@ class DeployConfig:
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
     enable_prefix_caching: bool = False
@@ -601,23 +601,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _detect_platform() -> str | None:
-    """Return "npu", "rocm", "xpu", or None (CUDA default)."""
-    try:
-        from vllm.platforms import current_platform
-
-        name = current_platform.device_name.lower()
-        if "npu" in name:
-            return "npu"
-        if "rocm" in name or "amd" in name:
-            return "rocm"
-        if "xpu" in name:
-            return "xpu"
-    except Exception as e:
-        logger.debug("Platform auto-detect failed, falling back to CUDA: %s", e)
-    return None
-
-
 def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Return ``(overrides, devices)`` from a platform stage entry.
 
@@ -636,7 +619,9 @@ def _apply_platform_overrides(
 ) -> DeployConfig:
     """Merge platform-specific stage overrides into deploy config."""
     if platform is None:
-        platform = _detect_platform()
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform.device_name.lower()
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -746,6 +731,8 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if ps.omni_kv_config:
+        engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
 
 
@@ -765,6 +752,10 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_expand_func:
+        extras["prompt_expand_func"] = ps.prompt_expand_func
+    if ps.cfg_kv_collect_func:
+        extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
     if ps.extras:
         extras.update(ps.extras)
     return extras
